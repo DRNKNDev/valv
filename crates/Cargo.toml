@@ -1,0 +1,3 @@
+[workspace]
+members = ["valv-sync", "valvd", "valv-cli"]
+resolver = "2"

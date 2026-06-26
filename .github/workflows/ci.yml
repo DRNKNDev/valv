@@ -1,0 +1,81 @@
+name: OSS CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  contracts-sync:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts/sync
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.9.0
+      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm exec tsc --noEmit
+
+  contracts-http:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts/http
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.9.0
+      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm exec tsc --noEmit
+
+  contracts-ipc:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts/ipc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.9.0
+      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm exec tsc --noEmit
+
+  core:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.9.0
+      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm exec tsc --noEmit
+
+  cargo:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo check --workspace
