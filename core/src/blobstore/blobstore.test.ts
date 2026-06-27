@@ -1,0 +1,163 @@
+import { describe, expect, it, vi } from "vitest";
+
+import type { CoreAuth, CoreDb, Principal } from "../auth/index.js";
+import { pgSchema } from "../db/schema.js";
+import { chunkKey, createBlobstoreRouter } from "./index.js";
+
+vi.mock("@aws-sdk/s3-request-presigner", () => ({
+  getSignedUrl: vi.fn(async (_client, command: { constructor: { name: string }; input: { Key?: string } }) => {
+    return `signed:${command.constructor.name}:${command.input.Key}`;
+  }),
+}));
+
+describe("blobstore batch coordination", () => {
+  it("computes the OSS chunk key layout", () => {
+    expect(chunkKey("abc123")).toBe("chunks/abc123");
+  });
+
+  it("deduplicates upload hits and stages upload misses", async () => {
+    const db = new BlobTestDb({ existingChunks: ["known"] });
+    const app = appFor(db);
+
+    const response = await app.request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({
+        operation: "upload",
+        objects: [
+          { oid: "known", size: 1 },
+          { oid: "new", size: 2 },
+        ],
+      }),
+      headers: { "content-type": "application/json" },
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.transfer).toBe("basic");
+    expect(body.objects[0]).toEqual({ oid: "known", size: 1 });
+    expect(body.objects[1]).toEqual({
+      oid: "new",
+      size: 2,
+      actions: {
+        upload: {
+          href: "signed:PutObjectCommand:chunks/new",
+          header: { "Content-Type": "application/octet-stream" },
+          expires_in: 900,
+        },
+      },
+    });
+    expect(db.insertedChunks).toEqual([{ chunkHash: "new", sizeBytes: 2, refcount: 0 }]);
+  });
+
+  it("issues download URLs only when a grant covers a referencing node", async () => {
+    const db = new BlobTestDb({ authorized: true, downloadRows: [{ nodeId: "doc", manifest: [{ chunk_hash: "oid-1" }] }] });
+    const app = appFor(db, { type: "device", deviceId: "device-1" });
+
+    const response = await app.request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({ operation: "download", objects: [{ oid: "oid-1", size: 10 }] }),
+      headers: { "content-type": "application/json", authorization: "Bearer token" },
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.objects).toEqual([
+      { oid: "oid-1", size: 10, actions: { download: { href: "signed:GetObjectCommand:chunks/oid-1", expires_in: 900 } } },
+    ]);
+  });
+
+  it("returns per-object 403 when no grant covers a referencing node", async () => {
+    const db = new BlobTestDb({ authorized: false, downloadRows: [{ nodeId: "doc", manifest: [{ chunk_hash: "oid-1" }] }] });
+    const app = appFor(db, { type: "device", deviceId: "device-1" });
+
+    const response = await app.request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({ operation: "download", objects: [{ oid: "oid-1", size: 10 }] }),
+      headers: { "content-type": "application/json", authorization: "Bearer token" },
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.objects).toEqual([{ oid: "oid-1", size: 10, error: { code: 403, message: "no grant" } }]);
+  });
+
+  it("rejects unauthenticated uploads", async () => {
+    const response = await appFor(new BlobTestDb(), null).request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({ operation: "upload", objects: [{ oid: "new", size: 2 }] }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(401);
+  });
+});
+
+class BlobTestDb implements CoreDb {
+  update: CoreDb["update"];
+  delete: CoreDb["delete"];
+  insertedChunks: Array<{ chunkHash: string; sizeBytes: number; refcount: number }> = [];
+  private existingChunks: Set<string>;
+  private downloadRows: Array<{ nodeId: string; manifest: Array<{ chunk_hash: string }> }>;
+  private authorized: boolean;
+  private selectCalls = 0;
+
+  constructor(opts: { existingChunks?: string[]; downloadRows?: Array<{ nodeId: string; manifest: Array<{ chunk_hash: string }> }>; authorized?: boolean } = {}) {
+    this.existingChunks = new Set(opts.existingChunks ?? []);
+    this.downloadRows = opts.downloadRows ?? [];
+    this.authorized = opts.authorized ?? true;
+  }
+
+  select(): any {
+    const callIndex = this.selectCalls;
+    this.selectCalls += 1;
+    return {
+      from: () => ({
+        where: (_condition: unknown) => ({
+          limit: async () => this.chunkSelectRows(callIndex),
+        }),
+        innerJoin: async () => this.downloadRows,
+      }),
+    };
+  }
+
+  insert(): any {
+    return {
+      values: async (value: { chunkHash: string; sizeBytes: number; refcount: number }) => {
+        this.insertedChunks.push(value);
+        this.existingChunks.add(value.chunkHash);
+      },
+    };
+  }
+
+  async getNodeForAuthz(nodeId: string): Promise<{ nodeId: string; folderId: string; parentId: string | null } | undefined> {
+    return { nodeId, folderId: "folder-1", parentId: null };
+  }
+
+  async getGrantForAuthz(_opts: { principal: Principal }): Promise<{ grantId: string; scopeNodeId: string; canRead: boolean; canWrite: boolean } | undefined> {
+    return this.authorized ? { grantId: "grant-1", scopeNodeId: "doc", canRead: true, canWrite: false } : undefined;
+  }
+
+  private chunkSelectRows(callIndex: number): Array<{ chunkHash: string }> {
+    const known = [...this.existingChunks][callIndex];
+    return known ? [{ chunkHash: known }] : [];
+  }
+}
+
+function appFor(db: BlobTestDb, principal: Principal | null = { type: "user", userId: "user-1" }) {
+  const auth = {
+    db,
+    schema: pgSchema,
+    api: {
+      getSession: async () => (principal?.type === "user" ? { user: { id: principal.userId } } : null),
+    },
+  } as unknown as CoreAuth;
+  if (principal?.type === "device") {
+    db.select = () => ({
+      from: () => ({
+        where: () => ({ limit: async () => [{ deviceId: principal.deviceId }] }),
+        innerJoin: async () => db["downloadRows"],
+      }),
+    });
+  }
+  return createBlobstoreRouter({ auth, s3Client: {} as any, bucketName: "bucket" });
+}
