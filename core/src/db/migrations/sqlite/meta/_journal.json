@@ -1,0 +1,20 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1782555185811,
+      "tag": "0000_orange_master_mold",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1782561763018,
+      "tag": "0001_tricky_vengeance",
+      "breakpoints": true
+    }
+  ]
+}
