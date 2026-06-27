@@ -1,0 +1,15 @@
+import Foundation
+
+struct SpikeConfig {
+    let bucketName: String
+    let region: String
+    let endpoint: String
+    let presignBaseURL: String
+
+    static let current = SpikeConfig(
+        bucketName: "example-bucket",
+        region: "auto",
+        endpoint: "https://example-account-id.r2.cloudflarestorage.com",
+        presignBaseURL: "http://127.0.0.1:8787"
+    )
+}
