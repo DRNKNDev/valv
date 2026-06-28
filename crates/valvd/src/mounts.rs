@@ -1,0 +1,140 @@
+use std::path::Path;
+
+use anyhow::{anyhow, Result};
+use axum::{extract::State, http::StatusCode, Json};
+use serde::Deserialize;
+use valv_sync::{
+    persistence::mounts as mount_store,
+    protocol::ipc::{MountRequest, MountResponse},
+};
+
+use crate::{internal_error, tasks::spawn_tasks_for_mount, DaemonState, ErrorResponse, MountState};
+
+pub(crate) async fn post_mount(
+    State(state): State<DaemonState>,
+    Json(req): Json<MountRequest>,
+) -> Result<Json<MountResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if req.folder_id.is_some() && req.grant_token.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "folder_id_and_grant_token_are_mutually_exclusive",
+            )),
+        ));
+    }
+
+    let resolved = resolve_mount(&state, &req).await.map_err(internal_error)?;
+    {
+        let conn = state.db.lock().await;
+        mount_store::upsert_mount(
+            &conn,
+            &req.path,
+            &resolved.folder_id,
+            resolved.grant_id.as_deref(),
+            resolved.scope_node_id.as_deref(),
+            resolved.mount_token.as_deref(),
+        )
+        .map_err(internal_error)?;
+    }
+    let mount = MountState {
+        path: req.path.clone(),
+        folder_id: resolved.folder_id.clone(),
+        grant_id: resolved.grant_id.clone(),
+        scope_node_id: resolved.scope_node_id.clone(),
+        mount_token: resolved.mount_token,
+        syncing: false,
+        pending_ops: 0,
+        last_synced_at: None,
+        error: None,
+    };
+    state.mounts.lock().await.push(mount.clone());
+    spawn_tasks_for_mount(&state, mount).await;
+
+    Ok(Json(MountResponse {
+        folder_id: resolved.folder_id,
+        grant_id: resolved.grant_id,
+        scope_node_id: resolved.scope_node_id,
+        path: req.path,
+    }))
+}
+
+#[derive(Debug)]
+struct ResolvedMount {
+    folder_id: String,
+    grant_id: Option<String>,
+    scope_node_id: Option<String>,
+    mount_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateFolderResponse {
+    folder_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GrantListEntry {
+    grant_id: String,
+    folder_id: String,
+    scope_node_id: String,
+}
+
+async fn resolve_mount(state: &DaemonState, req: &MountRequest) -> Result<ResolvedMount> {
+    if let Some(grant_token) = &req.grant_token {
+        let grants = state
+            .client
+            .get(format!(
+                "{}/grants",
+                state.config.backend_url.trim_end_matches('/')
+            ))
+            .bearer_auth(grant_token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Vec<GrantListEntry>>()
+            .await?;
+        let grant = grants
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("grant token has no accessible grants"))?;
+        return Ok(ResolvedMount {
+            folder_id: grant.folder_id,
+            grant_id: Some(grant.grant_id),
+            scope_node_id: Some(grant.scope_node_id),
+            mount_token: Some(grant_token.clone()),
+        });
+    }
+
+    if let Some(folder_id) = &req.folder_id {
+        return Ok(ResolvedMount {
+            folder_id: folder_id.clone(),
+            grant_id: None,
+            scope_node_id: None,
+            mount_token: None,
+        });
+    }
+
+    let name = Path::new(&req.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Valv Folder");
+    let created = state
+        .client
+        .post(format!(
+            "{}/folders",
+            state.config.backend_url.trim_end_matches('/')
+        ))
+        .bearer_auth(&state.config.device_token)
+        .json(&serde_json::json!({ "name": name }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<CreateFolderResponse>()
+        .await?;
+    Ok(ResolvedMount {
+        folder_id: created.folder_id,
+        grant_id: None,
+        scope_node_id: None,
+        mount_token: None,
+    })
+}

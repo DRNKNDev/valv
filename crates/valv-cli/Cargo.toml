@@ -2,3 +2,18 @@
 name = "valv-cli"
 version = "0.0.0"
 edition = "2021"
+
+[[bin]]
+name = "valv"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hyper-util = { version = "0.1", features = ["tokio", "client", "http1"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "macos-system-configuration"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+toml = "1.1.2"
+valv-sync = { version = "0.0.0", path = "../valv-sync" }

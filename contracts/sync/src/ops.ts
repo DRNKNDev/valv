@@ -3,6 +3,7 @@ import type { ChunkRef } from './manifest';
 export type OpType = 'create' | 'rename' | 'move' | 'delete' | 'new_version';
 
 export interface CreatePayload {
+  node_id: string;
   parent_id: string;
   name: string;
   type: 'file' | 'folder';
