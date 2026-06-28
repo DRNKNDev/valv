@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { or } from "drizzle-orm";
 
 import { type CoreAuth } from "../auth/index.js";
 import { type MetadataVariables, eq, inTransaction, newId, requirePrincipal } from "./common.js";
@@ -12,13 +13,15 @@ type FolderRouteStore = {
     ownerUserId: string;
   }) => Promise<void>;
   listGrantsForRoute?: (principal: { type: "user"; userId: string } | { type: "device"; deviceId: string }) => Promise<unknown[]>;
+  getDeviceUserIdForRoute?: (deviceId: string) => Promise<string | undefined>;
 };
 
 export function registerFolderRoutes(router: Hono<{ Variables: MetadataVariables }>, auth: CoreAuth): void {
   router.post("/folders", async (ctx) => {
     const principal = requirePrincipal(ctx);
-    if (principal.type !== "user") {
-      return ctx.json({ error: "user_required" }, 403);
+    const ownerUserId = await resolveEffectiveUserId(auth, principal);
+    if (!ownerUserId) {
+      return ctx.json({ error: "agent_devices_cannot_create_folders" }, 403);
     }
 
     const body = await ctx.req.json().catch(() => ({}));
@@ -28,13 +31,13 @@ export function registerFolderRoutes(router: Hono<{ Variables: MetadataVariables
     const name = typeof body.name === "string" && body.name.length > 0 ? body.name : "Untitled Folder";
 
     if (hasFolderRouteStore(auth.db) && auth.db.createFolderForRoute) {
-      await auth.db.createFolderForRoute({ folderId, rootNodeId, grantId, name, ownerUserId: principal.userId });
+      await auth.db.createFolderForRoute({ folderId, rootNodeId, grantId, name, ownerUserId });
     } else {
       await inTransaction(auth, async (tx) => {
       await tx.insert(auth.schema.sharedFolders).values({
         folderId,
         name,
-        ownerUserId: principal.userId,
+        ownerUserId,
       });
       await tx.insert(auth.schema.nodes).values({
         nodeId: rootNodeId,
@@ -48,7 +51,7 @@ export function registerFolderRoutes(router: Hono<{ Variables: MetadataVariables
         grantId,
         folderId,
         scopeNodeId: rootNodeId,
-        userId: principal.userId,
+        userId: ownerUserId,
         deviceId: null,
         role: "owner",
         canRead: true,
@@ -65,6 +68,13 @@ export function registerFolderRoutes(router: Hono<{ Variables: MetadataVariables
     if (hasFolderRouteStore(auth.db) && auth.db.listGrantsForRoute) {
       return ctx.json(await auth.db.listGrantsForRoute(principal));
     }
+    const deviceUserId = principal.type === "device" ? await resolveDeviceUserId(auth, principal.deviceId) : undefined;
+    const principalCondition =
+      principal.type === "user"
+        ? eq(auth.schema.folderGrants.userId, principal.userId)
+        : deviceUserId
+          ? or(eq(auth.schema.folderGrants.deviceId, principal.deviceId), eq(auth.schema.folderGrants.userId, deviceUserId))
+          : eq(auth.schema.folderGrants.deviceId, principal.deviceId);
     const rows = await auth.db
       .select({
         grant_id: auth.schema.folderGrants.grantId,
@@ -75,13 +85,31 @@ export function registerFolderRoutes(router: Hono<{ Variables: MetadataVariables
         can_write: auth.schema.folderGrants.canWrite,
       })
       .from(auth.schema.folderGrants)
-      .where(
-        principal.type === "user"
-          ? eq(auth.schema.folderGrants.userId, principal.userId)
-          : eq(auth.schema.folderGrants.deviceId, principal.deviceId),
-      );
+      .where(principalCondition);
     return ctx.json(rows);
   });
+}
+
+async function resolveEffectiveUserId(
+  auth: CoreAuth,
+  principal: { type: "user"; userId: string } | { type: "device"; deviceId: string },
+): Promise<string | undefined> {
+  if (principal.type === "user") {
+    return principal.userId;
+  }
+  return resolveDeviceUserId(auth, principal.deviceId);
+}
+
+async function resolveDeviceUserId(auth: CoreAuth, deviceId: string): Promise<string | undefined> {
+  if (hasFolderRouteStore(auth.db) && auth.db.getDeviceUserIdForRoute) {
+    return auth.db.getDeviceUserIdForRoute(deviceId);
+  }
+  const rows = await auth.db
+    .select({ userId: auth.schema.devices.userId })
+    .from(auth.schema.devices)
+    .where(eq(auth.schema.devices.deviceId, deviceId))
+    .limit(1);
+  return rows[0]?.userId ?? undefined;
 }
 
 function hasFolderRouteStore(db: CoreAuth["db"]): db is CoreAuth["db"] & FolderRouteStore {

@@ -127,7 +127,7 @@ describe("submitOp", () => {
 
     const response = await submitOp(authFor(db), hub, "folder-1", devicePrincipal, {
       op_type: "create",
-      payload: { parent_id: "root", name: "doc.md", type: "file" },
+      payload: { node_id: "duplicate", parent_id: "root", name: "doc.md", type: "file" },
     });
 
     expect(response).toEqual({ result: "superseded", current_seq: 1 });

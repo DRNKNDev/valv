@@ -61,7 +61,7 @@ describe("SQLite server smoke", () => {
         method: "POST",
         body: {
           op_type: "create",
-          payload: { parent_id: rootNodeId, name: "smoke.txt", type: "file" },
+          payload: { node_id: "smoke-node", parent_id: rootNodeId, name: "smoke.txt", type: "file" },
         },
       },
     );

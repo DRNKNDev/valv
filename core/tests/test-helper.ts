@@ -73,7 +73,22 @@ export class LifecycleDb implements CoreDb {
     if (this.authorizedScopes.has(opts.scopeNodeId)) {
       return { grantId: "grant-authz", scopeNodeId: opts.scopeNodeId, canRead: true, canWrite: true };
     }
-    return undefined;
+    const deviceUserId = opts.principal.type === "device" ? await this.getDeviceUserIdForAuthz(opts.principal.deviceId) : undefined;
+    return this.folderGrants.find((grant) => {
+      const principalMatches =
+        opts.principal.type === "user"
+          ? grant.userId === opts.principal.userId
+          : grant.deviceId === opts.principal.deviceId || (deviceUserId !== undefined && grant.userId === deviceUserId);
+      return grant.folderId === opts.folderId && grant.scopeNodeId === opts.scopeNodeId && principalMatches;
+    });
+  }
+
+  async getDeviceUserIdForAuthz(deviceId: string): Promise<string | undefined> {
+    return this.devices.find((device) => device.deviceId === deviceId)?.userId ?? undefined;
+  }
+
+  async getDeviceUserIdForRoute(deviceId: string): Promise<string | undefined> {
+    return this.getDeviceUserIdForAuthz(deviceId);
   }
 
   async createFolderForRoute(opts: {
@@ -91,9 +106,12 @@ export class LifecycleDb implements CoreDb {
   }
 
   async listGrantsForRoute(principal: Principal): Promise<unknown[]> {
+    const deviceUserId = principal.type === "device" ? await this.getDeviceUserIdForRoute(principal.deviceId) : undefined;
     return this.folderGrants
       .filter((item) =>
-        principal.type === "user" ? item.userId === principal.userId : item.deviceId === principal.deviceId,
+        principal.type === "user"
+          ? item.userId === principal.userId
+          : item.deviceId === principal.deviceId || (deviceUserId !== undefined && item.userId === deviceUserId),
       )
       .map((item) => ({
         grant_id: item.grantId,

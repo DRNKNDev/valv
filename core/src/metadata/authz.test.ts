@@ -52,6 +52,21 @@ describe("checkGrant", () => {
       .resolves.toEqual({ granted: false, reason: "no_grant" });
   });
 
+  it("lets human-registered devices inherit user grants", async () => {
+    db.devices.set("device-1", "user-1");
+    db.grantUser("grant-user", "work", true, true);
+
+    await expect(checkGrant(db, "doc", { type: "device", deviceId: "device-1" }, "read"))
+      .resolves.toMatchObject({ granted: true, grantId: "grant-user", scopeNodeId: "work" });
+  });
+
+  it("does not let agent devices inherit user grants", async () => {
+    db.grantUser("grant-user", "work", true, true);
+
+    await expect(checkGrant(db, "doc", { type: "device", deviceId: "agent-device" }, "read"))
+      .resolves.toEqual({ granted: false, reason: "no_grant" });
+  });
+
   it("returns insufficient_permission for read-only grant when write is required", async () => {
     db.grantUser("grant-read", "work", true, false);
 
@@ -75,6 +90,7 @@ class TestAuthzDb implements CoreDb {
   delete: CoreDb["delete"];
   nodes = new Map<string, TestNode>();
   grants: TestGrant[] = [];
+  devices = new Map<string, string>();
 
   async getNodeForAuthz(nodeId: string): Promise<TestNode | undefined> {
     return this.nodes.get(nodeId);
@@ -86,12 +102,17 @@ class TestAuthzDb implements CoreDb {
     principal: Principal;
   }): Promise<TestGrant | undefined> {
     return this.grants.find((grant) => {
+      const deviceUserId = opts.principal.type === "device" ? this.devices.get(opts.principal.deviceId) : undefined;
       const principalMatches =
         opts.principal.type === "user"
           ? grant.userId === opts.principal.userId
-          : grant.deviceId === opts.principal.deviceId;
+          : grant.deviceId === opts.principal.deviceId || (deviceUserId !== undefined && grant.userId === deviceUserId);
       return grant.folderId === opts.folderId && grant.scopeNodeId === opts.scopeNodeId && principalMatches;
     });
+  }
+
+  async getDeviceUserIdForAuthz(deviceId: string): Promise<string | undefined> {
+    return this.devices.get(deviceId);
   }
 
   grantUser(grantId: string, scopeNodeId: string, canRead: boolean, canWrite: boolean): void {

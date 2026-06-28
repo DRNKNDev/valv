@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, or } from "drizzle-orm";
 
 import type { CoreDb, CoreSchema, Principal } from "../auth/index.js";
 import { pgSchema } from "../db/schema.js";
@@ -21,6 +21,7 @@ type AuthzLoaderDb = {
     scopeNodeId: string;
     principal: Principal;
   }) => Promise<AuthzGrant | undefined>;
+  getDeviceUserIdForAuthz?: (deviceId: string) => Promise<string | undefined>;
 };
 
 export async function checkGrant(
@@ -91,6 +92,14 @@ async function loadGrant(
     return db.getGrantForAuthz({ folderId, scopeNodeId, principal });
   }
 
+  const deviceUserId = principal.type === "device" ? await loadDeviceUserId(db, principal.deviceId, schema) : undefined;
+  const principalCondition =
+    principal.type === "user"
+      ? eq(schema.folderGrants.userId, principal.userId)
+      : deviceUserId
+        ? or(eq(schema.folderGrants.deviceId, principal.deviceId), eq(schema.folderGrants.userId, deviceUserId))
+        : eq(schema.folderGrants.deviceId, principal.deviceId);
+
   const rows = await db
     .select({
       grantId: schema.folderGrants.grantId,
@@ -103,13 +112,24 @@ async function loadGrant(
       and(
         eq(schema.folderGrants.scopeNodeId, scopeNodeId),
         eq(schema.folderGrants.folderId, folderId),
-        principal.type === "user"
-          ? eq(schema.folderGrants.userId, principal.userId)
-          : eq(schema.folderGrants.deviceId, principal.deviceId),
+        principalCondition,
       ),
     )
     .limit(1);
   return rows[0];
+}
+
+async function loadDeviceUserId(db: CoreDb, deviceId: string, schema: CoreSchema): Promise<string | undefined> {
+  if (hasAuthzLoaders(db) && db.getDeviceUserIdForAuthz) {
+    return db.getDeviceUserIdForAuthz(deviceId);
+  }
+
+  const rows = await db
+    .select({ userId: schema.devices.userId })
+    .from(schema.devices)
+    .where(eq(schema.devices.deviceId, deviceId))
+    .limit(1);
+  return rows[0]?.userId ?? undefined;
 }
 
 function hasAuthzLoaders(db: CoreDb): db is CoreDb & AuthzLoaderDb {

@@ -14,7 +14,7 @@ import {
 
 type ChunkRef = { chunk_hash: string; offset: number; length: number };
 type SubmitOpRequest =
-  | { op_type: "create"; payload: { parent_id: string; name: string; type: "file" | "folder" } }
+  | { op_type: "create"; payload: { node_id: string; parent_id: string; name: string; type: "file" | "folder" } }
   | { op_type: "rename"; node_id: string; based_on_seq: number; payload: { new_name: string } }
   | { op_type: "move"; node_id: string; based_on_seq: number; payload: { new_parent_id: string } }
   | { op_type: "delete"; node_id: string; based_on_seq: number; payload: Record<string, never> }
@@ -271,7 +271,7 @@ async function createNode(
   actorDeviceId: string,
   op: Extract<SubmitOpRequest, { op_type: "create" }>,
 ): Promise<SubmitOpResponse> {
-  const nodeId = newId();
+  const nodeId = op.payload.node_id;
   try {
     return await inTransaction(auth, async (tx) => {
       await tx.insert(auth.schema.nodes).values({
