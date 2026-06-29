@@ -1,0 +1,4 @@
+packages:
+  - core
+  - contracts/*
+  - e2e

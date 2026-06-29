@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node", "vitest/globals"],
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@valv/core": ["../core/src/index.ts"],
+      "@aws-sdk/client-s3": ["../core/node_modules/@aws-sdk/client-s3"],
+      "@hono/node-server": ["../core/node_modules/@hono/node-server"],
+      "better-sqlite3": ["../core/node_modules/@types/better-sqlite3/index.d.ts"],
+      "drizzle-orm/*": ["../core/node_modules/drizzle-orm/*"],
+      "hono": ["../core/node_modules/hono"],
+      "hono/cookie": ["../core/node_modules/hono/dist/types/helper/cookie/index.d.ts"],
+      "hono/*": ["../core/node_modules/hono/*"]
+    }
+  },
+  "include": ["api/**/*.ts", "setup/**/*.ts", "vitest.config.ts"]
+}

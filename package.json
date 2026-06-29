@@ -1,0 +1,13 @@
+{
+  "name": "valv-oss",
+  "private": true,
+  "scripts": {
+    "typecheck": "pnpm --filter @valv/core typecheck && pnpm --filter @valv/e2e typecheck"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  }
+}
