@@ -25,7 +25,7 @@ use crate::{
     chunking::{chunk_file, Chunk},
     persistence::{
         chunks as chunk_store,
-        nodes::{get_node_by_parent_and_name, get_root_node, LocalNode},
+        nodes::{self, get_node_by_parent_and_name, get_root_node, LocalNode},
     },
     protocol::http::{BatchOperation, BatchRequest, BatchRequestObject, BatchResponse},
     protocol::sync::{
@@ -226,22 +226,61 @@ async fn handle_create(
         NodeType::File
     };
     let name = file_name(path)?;
-    let req = {
+    let (req, parent_id, local_name, local_node_type) = {
         let conn = db.lock().await;
         let Some(parent) = resolve_parent_for_path(&conn, &mount.path, &mount.folder_id, path)?
         else {
+            eprintln!(
+                "watcher: skipping create for {} - parent not in local mirror (folder: {})",
+                path.display(),
+                mount.folder_id
+            );
             return Ok(());
         };
-        SubmitOpRequest::Create {
-            payload: CreatePayload {
-                node_id: Uuid::new_v4().to_string(),
-                parent_id: parent.node_id,
-                name,
-                node_type,
+        (
+            SubmitOpRequest::Create {
+                payload: CreatePayload {
+                    node_id: Uuid::new_v4().to_string(),
+                    parent_id: parent.node_id.clone(),
+                    name: name.clone(),
+                    node_type: node_type.clone(),
+                },
             },
-        }
+            parent.node_id,
+            name,
+            node_type_str(&node_type).to_owned(),
+        )
     };
-    submit_op(client, backend_url, token, &mount.folder_id, &req).await?;
+    let response = submit_op(client, backend_url, token, &mount.folder_id, &req).await?;
+    match response {
+        SubmitOpResponse::Applied {
+            node_id,
+            server_seq,
+        } => {
+            let conn = db.lock().await;
+            nodes::upsert_node(
+                &conn,
+                &LocalNode {
+                    node_id,
+                    folder_id: mount.folder_id.clone(),
+                    parent_id: Some(parent_id),
+                    name: local_name,
+                    node_type: local_node_type,
+                    current_version_id: None,
+                    server_seq,
+                    deleted_at: None,
+                },
+            )?;
+        }
+        SubmitOpResponse::Superseded { .. } => {
+            eprintln!(
+                "watcher: skipping create for {} - name collision on server (folder: {})",
+                path.display(),
+                mount.folder_id
+            );
+        }
+        SubmitOpResponse::ConflictCopy { .. } => {}
+    }
     Ok(())
 }
 
@@ -256,6 +295,11 @@ async fn handle_modify(
     let node = {
         let conn = db.lock().await;
         let Some(node) = resolve_abs_path(&conn, &mount.path, &mount.folder_id, path)? else {
+            eprintln!(
+                "watcher: skipping modify for {} - node not in local mirror (folder: {})",
+                path.display(),
+                mount.folder_id
+            );
             return Ok(());
         };
         node
@@ -409,6 +453,11 @@ async fn handle_delete(
     let req = {
         let conn = db.lock().await;
         let Some(node) = resolve_abs_path(&conn, &mount.path, &mount.folder_id, path)? else {
+            eprintln!(
+                "watcher: skipping delete for {} - node not in local mirror (folder: {})",
+                path.display(),
+                mount.folder_id
+            );
             return Ok(());
         };
         if node.parent_id.is_none() {
@@ -436,10 +485,20 @@ async fn handle_rename(
     let req = {
         let conn = db.lock().await;
         let Some(from_node) = resolve_abs_path(&conn, &mount.path, &mount.folder_id, from)? else {
+            eprintln!(
+                "watcher: skipping rename from {} - node not in local mirror (folder: {})",
+                from.display(),
+                mount.folder_id
+            );
             return Ok(());
         };
         let Some(to_parent) = resolve_parent_for_path(&conn, &mount.path, &mount.folder_id, to)?
         else {
+            eprintln!(
+                "watcher: skipping rename to {} - parent not in local mirror (folder: {})",
+                to.display(),
+                mount.folder_id
+            );
             return Ok(());
         };
         let Some(from_parent_id) = from_node.parent_id.clone() else {
@@ -476,6 +535,13 @@ fn file_name(path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("path has no valid UTF-8 file name: {}", path.display()))
 }
 
+fn node_type_str(node_type: &NodeType) -> &'static str {
+    match node_type {
+        NodeType::File => "file",
+        NodeType::Folder => "folder",
+    }
+}
+
 fn map_notify_event(event: Event) -> Option<FsEvent> {
     match event.kind {
         EventKind::Create(_) => event.paths.into_iter().next().map(FsEvent::Create),
@@ -493,8 +559,19 @@ fn map_notify_event(event: Event) -> Option<FsEvent> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
-    use crate::persistence::{nodes::upsert_node, schema_sql, LocalNode};
+    use crate::persistence::{
+        nodes::{get_node, upsert_node},
+        schema_sql, LocalNode,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        task::JoinHandle,
+        time::timeout,
+    };
 
     #[test]
     fn collapse_rapid_modify_events_to_one() {
@@ -575,5 +652,192 @@ mod tests {
         .unwrap();
 
         assert_eq!(node.node_id, "report-node");
+    }
+
+    #[tokio::test]
+    async fn handle_create_applied_response_writes_local_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        fs::write(&path, b"hello").unwrap();
+        let db = seeded_db();
+        let (backend_url, server) = submit_op_server(vec![SubmitOpResponse::Applied {
+            node_id: "server-file".into(),
+            server_seq: 42,
+        }])
+        .await;
+
+        handle_create(
+            &watch_mount(dir.path()),
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            &path,
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(requests.len(), 1);
+        let conn = db.lock().await;
+        let node = get_node(&conn, "server-file").unwrap().unwrap();
+        assert_eq!(node.server_seq, 42);
+        assert_eq!(node.parent_id.as_deref(), Some("root-node"));
+        assert_eq!(node.name, "report.md");
+        assert_eq!(node.node_type, "file");
+    }
+
+    #[tokio::test]
+    async fn handle_create_with_empty_mirror_returns_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        fs::write(&path, b"hello").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema_sql()).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+
+        handle_create(
+            &watch_mount(dir.path()),
+            &db,
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            "token",
+            &path,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn nested_create_uses_directory_written_from_first_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_path = dir.path().join("docs");
+        let file_path = docs_path.join("notes.md");
+        fs::create_dir(&docs_path).unwrap();
+        fs::write(&file_path, b"hello").unwrap();
+        let db = seeded_db();
+        let (backend_url, server) = submit_op_server(vec![
+            SubmitOpResponse::Applied {
+                node_id: "docs-node".into(),
+                server_seq: 2,
+            },
+            SubmitOpResponse::Applied {
+                node_id: "file-node".into(),
+                server_seq: 3,
+            },
+        ])
+        .await;
+        let mount = watch_mount(dir.path());
+        let client = reqwest::Client::new();
+
+        handle_create(&mount, &db, &client, &backend_url, "token", &docs_path)
+            .await
+            .unwrap();
+        handle_create(&mount, &db, &client, &backend_url, "token", &file_path)
+            .await
+            .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(requests.len(), 2);
+        let conn = db.lock().await;
+        let docs = get_node(&conn, "docs-node").unwrap().unwrap();
+        let file = get_node(&conn, "file-node").unwrap().unwrap();
+        assert_eq!(docs.parent_id.as_deref(), Some("root-node"));
+        assert_eq!(file.parent_id.as_deref(), Some("docs-node"));
+        assert_eq!(file.server_seq, 3);
+    }
+
+    fn seeded_db() -> Arc<Mutex<Connection>> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema_sql()).unwrap();
+        upsert_node(
+            &conn,
+            &LocalNode {
+                node_id: "root-node".into(),
+                folder_id: "folder-1".into(),
+                parent_id: None,
+                name: "Sync".into(),
+                node_type: "folder".into(),
+                current_version_id: None,
+                server_seq: 1,
+                deleted_at: None,
+            },
+        )
+        .unwrap();
+        Arc::new(Mutex::new(conn))
+    }
+
+    fn watch_mount(path: &Path) -> WatchMount {
+        WatchMount {
+            path: path.to_path_buf(),
+            folder_id: "folder-1".into(),
+            device_name: "Test Device".into(),
+        }
+    }
+
+    async fn submit_op_server(
+        responses: Vec<SubmitOpResponse>,
+    ) -> (String, JoinHandle<Vec<serde_json::Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let server = tokio::spawn(async move {
+            let mut responses = VecDeque::from(responses);
+            let mut requests = Vec::new();
+            while let Some(response) = responses.pop_front() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_request_json(&mut stream).await);
+                let body = serde_json::to_vec(&response).unwrap();
+                write_response(&mut stream, "200 OK", &body).await;
+            }
+            requests
+        });
+        (base_url, server)
+    }
+
+    async fn read_request_json(stream: &mut TcpStream) -> serde_json::Value {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let header_end;
+        loop {
+            let n = stream.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "connection closed before headers");
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+
+        let header_text = String::from_utf8_lossy(&buf[..header_end]);
+        let content_length = header_text
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = buf[header_end..].to_vec();
+        while body.len() < content_length {
+            let n = stream.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "connection closed before body");
+            body.extend_from_slice(&tmp[..n]);
+        }
+        body.truncate(content_length);
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn write_response(stream: &mut TcpStream, status: &str, body: &[u8]) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
     }
 }
