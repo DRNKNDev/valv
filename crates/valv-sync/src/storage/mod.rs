@@ -145,7 +145,7 @@ async fn post_batch(
     operation: BatchOperation,
     objects: Vec<BatchRequestObject>,
 ) -> Result<BatchResponse> {
-    let url = format!("{}/objects/batch", backend_url.trim_end_matches('/'));
+    let url = format!("{}/objects/batch", crate::api_base(backend_url));
     let response = client
         .post(url)
         .bearer_auth(token)
@@ -236,7 +236,7 @@ mod tests {
         base_url: String,
     ) {
         let (method, path, headers, body) = read_request(&mut stream).await;
-        if method == "POST" && path == "/objects/batch" {
+        if method == "POST" && path == "/api/objects/batch" {
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             state.lock().await.batch_transfer = json["transfer"].as_str().map(str::to_owned);
             let response = format!(

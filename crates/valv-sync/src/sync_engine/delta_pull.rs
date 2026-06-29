@@ -19,7 +19,7 @@ pub async fn pull_delta(
     loop {
         let url = format!(
             "{}/folders/{}/ops?since={}",
-            backend_url.trim_end_matches('/'),
+            crate::api_base(backend_url),
             folder_id,
             cursor
         );
@@ -53,7 +53,7 @@ pub async fn tree_resync(
 ) -> Result<i64> {
     let url = format!(
         "{}/folders/{}/tree",
-        backend_url.trim_end_matches('/'),
+        crate::api_base(backend_url),
         folder_id
     );
     let tree = client
@@ -119,9 +119,9 @@ mod tests {
 
     async fn handle_connection(mut stream: TcpStream, saw_tree: Arc<AtomicBool>) {
         let path = read_path(&mut stream).await;
-        if path.starts_with("/folders/folder-1/ops") {
+        if path.starts_with("/api/folders/folder-1/ops") {
             write_response(&mut stream, "410 Gone", b"").await;
-        } else if path == "/folders/folder-1/tree" {
+        } else if path == "/api/folders/folder-1/tree" {
             saw_tree.store(true, Ordering::Release);
             write_response(&mut stream, "200 OK", br#"{"nodes":[],"up_to_seq":123}"#).await;
         } else {

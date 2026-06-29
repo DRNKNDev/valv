@@ -21,11 +21,7 @@ pub async fn submit_op(
     folder_id: &str,
     req: &SubmitOpRequest,
 ) -> Result<SubmitOpResponse> {
-    let url = format!(
-        "{}/folders/{}/ops",
-        backend_url.trim_end_matches('/'),
-        folder_id
-    );
+    let url = format!("{}/folders/{}/ops", crate::api_base(backend_url), folder_id);
     let response = client.post(url).bearer_auth(token).json(req).send().await?;
     if response.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(anyhow!(

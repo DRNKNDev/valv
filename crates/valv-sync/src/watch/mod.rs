@@ -355,10 +355,7 @@ async fn upload_pending_chunks(
         })
         .collect::<Vec<_>>();
     let batch = client
-        .post(format!(
-            "{}/objects/batch",
-            backend_url.trim_end_matches('/')
-        ))
+        .post(format!("{}/objects/batch", crate::api_base(backend_url)))
         .bearer_auth(token)
         .json(&BatchRequest::new(BatchOperation::Upload, objects))
         .send()
