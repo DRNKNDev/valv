@@ -69,15 +69,17 @@ async function handleUploadObject(
   size: number,
 ): Promise<BatchResponseObject> {
   const existing = await opts.auth.db
-    .select({ chunkHash: opts.auth.schema.chunks.chunkHash })
+    .select({ chunkHash: opts.auth.schema.chunks.chunkHash, refcount: opts.auth.schema.chunks.refcount })
     .from(opts.auth.schema.chunks)
     .where(eq(opts.auth.schema.chunks.chunkHash, oid))
     .limit(1);
-  if (existing[0]) {
+  if (existing[0] && existing[0].refcount > 0) {
     return { oid, size };
   }
 
-  await opts.auth.db.insert(opts.auth.schema.chunks).values({ chunkHash: oid, sizeBytes: size, refcount: 0 });
+  if (!existing[0]) {
+    await opts.auth.db.insert(opts.auth.schema.chunks).values({ chunkHash: oid, sizeBytes: size, refcount: 0 });
+  }
   const href = await getSignedUrl(
     opts.s3Client,
     new PutObjectCommand({

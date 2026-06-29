@@ -16,7 +16,7 @@ describe("blobstore batch coordination", () => {
   });
 
   it("deduplicates upload hits and stages upload misses", async () => {
-    const db = new BlobTestDb({ existingChunks: ["known"] });
+    const db = new BlobTestDb({ existingChunks: [{ chunkHash: "known", refcount: 1 }] });
     const app = appFor(db);
 
     const response = await app.request("/objects/batch", {
@@ -47,6 +47,34 @@ describe("blobstore batch coordination", () => {
       },
     });
     expect(db.insertedChunks).toEqual([{ chunkHash: "new", sizeBytes: 2, refcount: 0 }]);
+  });
+
+  it("retries upload for existing chunks that are not referenced yet", async () => {
+    const db = new BlobTestDb({ existingChunks: [{ chunkHash: "pending", refcount: 0 }] });
+    const app = appFor(db);
+
+    const response = await app.request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({ operation: "upload", objects: [{ oid: "pending", size: 3 }] }),
+      headers: { "content-type": "application/json" },
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.objects).toEqual([
+      {
+        oid: "pending",
+        size: 3,
+        actions: {
+          upload: {
+            href: "signed:PutObjectCommand:chunks/pending",
+            header: { "Content-Type": "application/octet-stream" },
+            expires_in: 900,
+          },
+        },
+      },
+    ]);
+    expect(db.insertedChunks).toEqual([]);
   });
 
   it("issues download URLs only when a grant covers a referencing node", async () => {
@@ -96,13 +124,13 @@ class BlobTestDb implements CoreDb {
   update: CoreDb["update"];
   delete: CoreDb["delete"];
   insertedChunks: Array<{ chunkHash: string; sizeBytes: number; refcount: number }> = [];
-  private existingChunks: Set<string>;
+  private existingChunks: Array<{ chunkHash: string; refcount: number }>;
   private downloadRows: Array<{ nodeId: string; manifest: Array<{ chunk_hash: string }> }>;
   private authorized: boolean;
   private selectCalls = 0;
 
-  constructor(opts: { existingChunks?: string[]; downloadRows?: Array<{ nodeId: string; manifest: Array<{ chunk_hash: string }> }>; authorized?: boolean } = {}) {
-    this.existingChunks = new Set(opts.existingChunks ?? []);
+  constructor(opts: { existingChunks?: Array<{ chunkHash: string; refcount: number }>; downloadRows?: Array<{ nodeId: string; manifest: Array<{ chunk_hash: string }> }>; authorized?: boolean } = {}) {
+    this.existingChunks = opts.existingChunks ?? [];
     this.downloadRows = opts.downloadRows ?? [];
     this.authorized = opts.authorized ?? true;
   }
@@ -124,7 +152,7 @@ class BlobTestDb implements CoreDb {
     return {
       values: async (value: { chunkHash: string; sizeBytes: number; refcount: number }) => {
         this.insertedChunks.push(value);
-        this.existingChunks.add(value.chunkHash);
+        this.existingChunks.push({ chunkHash: value.chunkHash, refcount: value.refcount });
       },
     };
   }
@@ -137,9 +165,9 @@ class BlobTestDb implements CoreDb {
     return this.authorized ? { grantId: "grant-1", scopeNodeId: "doc", canRead: true, canWrite: false } : undefined;
   }
 
-  private chunkSelectRows(callIndex: number): Array<{ chunkHash: string }> {
-    const known = [...this.existingChunks][callIndex];
-    return known ? [{ chunkHash: known }] : [];
+  private chunkSelectRows(callIndex: number): Array<{ chunkHash: string; refcount: number }> {
+    const known = this.existingChunks[callIndex];
+    return known ? [known] : [];
   }
 }
 

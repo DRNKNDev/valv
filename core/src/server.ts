@@ -42,6 +42,7 @@ const auth = createAuth(db, {
 const s3Client = new S3Client({
   endpoint: requiredEnv("BUCKET_ENDPOINT"),
   region: "auto",
+  forcePathStyle: process.env.BUCKET_FORCE_PATH_STYLE === "true",
   credentials: {
     accessKeyId: requiredEnv("BUCKET_ACCESS_KEY_ID"),
     secretAccessKey: requiredEnv("BUCKET_SECRET_ACCESS_KEY"),
