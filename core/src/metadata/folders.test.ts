@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { grant, LifecycleDb, metadataAppFor } from "../../tests/test-helper.js";
+import { grant, LifecycleDb, metadataAppFor } from "../../tests/support.js";
 
 describe("folder routes", () => {
   it("creates a folder root and owner grant atomically", async () => {

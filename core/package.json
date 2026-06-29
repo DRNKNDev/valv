@@ -7,7 +7,6 @@
   "scripts": {
     "db:migrate:sqlite": "drizzle-kit migrate --config drizzle.sqlite.config.ts",
     "dev": "tsx watch src/server.ts",
-    "smoke": "vitest run --config vitest.smoke.config.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { LifecycleDb, metadataAppFor } from "../../tests/test-helper.js";
+import { LifecycleDb, metadataAppFor } from "../../tests/support.js";
 
 describe("invite routes", () => {
   it("defaults invite scope to folder root and does not roll back when email fails", async () => {

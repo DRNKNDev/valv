@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { sha256Hex } from "../auth/index.js";
-import { grant, LifecycleDb, metadataAppFor } from "../../tests/test-helper.js";
+import { grant, LifecycleDb, metadataAppFor } from "../../tests/support.js";
 
 describe("grant routes", () => {
   it("requires covering authorization before revoking a grant", async () => {
