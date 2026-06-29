@@ -176,7 +176,9 @@ async fn accept_loop(listener: UnixListener, app: Router) -> Result<()> {
                 .serve_connection(io, service)
                 .await
             {
-                eprintln!("daemon socket connection failed: {err}");
+                if !err.to_string().contains("shutting down") {
+                    eprintln!("daemon socket connection failed: {err}");
+                }
             }
         });
     }
