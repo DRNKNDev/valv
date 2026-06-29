@@ -84,8 +84,8 @@ export function registerGrantRoutes(router: Hono<{ Variables: MetadataVariables 
     const routeScope = hasGrantRouteStore(auth.db) && auth.db.getGrantScopeForRoute
       ? await auth.db.getGrantScopeForRoute(grantId)
       : undefined;
-    const grants = routeScope ? [{ scopeNodeId: routeScope }] : await auth.db
-      .select({ scopeNodeId: auth.schema.folderGrants.scopeNodeId })
+    const grants = routeScope ? [{ scopeNodeId: routeScope, deviceId: undefined }] : await auth.db
+      .select({ scopeNodeId: auth.schema.folderGrants.scopeNodeId, deviceId: auth.schema.folderGrants.deviceId })
       .from(auth.schema.folderGrants)
       .where(eq(auth.schema.folderGrants.grantId, grantId))
       .limit(1);
@@ -103,6 +103,12 @@ export function registerGrantRoutes(router: Hono<{ Variables: MetadataVariables 
       await auth.db.deleteGrantForRoute(grantId);
     } else {
       await auth.db.delete(auth.schema.folderGrants).where(eq(auth.schema.folderGrants.grantId, grantId));
+      if (target.deviceId) {
+        await auth.db
+          .update(auth.schema.devices)
+          .set({ tokenHash: `revoked:${grantId}` })
+          .where(eq(auth.schema.devices.deviceId, target.deviceId));
+      }
     }
     return ctx.body(null, 204);
   });

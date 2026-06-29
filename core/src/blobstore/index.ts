@@ -19,6 +19,7 @@ type BatchRequest = {
 type BatchResponseObject = {
   oid: string;
   size: number;
+  already_exists?: boolean;
   actions?: {
     upload?: { href: string; header?: Record<string, string>; expires_in?: number };
     download?: { href: string; expires_in?: number };
@@ -41,7 +42,7 @@ export function createBlobstoreRouter(opts: CreateBlobstoreRouterOptions): Hono<
   const router = new Hono<{ Variables: AuthVariables }>();
   router.use("*", createAuthMiddleware(opts.auth));
 
-  router.post("/objects/batch", async (ctx) => {
+  const handleBatch = async (ctx: any) => {
     const principal = ctx.var.principal;
     if (!principal) {
       return ctx.json({ error: "unauthenticated" }, 401);
@@ -58,7 +59,9 @@ export function createBlobstoreRouter(opts: CreateBlobstoreRouterOptions): Hono<
       body.objects.map((object) => handleDownloadObject(opts, principal, object.oid, object.size)),
     );
     return ctx.json({ transfer: "basic", objects });
-  });
+  };
+
+  router.post("/objects/batch", handleBatch);
 
   return router;
 }
@@ -74,7 +77,7 @@ async function handleUploadObject(
     .where(eq(opts.auth.schema.chunks.chunkHash, oid))
     .limit(1);
   if (existing[0] && existing[0].refcount > 0) {
-    return { oid, size };
+    return { oid, size, already_exists: true };
   }
 
   if (!existing[0]) {
@@ -93,6 +96,7 @@ async function handleUploadObject(
   return {
     oid,
     size,
+    already_exists: false,
     actions: {
       upload: {
         href,

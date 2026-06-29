@@ -34,10 +34,11 @@ describe("blobstore batch coordination", () => {
 
     expect(response.status).toBe(200);
     expect(body.transfer).toBe("basic");
-    expect(body.objects[0]).toEqual({ oid: "known", size: 1 });
+    expect(body.objects[0]).toEqual({ oid: "known", size: 1, already_exists: true });
     expect(body.objects[1]).toEqual({
       oid: "new",
       size: 2,
+      already_exists: false,
       actions: {
         upload: {
           href: "signed:PutObjectCommand:chunks/new",
@@ -65,6 +66,7 @@ describe("blobstore batch coordination", () => {
       {
         oid: "pending",
         size: 3,
+        already_exists: false,
         actions: {
           upload: {
             href: "signed:PutObjectCommand:chunks/pending",

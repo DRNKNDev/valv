@@ -10,7 +10,7 @@ export function registerVersionRoutes(
   auth: CoreAuth,
   hub: MetadataHub,
 ): void {
-  router.get("/folders/:id/nodes/:nodeId/versions", async (ctx) => {
+  const listVersions = async (ctx: any) => {
     const principal = requirePrincipal(ctx);
     const nodeId = ctx.req.param("nodeId");
     const grant = await checkGrant(auth.db, nodeId, principal, "read", auth.schema);
@@ -29,12 +29,16 @@ export function registerVersionRoutes(
         version_id: version.versionId,
         content_hash: version.contentHash,
         size_bytes: version.sizeBytes,
+        manifest: version.manifest,
         author_device_id: version.authorDeviceId,
         created_at: toIso(version.createdAt),
         is_conflict_copy: version.isConflictCopy,
       })),
     );
-  });
+  };
+
+  router.get("/folders/:id/nodes/:nodeId/versions", listVersions);
+  router.get("/folders/:id/versions/:nodeId", listVersions);
 
   router.post("/folders/:id/nodes/:nodeId/versions/:versionId/restore", async (ctx) => {
     const principal = requirePrincipal(ctx);

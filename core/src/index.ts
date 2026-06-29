@@ -1,4 +1,4 @@
-export { createAuth, authenticateRequest, createAuthMiddleware } from "./auth/index.js";
+export { createAuth, authenticateRequest, createAuthMiddleware, generateDeviceToken, sha256Hex } from "./auth/index.js";
 export type { AuthResult, CoreAuth, CoreDb, CoreSchema, Principal } from "./auth/index.js";
 export { createDeviceAuthRouter } from "./auth/device.js";
 export { createBlobstoreRouter, chunkKey } from "./blobstore/index.js";

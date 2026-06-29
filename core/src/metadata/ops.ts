@@ -73,8 +73,15 @@ export function registerOpRoutes(
   router.post("/folders/:id/ops", async (ctx) => {
     const principal = requirePrincipal(ctx);
     const body = (await ctx.req.json()) as SubmitOpRequest;
-    const response = await submitOp(auth, hub, ctx.req.param("id"), principal, body);
-    return ctx.json(response);
+    try {
+      const response = await submitOp(auth, hub, ctx.req.param("id"), principal, body);
+      return ctx.json(response);
+    } catch (error) {
+      if (error instanceof Response) {
+        return error;
+      }
+      throw error;
+    }
   });
 }
 
@@ -106,6 +113,17 @@ export async function submitOp(
     throw new Response(JSON.stringify({ error: grant.reason }), { status: 403 });
   }
 
+  if (op.op_type === "move") {
+    const parents = await auth.db
+      .select({ nodeId: auth.schema.nodes.nodeId, type: auth.schema.nodes.type })
+      .from(auth.schema.nodes)
+      .where(eq(auth.schema.nodes.nodeId, op.payload.new_parent_id))
+      .limit(1);
+    if (!parents[0] || parents[0].type !== "folder") {
+      throw new Response(JSON.stringify({ error: "parent_not_found" }), { status: 404 });
+    }
+  }
+
   return inTransaction(auth, async (tx) => {
     if (auth.schema === pgSchema && typeof tx.execute === "function") {
       await tx.execute(sql`SELECT node_id FROM nodes WHERE node_id = ${op.node_id} FOR UPDATE`);
@@ -133,6 +151,23 @@ export async function submitOp(
         node_id: op.node_id,
         conflict_version_id: conflictVersionId,
       } satisfies SubmitOpResponse;
+    }
+
+    if (op.op_type === "rename" || op.op_type === "move") {
+      const nextName = op.op_type === "rename" ? op.payload.new_name : (await currentNode(auth, tx, op.node_id))?.name;
+      const nextParentId = op.op_type === "move" ? op.payload.new_parent_id : (await currentNode(auth, tx, op.node_id))?.parentId;
+      if (nextName && nextParentId) {
+        const collisions = await tx
+          .select({ nodeId: auth.schema.nodes.nodeId })
+          .from(auth.schema.nodes)
+          .where(
+            sql`${auth.schema.nodes.folderId} = ${folderId} AND ${auth.schema.nodes.parentId} = ${nextParentId} AND ${auth.schema.nodes.name} = ${nextName} AND ${auth.schema.nodes.nodeId} <> ${op.node_id} AND ${auth.schema.nodes.deletedAt} IS NULL`,
+          )
+          .limit(1);
+        if (collisions[0]) {
+          throw new Response(JSON.stringify({ error: "name_collision" }), { status: 409 });
+        }
+      }
     }
 
     await applyMetadataMutation(auth, tx, op.node_id, op);
@@ -228,7 +263,21 @@ async function submitOpWithStore(
     nodePatch.name = op.payload.new_name;
   }
   if (op.op_type === "move") {
+    const parent = await db.getNodeForOp(op.payload.new_parent_id);
+    if (!parent || parent.type !== "folder") {
+      throw new Response(JSON.stringify({ error: "parent_not_found" }), { status: 404 });
+    }
+    const existing = await db.findLiveChildForOp({ folderId, parentId: op.payload.new_parent_id, name: node.name });
+    if (existing && existing.nodeId !== op.node_id) {
+      throw new Response(JSON.stringify({ error: "name_collision" }), { status: 409 });
+    }
     nodePatch.parentId = op.payload.new_parent_id;
+  }
+  if (op.op_type === "rename") {
+    const existing = await db.findLiveChildForOp({ folderId, parentId: node.parentId ?? "", name: op.payload.new_name });
+    if (existing && existing.nodeId !== op.node_id) {
+      throw new Response(JSON.stringify({ error: "name_collision" }), { status: 409 });
+    }
   }
   if (op.op_type === "delete") {
     nodePatch.deletedAt = new Date();
@@ -327,6 +376,19 @@ async function applyMetadataMutation(
   }
 }
 
+async function currentNode(
+  auth: CoreAuth,
+  tx: CoreAuth["db"],
+  nodeId: string,
+): Promise<{ name: string; parentId: string | null } | undefined> {
+  const rows = await tx
+    .select({ name: auth.schema.nodes.name, parentId: auth.schema.nodes.parentId })
+    .from(auth.schema.nodes)
+    .where(eq(auth.schema.nodes.nodeId, nodeId))
+    .limit(1);
+  return rows[0];
+}
+
 async function insertVersionAndOp(
   auth: CoreAuth,
   tx: CoreAuth["db"],
@@ -339,6 +401,10 @@ async function insertVersionAndOp(
   let versionId = "";
   if (op.op_type === "new_version") {
     versionId = isConflictCopy ? newId() : op.payload.version_id;
+    let previousManifest: ChunkRef[] = [];
+    if (!isConflictCopy) {
+      previousManifest = await currentVersionManifest(auth, tx, nodeId);
+    }
     await tx.insert(auth.schema.versions).values({
       versionId,
       nodeId,
@@ -356,6 +422,13 @@ async function insertVersionAndOp(
         .where(inArray(auth.schema.chunks.chunkHash, chunkHashes));
     }
     if (!isConflictCopy) {
+      const previousChunkHashes = previousManifest.map((chunk) => chunk.chunk_hash);
+      if (previousChunkHashes.length > 0) {
+        await tx
+          .update(auth.schema.chunks)
+          .set({ refcount: sql`CASE WHEN ${auth.schema.chunks.refcount} > 0 THEN ${auth.schema.chunks.refcount} - 1 ELSE 0 END` })
+          .where(inArray(auth.schema.chunks.chunkHash, previousChunkHashes));
+      }
       await tx
         .update(auth.schema.nodes)
         .set({ currentVersionId: versionId })
@@ -372,6 +445,21 @@ async function insertVersionAndOp(
     actorDeviceId,
   });
   return versionId;
+}
+
+async function currentVersionManifest(
+  auth: CoreAuth,
+  tx: CoreAuth["db"],
+  nodeId: string,
+): Promise<ChunkRef[]> {
+  const rows = await tx
+    .select({ manifest: auth.schema.versions.manifest })
+    .from(auth.schema.nodes)
+    .innerJoin(auth.schema.versions, eq(auth.schema.nodes.currentVersionId, auth.schema.versions.versionId))
+    .where(eq(auth.schema.nodes.nodeId, nodeId))
+    .limit(1);
+  const manifest = rows[0]?.manifest;
+  return Array.isArray(manifest) ? manifest as ChunkRef[] : [];
 }
 
 async function latestSeqForNode(

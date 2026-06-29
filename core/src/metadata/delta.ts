@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { sql } from "drizzle-orm";
+import { eq, or, sql } from "drizzle-orm";
 
 import type { CoreAuth, Principal } from "../auth/index.js";
 import { checkGrant } from "./authz.js";
@@ -50,7 +50,7 @@ export async function pullDelta(auth: CoreAuth, folderId: string, principal: Pri
   if (!rootNodeId) {
     throw new Response(JSON.stringify({ error: "folder_not_found" }), { status: 404 });
   }
-  const grant = await checkGrant(auth.db, rootNodeId, principal, "read", auth.schema);
+  const grant = await readableGrantForFolder(auth, folderId, rootNodeId, principal);
   if (!grant.granted) {
     throw new Response(JSON.stringify({ error: grant.reason }), { status: 403 });
   }
@@ -93,7 +93,7 @@ export async function pullTree(auth: CoreAuth, folderId: string, principal: Prin
   if (!rootNodeId) {
     throw new Response(JSON.stringify({ error: "folder_not_found" }), { status: 404 });
   }
-  const grant = await checkGrant(auth.db, rootNodeId, principal, "read", auth.schema);
+  const grant = await readableGrantForFolder(auth, folderId, rootNodeId, principal);
   if (!grant.granted) {
     throw new Response(JSON.stringify({ error: grant.reason }), { status: 403 });
   }
@@ -140,6 +140,48 @@ async function folderHeadSeq(auth: CoreAuth, folderId: string): Promise<number> 
 
 function hasDeltaStore(db: CoreAuth["db"]): db is CoreAuth["db"] & DeltaStoreDb {
   return "getDeltaOpsForScope" in db && "getTreeNodesForScope" in db && "getFolderHeadSeqForDelta" in db;
+}
+
+async function readableGrantForFolder(auth: CoreAuth, folderId: string, rootNodeId: string, principal: Principal) {
+  const rootGrant = await checkGrant(auth.db, rootNodeId, principal, "read", auth.schema);
+  if (rootGrant.granted) {
+    return rootGrant;
+  }
+
+  const deviceUserId = principal.type === "device" ? await loadDeviceUserId(auth, principal.deviceId) : undefined;
+  const principalCondition =
+    principal.type === "user"
+      ? eq(auth.schema.folderGrants.userId, principal.userId)
+      : deviceUserId
+        ? or(eq(auth.schema.folderGrants.deviceId, principal.deviceId), eq(auth.schema.folderGrants.userId, deviceUserId))
+        : eq(auth.schema.folderGrants.deviceId, principal.deviceId);
+  const rows = await auth.db
+    .select({
+      grantId: auth.schema.folderGrants.grantId,
+      scopeNodeId: auth.schema.folderGrants.scopeNodeId,
+      canRead: auth.schema.folderGrants.canRead,
+      canWrite: auth.schema.folderGrants.canWrite,
+    })
+    .from(auth.schema.folderGrants)
+    .where(sql`${auth.schema.folderGrants.folderId} = ${folderId} AND ${principalCondition}`)
+    .limit(1);
+  const grant = rows[0];
+  if (!grant) {
+    return rootGrant;
+  }
+  if (!grant.canRead && !grant.canWrite) {
+    return { granted: false as const, reason: "insufficient_permission" as const };
+  }
+  return { granted: true as const, grantId: grant.grantId, scopeNodeId: grant.scopeNodeId, canWrite: grant.canWrite };
+}
+
+async function loadDeviceUserId(auth: CoreAuth, deviceId: string): Promise<string | undefined> {
+  const rows = await auth.db
+    .select({ userId: auth.schema.devices.userId })
+    .from(auth.schema.devices)
+    .where(eq(auth.schema.devices.deviceId, deviceId))
+    .limit(1);
+  return rows[0]?.userId ?? undefined;
 }
 
 function parseOpPayload(payload: Record<string, unknown> | string): Record<string, unknown> {

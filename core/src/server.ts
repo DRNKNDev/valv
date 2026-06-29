@@ -57,6 +57,7 @@ app.route("/auth", createDeviceAuthRouter(auth));
 app.route("/api", createMetadataRouter({ auth, hub, sendInviteEmail }));
 app.route("/api", createBlobstoreRouter({ auth, s3Client, bucketName }));
 app.route("/ws", createRealtimeRouter({ auth, hub }));
+app.get("/health", (c) => c.json({ ok: true }));
 
 startGc(auth.db, s3Client, bucketName);
 
@@ -74,7 +75,7 @@ serve(
 function createDb(databaseUrl: string): CoreAuth["db"] {
   if (isSqliteUrl(databaseUrl)) {
     const sqlitePath = databaseUrl.startsWith("file:") ? databaseUrl.slice("file:".length) : databaseUrl;
-    return drizzleSqlite(new Database(sqlitePath), { schema: sqliteSchema }) as CoreAuth["db"];
+    return Object.assign(drizzleSqlite(new Database(sqlitePath), { schema: sqliteSchema }), { __valvSqlite: true }) as CoreAuth["db"];
   }
   return drizzlePg(new Pool({ connectionString: databaseUrl }), { schema: pgSchema }) as CoreAuth["db"];
 }
