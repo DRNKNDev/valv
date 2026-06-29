@@ -3,7 +3,9 @@ use std::process::Command as ProcessCommand;
 use anyhow::{anyhow, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use reqwest::StatusCode;
-use valv_sync::protocol::ipc::{DaemonStatus, MountRequest, MountResponse, SyncRequest};
+use valv_sync::protocol::ipc::{
+    DaemonStatus, MountRequest, MountResponse, SyncRequest, SyncSummary,
+};
 
 use crate::{
     daemon::{daemon_client, expect_status, map_daemon_error, parse_daemon_json},
@@ -166,8 +168,11 @@ async fn cmd_sync(folder: Option<String>) -> Result<()> {
         .send()
         .await
         .map_err(map_daemon_error)?;
-    expect_status(response, StatusCode::NO_CONTENT).await?;
-    println!("Sync triggered");
+    let summary = parse_daemon_json::<SyncSummary>(response).await?;
+    println!(
+        "Sync complete: {} created, {} updated, {} remote ops applied",
+        summary.creates_submitted, summary.versions_submitted, summary.pulled_ops
+    );
     Ok(())
 }
 

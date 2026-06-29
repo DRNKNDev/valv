@@ -47,6 +47,14 @@ pub struct SyncRequest {
     pub folder_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncSummary {
+    pub creates_submitted: u64,
+    pub versions_submitted: u64,
+    pub pulled_ops: i64,
+    pub errors: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FpItem {
     pub node_id: String,
