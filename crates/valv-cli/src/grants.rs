@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use valv_sync::api_base;
 
 use crate::{
     app::GrantCreateArgs,
@@ -16,7 +17,7 @@ pub(crate) async fn cmd_grant_create(args: GrantCreateArgs) -> Result<()> {
         let response = client
             .post(format!(
                 "{}/folders/{}/invites",
-                config.backend_url.trim_end_matches('/'),
+                api_base(&config.backend_url),
                 target.folder_id
             ))
             .bearer_auth(&config.device_token)
@@ -30,14 +31,14 @@ pub(crate) async fn cmd_grant_create(args: GrantCreateArgs) -> Result<()> {
         let invite = response.json::<InviteCreateResponse>().await?;
         println!(
             "Invite URL: {}/invites/{}/accept",
-            config.backend_url.trim_end_matches('/'),
+            api_base(&config.backend_url),
             invite.invite_token
         );
     } else if let Some(name) = args.device {
         let response = client
             .post(format!(
                 "{}/folders/{}/grants",
-                config.backend_url.trim_end_matches('/'),
+                api_base(&config.backend_url),
                 target.folder_id
             ))
             .bearer_auth(&config.device_token)
@@ -95,7 +96,7 @@ pub(crate) async fn cmd_grant_revoke(grant_id: String) -> Result<()> {
     reqwest::Client::new()
         .delete(format!(
             "{}/folders/{}/grants/{}",
-            config.backend_url.trim_end_matches('/'),
+            api_base(&config.backend_url),
             folder_id,
             grant_id
         ))
@@ -109,10 +110,7 @@ pub(crate) async fn cmd_grant_revoke(grant_id: String) -> Result<()> {
 
 async fn fetch_grants(config: &CliConfig) -> Result<Vec<GrantListEntry>> {
     Ok(reqwest::Client::new()
-        .get(format!(
-            "{}/grants",
-            config.backend_url.trim_end_matches('/')
-        ))
+        .get(format!("{}/grants", api_base(&config.backend_url)))
         .bearer_auth(&config.device_token)
         .send()
         .await?
