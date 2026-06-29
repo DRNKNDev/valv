@@ -6,6 +6,7 @@ use serde::Deserialize;
 use valv_sync::{
     persistence::mounts as mount_store,
     protocol::ipc::{MountRequest, MountResponse},
+    sync_engine::delta_pull::tree_resync,
 };
 
 use crate::{internal_error, tasks::spawn_tasks_for_mount, DaemonState, ErrorResponse, MountState};
@@ -24,8 +25,13 @@ pub(crate) async fn post_mount(
     }
 
     let resolved = resolve_mount(&state, &req).await.map_err(internal_error)?;
+    let token = resolved
+        .mount_token
+        .as_deref()
+        .unwrap_or(&state.config.device_token)
+        .to_owned();
     {
-        let conn = state.db.lock().await;
+        let mut conn = state.db.lock().await;
         mount_store::upsert_mount(
             &conn,
             &req.path,
@@ -35,6 +41,18 @@ pub(crate) async fn post_mount(
             resolved.mount_token.as_deref(),
         )
         .map_err(internal_error)?;
+        if let Err(err) = tree_resync(
+            &state.client,
+            &state.config.backend_url,
+            &token,
+            &resolved.folder_id,
+            &mut conn,
+        )
+        .await
+        {
+            let _ = mount_store::delete_mount(&conn, &req.path);
+            return Err(internal_error(err));
+        }
     }
     let mount = MountState {
         path: req.path.clone(),

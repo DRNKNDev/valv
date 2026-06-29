@@ -42,6 +42,11 @@ pub fn upsert_mount(
     Ok(())
 }
 
+pub fn delete_mount(conn: &Connection, path: &str) -> Result<()> {
+    conn.execute("DELETE FROM mounts WHERE path = ?1", params![path])?;
+    Ok(())
+}
+
 pub fn get_cursor(conn: &Connection, folder_id: &str) -> Result<i64> {
     let cursor = conn
         .query_row(
