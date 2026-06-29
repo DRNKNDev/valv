@@ -9,7 +9,11 @@ use valv_sync::{
     sync_engine::delta_pull::tree_resync,
 };
 
-use crate::{internal_error, tasks::spawn_tasks_for_mount, DaemonState, ErrorResponse, MountState};
+use crate::{
+    internal_error,
+    tasks::{cancel_mount_tasks, spawn_mount_tasks},
+    DaemonState, ErrorResponse, MountState,
+};
 
 pub(crate) async fn post_mount(
     State(state): State<DaemonState>,
@@ -65,8 +69,19 @@ pub(crate) async fn post_mount(
         last_synced_at: None,
         error: None,
     };
-    state.mounts.lock().await.push(mount.clone());
-    spawn_tasks_for_mount(&state, mount).await;
+    {
+        let mut mounts = state.mounts.lock().await;
+        if let Some(existing) = mounts
+            .iter_mut()
+            .find(|existing| existing.path == mount.path)
+        {
+            *existing = mount.clone();
+        } else {
+            mounts.push(mount.clone());
+        }
+    }
+    cancel_mount_tasks(&state).await;
+    spawn_mount_tasks(&state).await;
 
     Ok(Json(MountResponse {
         folder_id: resolved.folder_id,
