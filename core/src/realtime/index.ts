@@ -74,7 +74,7 @@ export function createHub(): Hub {
 
 export function createRealtimeRouter(opts: { hub: Hub; auth: CoreAuth }): Hono<{ Variables: AuthVariables }> {
   const router = new Hono<{ Variables: AuthVariables }>();
-  router.get("/ws", async (ctx, next) => {
+  router.get("/", async (ctx, next) => {
     const principal = await authenticateRequest(ctx, opts.auth);
     if (principal.type === "unauthenticated") {
       return ctx.json({ error: "unauthenticated" }, 401);

@@ -50,7 +50,7 @@ describe("realtime hub", () => {
 
 describe("realtime router", () => {
   it("rejects unauthenticated upgrade requests", async () => {
-    const response = await createRealtimeRouter({ hub: createHub(), auth: authFor(null) }).request("/ws");
+    const response = await createRealtimeRouter({ hub: createHub(), auth: authFor(null) }).request("/");
 
     expect(response.status).toBe(401);
     await expect(response.json()).resolves.toEqual({ error: "unauthenticated" });
@@ -59,7 +59,7 @@ describe("realtime router", () => {
   it("rejects unauthorized subscribe messages", async () => {
     const hub = { subscribe: vi.fn(), unsubscribe: vi.fn(), notify: vi.fn() };
     const app = createRealtimeRouter({ hub, auth: authFor({ type: "user", userId: "user-1" }, false) });
-    const response = await app.request("/ws");
+    const response = await app.request("/");
     const ws = socket();
 
     expect(response.status).toBe(200);
