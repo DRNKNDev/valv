@@ -154,7 +154,7 @@ pub(crate) async fn fp_content(
         .client
         .post(format!(
             "{}/objects/batch",
-            state.config.backend_url.trim_end_matches('/')
+            valv_sync::api_base(&state.config.backend_url)
         ))
         .bearer_auth(token)
         .json(&BatchRequest::new(BatchOperation::Download, objects))
@@ -488,7 +488,7 @@ async fn upload_pending_chunks(
     let batch = client
         .post(format!(
             "{}/objects/batch",
-            backend_url.trim_end_matches('/')
+            valv_sync::api_base(backend_url)
         ))
         .bearer_auth(token)
         .json(&BatchRequest::new(BatchOperation::Upload, objects))

@@ -84,7 +84,7 @@ async fn resolve_mount(state: &DaemonState, req: &MountRequest) -> Result<Resolv
             .client
             .get(format!(
                 "{}/grants",
-                state.config.backend_url.trim_end_matches('/')
+                valv_sync::api_base(&state.config.backend_url)
             ))
             .bearer_auth(grant_token)
             .send()
@@ -122,7 +122,7 @@ async fn resolve_mount(state: &DaemonState, req: &MountRequest) -> Result<Resolv
         .client
         .post(format!(
             "{}/folders",
-            state.config.backend_url.trim_end_matches('/')
+            valv_sync::api_base(&state.config.backend_url)
         ))
         .bearer_auth(&state.config.device_token)
         .json(&serde_json::json!({ "name": name }))
