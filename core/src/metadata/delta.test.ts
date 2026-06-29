@@ -15,6 +15,15 @@ describe("delta pull scope filtering", () => {
     expect(response.up_to_seq).toBe(2);
   });
 
+  it("parses sqlite JSON string op payloads before returning delta ops", async () => {
+    const db = new DeltaTestDb();
+    db.ops[0].op_payload = JSON.stringify({ parent_id: "root", name: "docs", type: "folder" });
+
+    const response = await pullDelta(authFor(db), "folder-1", devicePrincipal, 0);
+
+    expect(response.ops[0].op_payload).toEqual({ parent_id: "root", name: "docs", type: "folder" });
+  });
+
   it("includes tombstoned nodes in tree and masks the scope root parent", async () => {
     const db = new DeltaTestDb();
 
@@ -45,7 +54,7 @@ type TestOp = {
   folder_id: string;
   node_id: string;
   op_type: string;
-  op_payload: Record<string, unknown>;
+  op_payload: Record<string, unknown> | string;
   actor_device_id: string;
   applied_at: Date;
 };

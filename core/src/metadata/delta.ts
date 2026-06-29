@@ -9,7 +9,7 @@ type DeltaOpRow = {
   server_seq: number;
   node_id: string;
   op_type: string;
-  op_payload: Record<string, unknown>;
+  op_payload: Record<string, unknown> | string;
   actor_device_id: string;
   applied_at: Date | number | string | null;
 };
@@ -77,7 +77,7 @@ export async function pullDelta(auth: CoreAuth, folderId: string, principal: Pri
     server_seq: Number(row.server_seq),
     node_id: String(row.node_id),
     op_type: row.op_type,
-    op_payload: row.op_payload,
+    op_payload: parseOpPayload(row.op_payload),
     actor_device_id: String(row.actor_device_id),
     applied_at: toIso(row.applied_at),
   }));
@@ -140,6 +140,17 @@ async function folderHeadSeq(auth: CoreAuth, folderId: string): Promise<number> 
 
 function hasDeltaStore(db: CoreAuth["db"]): db is CoreAuth["db"] & DeltaStoreDb {
   return "getDeltaOpsForScope" in db && "getTreeNodesForScope" in db && "getFolderHeadSeqForDelta" in db;
+}
+
+function parseOpPayload(payload: Record<string, unknown> | string): Record<string, unknown> {
+  if (typeof payload !== "string") {
+    return payload;
+  }
+  const parsed = JSON.parse(payload) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("op_payload must decode to a JSON object");
+  }
+  return parsed as Record<string, unknown>;
 }
 
 async function executeRows(auth: CoreAuth, query: unknown): Promise<any[]> {
