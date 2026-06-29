@@ -94,7 +94,7 @@ export function registerInviteRoutes(
     }
 
     if (sendInviteEmail) {
-      sendInviteEmail({ to: invitedEmail, inviteToken, folderName }).catch((error: unknown) => {
+      await sendInviteEmail({ to: invitedEmail, inviteToken, folderName }).catch((error: unknown) => {
         console.error("Failed to send invite email", error);
       });
     }

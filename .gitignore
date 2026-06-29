@@ -1,0 +1,20 @@
+# Mirrors the OSS-relevant subset of the root .gitignore — update both together.
+
+node_modules/
+dist/
+target/
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.sqlite
+*.sqlite-journal
+*.db
+*.db-journal
+.DS_Store
+*.pem
+*.key
+xcuserdata/
+macos/spike/SpikeApp/SpikeApp/Config.local.swift
+macos/spike/SpikeApp/SpikeApp.xcodeproj/xcuserdata/
+macos/spike/SpikeApp/SpikeApp.xcodeproj/project.xcworkspace/xcuserdata/

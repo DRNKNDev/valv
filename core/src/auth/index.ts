@@ -62,6 +62,9 @@ export function createAuth(db: CoreDb, opts: CreateAuthOptions): CoreAuth {
       provider: opts.provider ?? "pg",
       schema,
     }),
+    emailAndPassword: {
+      enabled: true,
+    },
   });
 
   return Object.assign(auth, { db, schema });

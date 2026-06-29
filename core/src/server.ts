@@ -1,3 +1,5 @@
+import { existsSync, readFileSync } from "node:fs";
+
 import { S3Client } from "@aws-sdk/client-s3";
 import { serve } from "@hono/node-server";
 import Database from "better-sqlite3";
@@ -21,24 +23,28 @@ import {
   type CoreAuth,
 } from "./index.js";
 
-const databaseUrl = requiredEnv("DATABASE_URL");
-const bucketName = requiredEnv("R2_BUCKET");
+loadDotEnv(".env");
+
+const databaseUrl = requiredEnv("VALV_DATABASE_URL");
+const port = Number(process.env.VALV_PORT ?? 4747);
+const appBaseUrl = process.env.VALV_BASE_URL ?? `http://localhost:${port}`;
+const bucketName = requiredEnv("BUCKET_NAME");
 
 const db = createDb(databaseUrl);
 const provider = isSqliteUrl(databaseUrl) ? "sqlite" : "pg";
 const schema = provider === "sqlite" ? sqliteSchema : pgSchema;
 const auth = createAuth(db, {
-  secret: requiredEnv("AUTH_SECRET"),
-  baseURL: process.env.APP_BASE_URL,
+  secret: requiredEnv("VALV_AUTH_SECRET"),
+  baseURL: appBaseUrl,
   provider,
   schema,
 });
 const s3Client = new S3Client({
-  endpoint: requiredEnv("R2_ENDPOINT"),
+  endpoint: requiredEnv("BUCKET_ENDPOINT"),
   region: "auto",
   credentials: {
-    accessKeyId: requiredEnv("R2_ACCESS_KEY_ID"),
-    secretAccessKey: requiredEnv("R2_SECRET_ACCESS_KEY"),
+    accessKeyId: requiredEnv("BUCKET_ACCESS_KEY_ID"),
+    secretAccessKey: requiredEnv("BUCKET_SECRET_ACCESS_KEY"),
   },
 });
 const hub = createHub();
@@ -56,7 +62,7 @@ startGc(auth.db, s3Client, bucketName);
 serve(
   {
     fetch: app.fetch,
-    port: Number(process.env.PORT ?? 3000),
+    port,
     websocket: { server: new WebSocketServer({ noServer: true }) },
   },
   (info) => {
@@ -77,14 +83,21 @@ function isSqliteUrl(databaseUrl: string): boolean {
 }
 
 function maybeCreateSendInviteEmail() {
-  const apiToken = process.env.CF_EMAIL_API_TOKEN;
-  const from = process.env.CF_EMAIL_FROM;
-  const appBaseUrl = process.env.APP_BASE_URL;
-  if (!apiToken || !from || !appBaseUrl) {
-    console.warn("Invite emails disabled: set CF_EMAIL_API_TOKEN, CF_EMAIL_FROM, and APP_BASE_URL to enable them.");
+  const smtpPass = process.env.SMTP_PASS;
+  const from = process.env.EMAIL_FROM;
+  const smtpPort = process.env.SMTP_PORT === undefined ? undefined : Number(process.env.SMTP_PORT);
+  if (!smtpPass || !from) {
+    console.warn("Invite emails disabled: set SMTP_PASS and EMAIL_FROM to enable them.");
     return undefined;
   }
-  return createSendInviteEmail({ apiToken, from, appBaseUrl });
+  return createSendInviteEmail({
+    smtpHost: process.env.SMTP_HOST,
+    smtpPort,
+    smtpUser: process.env.SMTP_USER,
+    smtpPass,
+    from,
+    appBaseUrl,
+  });
 }
 
 function requiredEnv(name: string): string {
@@ -93,4 +106,26 @@ function requiredEnv(name: string): string {
     throw new Error(`Missing required environment variable: ${name}`);
   }
   return value;
+}
+
+function loadDotEnv(path: string): void {
+  if (!existsSync(path)) {
+    return;
+  }
+
+  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+
+    const separatorIndex = trimmed.indexOf("=");
+    if (separatorIndex === -1) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, separatorIndex).trim();
+    const rawValue = trimmed.slice(separatorIndex + 1).trim();
+    process.env[key] ??= rawValue.replace(/^['"]|['"]$/g, "");
+  }
 }

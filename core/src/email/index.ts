@@ -7,19 +7,22 @@ export type SendInviteEmail = (opts: {
 }) => Promise<void>;
 
 export type CreateSendInviteEmailOptions = {
-  apiToken: string;
+  smtpHost?: string;
+  smtpPort?: number;
+  smtpUser?: string;
+  smtpPass: string;
   from: string;
   appBaseUrl: string;
 };
 
 export function createSendInviteEmail(opts: CreateSendInviteEmailOptions): SendInviteEmail {
   const transporter = nodemailer.createTransport({
-    host: "smtp.mx.cloudflare.net",
-    port: 465,
-    secure: true,
+    host: opts.smtpHost ?? "smtp.mx.cloudflare.net",
+    port: opts.smtpPort ?? 465,
+    secure: opts.smtpPort === undefined || opts.smtpPort === 465,
     auth: {
-      user: "apitoken",
-      pass: opts.apiToken,
+      user: opts.smtpUser ?? "apitoken",
+      pass: opts.smtpPass,
     },
   });
 
