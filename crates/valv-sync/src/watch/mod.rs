@@ -130,6 +130,10 @@ pub fn collapse_events(events: Vec<FsEvent>) -> Vec<FsEvent> {
     }
 
     let mut output = collapsed.into_values().collect::<Vec<_>>();
+    output.sort_by_key(|event| match event {
+        FsEvent::Create(p) | FsEvent::Modify(p) | FsEvent::Delete(p) => p.components().count(),
+        FsEvent::Rename { from, .. } => from.components().count(),
+    });
     output.extend(renames);
     output
 }
@@ -601,6 +605,16 @@ mod tests {
         let events = vec![FsEvent::Create(path.clone()), FsEvent::Modify(path.clone())];
 
         assert_eq!(collapse_events(events), vec![FsEvent::Create(path)]);
+    }
+
+    #[test]
+    fn collapse_child_before_parent_orders_parent_first() {
+        let parent = PathBuf::from("/sync/docs");
+        let child = PathBuf::from("/sync/docs/notes.md");
+        // child arrives before parent
+        let events = vec![FsEvent::Create(child.clone()), FsEvent::Create(parent.clone())];
+        let result = collapse_events(events);
+        assert_eq!(result, vec![FsEvent::Create(parent), FsEvent::Create(child)]);
     }
 
     #[test]
