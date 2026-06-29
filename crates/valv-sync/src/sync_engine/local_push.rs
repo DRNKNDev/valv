@@ -6,8 +6,8 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use chrono::Local;
-use rusqlite::Connection;
+use chrono::{Local, Utc};
+use rusqlite::{params, Connection};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -16,7 +16,7 @@ use crate::{
         nodes::{self, get_node_by_parent_and_name, get_root_node, LocalNode},
         versions,
     },
-    protocol::sync::{CreatePayload, NodeType, SubmitOpRequest, SubmitOpResponse},
+    protocol::sync::{CreatePayload, DeletePayload, NodeType, SubmitOpRequest, SubmitOpResponse},
     sync_engine::op_submit::{submit_op, upload_then_submit_new_version},
 };
 
@@ -194,7 +194,117 @@ pub async fn push_local(
         }
     }
 
+    submit_deletes_for_missing(
+        &mut summary,
+        mount_root,
+        folder_id,
+        db,
+        client,
+        backend_url,
+        token,
+    )
+    .await?;
+
     Ok(summary)
+}
+
+#[derive(Debug, Clone)]
+struct MirrorNode {
+    node_id: String,
+    parent_id: Option<String>,
+    name: String,
+    node_type: String,
+    current_version_id: Option<String>,
+    server_seq: i64,
+}
+
+async fn submit_deletes_for_missing(
+    summary: &mut PushSummary,
+    mount_root: &Path,
+    folder_id: &str,
+    db: &Arc<Mutex<Connection>>,
+    client: &reqwest::Client,
+    backend_url: &str,
+    token: &str,
+) -> Result<()> {
+    let nodes = {
+        let conn = db.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, parent_id, name, node_type, current_version_id, server_seq
+             FROM nodes
+             WHERE folder_id = ?1 AND deleted_at IS NULL
+             ORDER BY parent_id IS NOT NULL, name ASC",
+        )?;
+        let rows = stmt.query_map(params![folder_id], |row| {
+            Ok(MirrorNode {
+                node_id: row.get(0)?,
+                parent_id: row.get(1)?,
+                name: row.get(2)?,
+                node_type: row.get(3)?,
+                current_version_id: row.get(4)?,
+                server_seq: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let Some(root) = nodes.iter().find(|node| node.parent_id.is_none()) else {
+        return Ok(());
+    };
+    let mut paths = std::collections::HashMap::from([(root.node_id.clone(), mount_root.to_path_buf())]);
+
+    for node in nodes.iter().filter(|node| node.parent_id.is_some()) {
+        let Some(parent_path) = node.parent_id.as_ref().and_then(|parent_id| paths.get(parent_id)) else {
+            continue;
+        };
+        let path = parent_path.join(&node.name);
+        paths.insert(node.node_id.clone(), path.clone());
+
+        if path.exists() || node.node_type != "file" || node.current_version_id.is_none() {
+            continue;
+        }
+        if !has_local_version(db, node.current_version_id.as_deref().unwrap()).await? {
+            continue;
+        }
+
+        let req = SubmitOpRequest::Delete {
+            node_id: node.node_id.clone(),
+            based_on_seq: node.server_seq,
+            payload: DeletePayload {},
+        };
+        match submit_op(client, backend_url, token, folder_id, &req).await {
+            Ok(SubmitOpResponse::Applied { server_seq, .. }) => {
+                let conn = db.lock().await;
+                conn.execute(
+                    "UPDATE nodes SET deleted_at = ?1, server_seq = ?2 WHERE node_id = ?3",
+                    params![Utc::now().to_rfc3339(), server_seq, node.node_id],
+                )?;
+                summary.creates_submitted += 1;
+            }
+            Ok(SubmitOpResponse::Superseded { .. } | SubmitOpResponse::ConflictCopy { .. }) => {
+                summary.skipped += 1;
+            }
+            Err(error) => {
+                eprintln!(
+                    "push_local: failed to submit delete for {}: {error}",
+                    path.display()
+                );
+                summary.errors += 1;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn has_local_version(db: &Arc<Mutex<Connection>>, version_id: &str) -> Result<bool> {
+    let conn = db.lock().await;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM versions WHERE version_id = ?1",
+        params![version_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 struct EntryInfo {

@@ -1,16 +1,19 @@
-use std::{path::PathBuf, sync::atomic::Ordering, time::Duration};
+use std::{collections::HashMap, fs, path::PathBuf, sync::atomic::Ordering, time::Duration};
 
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::Utc;
+use serde::Deserialize;
 use tokio::{
     sync::mpsc,
     time::{interval, MissedTickBehavior},
 };
 use valv_sync::{
+    persistence::versions::{upsert_version, LocalVersion},
     protocol::{
         ipc::{SyncRequest, SyncSummary},
-        sync::WsPushNotification,
+        sync::{ChunkRef, WsPushNotification},
     },
+    storage::download_chunks,
     sync_engine::{
         delta_pull::pull_delta,
         local_push::{push_local, PushSummary},
@@ -197,6 +200,10 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
     let error = match pull_result {
         Ok(pulled_ops) => {
             summary.pulled_ops = pulled_ops;
+            if let Err(error) = materialize_mount_files(state, mount).await {
+                eprintln!("materialize files failed for {}: {error}", mount.folder_id);
+                summary.errors += 1;
+            }
             None
         }
         Err(error) => {
@@ -208,6 +215,125 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
     set_mount_pending_ops(state, &mount.folder_id, 0).await;
     set_mount_syncing(state, &mount.folder_id, false, error).await;
     summary
+}
+
+#[derive(Debug)]
+struct MaterializeNode {
+    node_id: String,
+    parent_id: Option<String>,
+    name: String,
+    node_type: String,
+    current_version_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteVersion {
+    version_id: String,
+    content_hash: String,
+    size_bytes: u64,
+    manifest: Vec<ChunkRef>,
+}
+
+async fn materialize_mount_files(state: &DaemonState, mount: &MountState) -> anyhow::Result<()> {
+    let nodes = {
+        let conn = state.db.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, parent_id, name, node_type, current_version_id
+             FROM nodes
+             WHERE folder_id = ?1 AND deleted_at IS NULL
+             ORDER BY parent_id IS NOT NULL, name ASC",
+        )?;
+        let rows = stmt.query_map([&mount.folder_id], |row| {
+            Ok(MaterializeNode {
+                node_id: row.get(0)?,
+                parent_id: row.get(1)?,
+                name: row.get(2)?,
+                node_type: row.get(3)?,
+                current_version_id: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let Some(root) = nodes.iter().find(|node| node.parent_id.is_none()) else {
+        return Ok(());
+    };
+
+    let mut paths = HashMap::from([(root.node_id.clone(), PathBuf::from(&mount.path))]);
+    fs::create_dir_all(&mount.path)?;
+
+    for node in nodes.iter().filter(|node| node.parent_id.is_some()) {
+        let Some(parent_path) = node.parent_id.as_ref().and_then(|parent_id| paths.get(parent_id)) else {
+            continue;
+        };
+        let path = parent_path.join(&node.name);
+        paths.insert(node.node_id.clone(), path.clone());
+
+        if node.node_type == "folder" {
+            fs::create_dir_all(path)?;
+            continue;
+        }
+
+        let Some(version_id) = node.current_version_id.as_deref() else {
+            continue;
+        };
+        let version = fetch_remote_version(state, mount, &node.node_id, version_id).await?;
+        {
+            let conn = state.db.lock().await;
+            upsert_version(
+                &conn,
+                &LocalVersion {
+                    version_id: version.version_id.clone(),
+                    node_id: node.node_id.clone(),
+                    folder_id: mount.folder_id.clone(),
+                    content_hash: version.content_hash.clone(),
+                    size_bytes: version.size_bytes,
+                    manifest_json: serde_json::to_string(&version.manifest)?,
+                },
+            )?;
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let token = mount.effective_token(&state.config).to_owned();
+        let bytes = download_chunks(
+            &state.client,
+            &state.config.backend_url,
+            &token,
+            &version.manifest,
+        )
+        .await?;
+        fs::write(path, bytes)?;
+    }
+
+    Ok(())
+}
+
+async fn fetch_remote_version(
+    state: &DaemonState,
+    mount: &MountState,
+    node_id: &str,
+    version_id: &str,
+) -> anyhow::Result<RemoteVersion> {
+    let token = mount.effective_token(&state.config).to_owned();
+    let versions = state
+        .client
+        .get(format!(
+            "{}/folders/{}/versions/{}",
+            valv_sync::api_base(&state.config.backend_url),
+            mount.folder_id,
+            node_id,
+        ))
+        .bearer_auth(token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<RemoteVersion>>()
+        .await?;
+    versions
+        .into_iter()
+        .find(|version| version.version_id == version_id)
+        .ok_or_else(|| anyhow::anyhow!("version {version_id} not found for node {node_id}"))
 }
 
 async fn run_full_sync_mount(
