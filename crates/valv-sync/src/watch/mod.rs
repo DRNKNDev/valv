@@ -257,20 +257,28 @@ async fn handle_create(
             node_id,
             server_seq,
         } => {
-            let conn = db.lock().await;
-            nodes::upsert_node(
-                &conn,
-                &LocalNode {
-                    node_id,
-                    folder_id: mount.folder_id.clone(),
-                    parent_id: Some(parent_id),
-                    name: local_name,
-                    node_type: local_node_type,
-                    current_version_id: None,
-                    server_seq,
-                    deleted_at: None,
-                },
-            )?;
+            {
+                let conn = db.lock().await;
+                nodes::upsert_node(
+                    &conn,
+                    &LocalNode {
+                        node_id: node_id.clone(),
+                        folder_id: mount.folder_id.clone(),
+                        parent_id: Some(parent_id),
+                        name: local_name,
+                        node_type: local_node_type,
+                        current_version_id: None,
+                        server_seq,
+                        deleted_at: None,
+                    },
+                )?;
+            }
+            if matches!(node_type, NodeType::File) && metadata.len() > 0 {
+                upload_file_new_version(
+                    mount, db, client, backend_url, token, &node_id, server_seq, path,
+                )
+                .await?;
+            }
         }
         SubmitOpResponse::Superseded { .. } => {
             eprintln!(
@@ -658,7 +666,7 @@ mod tests {
     async fn handle_create_applied_response_writes_local_node() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("report.md");
-        fs::write(&path, b"hello").unwrap();
+        fs::write(&path, b"").unwrap();
         let db = seeded_db();
         let (backend_url, server) = submit_op_server(vec![SubmitOpResponse::Applied {
             node_id: "server-file".into(),
@@ -717,7 +725,7 @@ mod tests {
         let docs_path = dir.path().join("docs");
         let file_path = docs_path.join("notes.md");
         fs::create_dir(&docs_path).unwrap();
-        fs::write(&file_path, b"hello").unwrap();
+        fs::write(&file_path, b"").unwrap();
         let db = seeded_db();
         let (backend_url, server) = submit_op_server(vec![
             SubmitOpResponse::Applied {
@@ -753,6 +761,75 @@ mod tests {
         assert_eq!(file.server_seq, 3);
     }
 
+    #[tokio::test]
+    async fn handle_create_uploads_content_for_new_nonempty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        fs::write(&path, b"hello").unwrap();
+        let db = seeded_db();
+        let (backend_url, server) = full_create_server(vec![
+            SubmitOpResponse::Applied {
+                node_id: "server-file".into(),
+                server_seq: 42,
+            },
+            SubmitOpResponse::Applied {
+                node_id: "version-id".into(),
+                server_seq: 43,
+            },
+        ])
+        .await;
+
+        handle_create(
+            &watch_mount(dir.path()),
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            &path,
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["op_type"], "create");
+        assert_eq!(requests[1]["op_type"], "new_version");
+    }
+
+    #[tokio::test]
+    async fn handle_create_does_not_upload_for_new_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        fs::write(&path, b"").unwrap();
+        let db = seeded_db();
+        let (backend_url, server) = submit_op_server(vec![SubmitOpResponse::Applied {
+            node_id: "server-file".into(),
+            server_seq: 42,
+        }])
+        .await;
+
+        handle_create(
+            &watch_mount(dir.path()),
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            &path,
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["op_type"], "create");
+    }
+
     fn seeded_db() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(schema_sql()).unwrap();
@@ -779,6 +856,96 @@ mod tests {
             folder_id: "folder-1".into(),
             device_name: "Test Device".into(),
         }
+    }
+
+    async fn parse_http_request_raw(stream: &mut TcpStream) -> (String, String, Vec<u8>) {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let header_end;
+        loop {
+            let n = stream.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "connection closed before headers");
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+        let header_text = String::from_utf8_lossy(&buf[..header_end]);
+        let request_line = header_text.lines().next().unwrap();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap().to_owned();
+        let path = parts.next().unwrap().to_owned();
+        let content_length = header_text
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, val)| val.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = buf[header_end..].to_vec();
+        while body.len() < content_length {
+            let n = stream.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "connection closed before body");
+            body.extend_from_slice(&tmp[..n]);
+        }
+        body.truncate(content_length);
+        (method, path, body)
+    }
+
+    // Handles Create op + objects/batch + chunk PUT + NewVersion op.
+    async fn full_create_server(
+        responses: Vec<SubmitOpResponse>,
+    ) -> (String, JoinHandle<Vec<serde_json::Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let server_url = base_url.clone();
+        let server = tokio::spawn(async move {
+            let mut responses = VecDeque::from(responses);
+            let mut requests = Vec::new();
+            while !responses.is_empty() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (method, path, body) = parse_http_request_raw(&mut stream).await;
+                if method == "POST" && path.ends_with("/objects/batch") {
+                    let batch_req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let objects = batch_req["objects"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|obj| {
+                            let oid = obj["oid"].as_str().unwrap();
+                            let size = obj["size"].as_u64().unwrap();
+                            serde_json::json!({
+                                "oid": oid,
+                                "size": size,
+                                "actions": {
+                                    "upload": {
+                                        "href": format!("{server_url}/upload/{oid}"),
+                                        "header": {}
+                                    }
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let resp = serde_json::to_vec(
+                        &serde_json::json!({"transfer": "basic", "objects": objects}),
+                    )
+                    .unwrap();
+                    write_response(&mut stream, "200 OK", &resp).await;
+                } else if method == "PUT" {
+                    write_response(&mut stream, "204 No Content", b"").await;
+                } else if method == "POST" {
+                    requests.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+                    let body =
+                        serde_json::to_vec(responses.pop_front().as_ref().unwrap()).unwrap();
+                    write_response(&mut stream, "200 OK", &body).await;
+                } else {
+                    write_response(&mut stream, "404 Not Found", b"").await;
+                }
+            }
+            requests
+        });
+        (base_url, server)
     }
 
     async fn submit_op_server(
