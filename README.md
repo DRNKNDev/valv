@@ -1,80 +1,22 @@
 # Valv
 
-Valv is an open-source file sync project in the Dropbox / Nextcloud class.
+Valv is a self-hostable file sync project in the Dropbox / Nextcloud class, built around an open core backend, a Rust sync engine and daemon, and native desktop integration. The public code is licensed under AGPL-3.0.
 
-It is currently **scaffolded but still early and mostly stubbed**. The packages and workspaces exist, compile, and define the intended architecture, but they do not implement real sync behavior yet.
+## Components
 
-## What Is Here
+- `contracts/sync`: TypeScript types for operation submission, delta pull, folder snapshots, and WebSocket push notifications.
+- `contracts/http`: TypeScript types for the Git LFS-modeled chunk batch API used for blob upload and download.
+- `contracts/ipc`: TypeScript types for the local Unix socket control API used by the daemon, CLI, and macOS client.
+- `core`: Node.js backend using Hono, Drizzle, Better Auth, and S3-compatible bucket storage.
+- `crates/valv-sync`: Rust sync engine with chunking, storage, filesystem watching, and local mirror logic.
+- `crates/valvd`: Rust daemon that owns the sync engine and exposes the local control API.
+- `crates/valv-cli`: Rust CLI for controlling the daemon from a terminal.
+- `macos/spike`: macOS File Provider spike used to validate native sync integration behavior.
 
-- `contracts/sync`: TypeScript sync contract package
-- `contracts/http`: TypeScript HTTP contract package
-- `contracts/ipc`: TypeScript IPC contract package
-- `core`: TypeScript Core package stub
-- `crates/valv-sync`: Rust sync engine crate stub
-- `crates/valvd`: Rust daemon crate stub
-- `crates/valv-cli`: Rust CLI crate stub
-- `macos/app`: placeholder for the native macOS app
-- `macos/file-provider`: placeholder for the File Provider extension
+## Getting Started
 
-## Current Status
-
-Implemented today:
-- package boundaries and workspace layout
-- compilable TypeScript stubs for contracts and Core
-- compilable Rust workspace stubs
-- CI for typechecking and `cargo check`
-
-Not implemented yet:
-- real Core API logic
-- real sync protocol logic
-- real daemon / CLI behavior
-- macOS app and File Provider implementation
-
-## Development
-
-There is no root Node workspace manifest here. Run Node commands inside each package.
-
-TypeScript checks:
-
-```bash
-cd contracts/sync
-pnpm install
-pnpm exec tsc --noEmit
-
-cd ../http
-pnpm install
-pnpm exec tsc --noEmit
-
-cd ../ipc
-pnpm install
-pnpm exec tsc --noEmit
-
-cd ../../core
-pnpm install
-pnpm exec tsc --noEmit
-```
-
-Rust check:
-
-```bash
-cd crates
-cargo check --workspace
-```
-
-## CI
-
-CI lives in `.github/workflows/ci.yml` and currently runs:
-- `tsc --noEmit` for each contracts package
-- `tsc --noEmit` for `core`
-- `cargo check --workspace` for `crates`
-
-## Direction
-
-Valv is being designed around:
-- a self-hostable Core for sync, metadata, and blob coordination
-- a Rust-based sync engine and daemon
-- a native macOS client stack on top of that daemon
+Use [`core/README.md`](./core/README.md) to start the Node.js backend and register a device. Use [`crates/README.md`](./crates/README.md) to build and run the Rust daemon and CLI against that backend.
 
 ## License
 
-See [`LICENSE.md`](./LICENSE.md).
+See [`LICENSE.md`](./LICENSE.md) for the AGPL-3.0 license.
