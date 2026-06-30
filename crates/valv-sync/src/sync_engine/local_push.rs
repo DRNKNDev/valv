@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     persistence::{
+        chunks as chunk_store,
         nodes::{self, get_node_by_parent_and_name, get_root_node, LocalNode},
         versions,
     },
@@ -198,6 +199,7 @@ pub async fn push_local(
         &mut summary,
         mount_root,
         folder_id,
+        scope_node_id,
         db,
         client,
         backend_url,
@@ -222,6 +224,7 @@ async fn submit_deletes_for_missing(
     summary: &mut PushSummary,
     mount_root: &Path,
     folder_id: &str,
+    scope_node_id: Option<&str>,
     db: &Arc<Mutex<Connection>>,
     client: &reqwest::Client,
     backend_url: &str,
@@ -232,64 +235,100 @@ async fn submit_deletes_for_missing(
         let mut stmt = conn.prepare(
             "SELECT node_id, parent_id, name, node_type, current_version_id, server_seq
              FROM nodes
-             WHERE folder_id = ?1 AND deleted_at IS NULL
-             ORDER BY parent_id IS NOT NULL, name ASC",
+             WHERE folder_id = ?1 AND deleted_at IS NULL",
         )?;
-        let rows = stmt.query_map(params![folder_id], |row| {
-            Ok(MirrorNode {
-                node_id: row.get(0)?,
-                parent_id: row.get(1)?,
-                name: row.get(2)?,
-                node_type: row.get(3)?,
-                current_version_id: row.get(4)?,
-                server_seq: row.get(5)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt
+            .query_map(params![folder_id], |row| {
+                Ok(MirrorNode {
+                    node_id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    name: row.get(2)?,
+                    node_type: row.get(3)?,
+                    current_version_id: row.get(4)?,
+                    server_seq: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
-    let Some(root) = nodes.iter().find(|node| node.parent_id.is_none()) else {
+    let seed = if let Some(scope_node_id) = scope_node_id {
+        nodes.iter().find(|node| node.node_id == scope_node_id)
+    } else {
+        nodes.iter().find(|node| node.parent_id.is_none())
+    };
+    let Some(seed) = seed else {
         return Ok(());
     };
-    let mut paths = std::collections::HashMap::from([(root.node_id.clone(), mount_root.to_path_buf())]);
 
-    for node in nodes.iter().filter(|node| node.parent_id.is_some()) {
-        let Some(parent_path) = node.parent_id.as_ref().and_then(|parent_id| paths.get(parent_id)) else {
+    let mut children_map: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, node) in nodes.iter().enumerate() {
+        if let Some(parent_id) = &node.parent_id {
+            children_map.entry(parent_id.clone()).or_default().push(idx);
+        }
+    }
+
+    // The seed node anchors traversal only. For scoped mounts this means the
+    // scoped root is never evaluated as a delete candidate; only its children are.
+    let mut paths = HashMap::from([(seed.node_id.clone(), mount_root.to_path_buf())]);
+    let mut queue = VecDeque::new();
+    queue.push_back(seed.node_id.clone());
+
+    while let Some(parent_id) = queue.pop_front() {
+        let Some(child_indices) = children_map.get(&parent_id).cloned() else {
             continue;
         };
-        let path = parent_path.join(&node.name);
-        paths.insert(node.node_id.clone(), path.clone());
+        for idx in child_indices {
+            let node = &nodes[idx];
+            let parent_path = paths[&parent_id].clone();
+            let path = parent_path.join(&node.name);
+            paths.insert(node.node_id.clone(), path.clone());
+            queue.push_back(node.node_id.clone());
 
-        if path.exists() || node.node_type != "file" || node.current_version_id.is_none() {
-            continue;
-        }
-        if !has_local_version(db, node.current_version_id.as_deref().unwrap()).await? {
-            continue;
-        }
+            if path.exists() {
+                continue;
+            }
 
-        let req = SubmitOpRequest::Delete {
-            node_id: node.node_id.clone(),
-            based_on_seq: node.server_seq,
-            payload: DeletePayload {},
-        };
-        match submit_op(client, backend_url, token, folder_id, &req).await {
-            Ok(SubmitOpResponse::Applied { server_seq, .. }) => {
-                let conn = db.lock().await;
-                conn.execute(
-                    "UPDATE nodes SET deleted_at = ?1, server_seq = ?2 WHERE node_id = ?3",
-                    params![Utc::now().to_rfc3339(), server_seq, node.node_id],
-                )?;
-                summary.creates_submitted += 1;
+            let should_delete = match node.node_type.as_str() {
+                "folder" => {
+                    folder_descendant_files_are_local(&nodes, &children_map, &node.node_id, db)
+                        .await?
+                }
+                "file" => {
+                    let Some(version_id) = node.current_version_id.as_deref() else {
+                        continue;
+                    };
+                    has_local_version(db, version_id).await?
+                }
+                _ => false,
+            };
+            if !should_delete {
+                continue;
             }
-            Ok(SubmitOpResponse::Superseded { .. } | SubmitOpResponse::ConflictCopy { .. }) => {
-                summary.skipped += 1;
-            }
-            Err(error) => {
-                eprintln!(
-                    "push_local: failed to submit delete for {}: {error}",
-                    path.display()
-                );
-                summary.errors += 1;
+
+            let req = SubmitOpRequest::Delete {
+                node_id: node.node_id.clone(),
+                based_on_seq: node.server_seq,
+                payload: DeletePayload {},
+            };
+            match submit_op(client, backend_url, token, folder_id, &req).await {
+                Ok(SubmitOpResponse::Applied { server_seq, .. }) => {
+                    let conn = db.lock().await;
+                    conn.execute(
+                        "UPDATE nodes SET deleted_at = ?1, server_seq = ?2 WHERE node_id = ?3",
+                        params![Utc::now().to_rfc3339(), server_seq, node.node_id],
+                    )?;
+                    summary.creates_submitted += 1;
+                }
+                Ok(SubmitOpResponse::Superseded { .. } | SubmitOpResponse::ConflictCopy { .. }) => {
+                    summary.skipped += 1;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "push_local: failed to submit delete for {}: {error}",
+                        path.display()
+                    );
+                    summary.errors += 1;
+                }
             }
         }
     }
@@ -297,14 +336,49 @@ async fn submit_deletes_for_missing(
     Ok(())
 }
 
+async fn folder_descendant_files_are_local(
+    nodes: &[MirrorNode],
+    children_map: &HashMap<String, Vec<usize>>,
+    folder_node_id: &str,
+    db: &Arc<Mutex<Connection>>,
+) -> Result<bool> {
+    let mut queue = VecDeque::from([folder_node_id.to_owned()]);
+    while let Some(parent_id) = queue.pop_front() {
+        let Some(child_indices) = children_map.get(&parent_id) else {
+            continue;
+        };
+        for idx in child_indices {
+            let child = &nodes[*idx];
+            if child.node_type == "folder" {
+                queue.push_back(child.node_id.clone());
+                continue;
+            }
+            if child.node_type == "file" {
+                let Some(version_id) = child.current_version_id.as_deref() else {
+                    return Ok(false);
+                };
+                if !has_local_version(db, version_id).await? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 async fn has_local_version(db: &Arc<Mutex<Connection>>, version_id: &str) -> Result<bool> {
     let conn = db.lock().await;
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM versions WHERE version_id = ?1",
-        params![version_id],
-        |row| row.get(0),
-    )?;
-    Ok(count > 0)
+    let Some(version) = versions::get_version(&conn, version_id)? else {
+        return Ok(false);
+    };
+    let manifest =
+        serde_json::from_str::<Vec<crate::protocol::sync::ChunkRef>>(&version.manifest_json)?;
+    for chunk in manifest {
+        if !chunk_store::is_uploaded(&conn, &chunk.chunk_hash)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 struct EntryInfo {
@@ -830,6 +904,365 @@ mod tests {
         assert_eq!(requests.len(), 1);
     }
 
+    #[tokio::test]
+    async fn push_local_submits_delete_for_missing_synced_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seeded_db();
+        seed_file_with_version(&db, "file-node", "delete-me.txt", 42).await;
+        let (backend_url, server) = local_push_server(vec![MockOp::Applied {
+            node_id: "file-node".into(),
+            server_seq: 5,
+        }])
+        .await;
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["op_type"], "delete");
+        assert_eq!(requests[0]["node_id"], "file-node");
+        let node = node(&db, "file-node").await;
+        assert!(node.deleted_at.is_some());
+        assert_eq!(node.server_seq, 5);
+    }
+
+    #[tokio::test]
+    async fn push_local_submits_deletes_for_removed_dir_and_nested_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seeded_db();
+        seed_folder(&db, "folder-node", "root-node", "gone", 2).await;
+        seed_file_with_version_under(
+            &db,
+            "nested-file",
+            "folder-node",
+            "nested.txt",
+            "version-nested",
+            12,
+            3,
+        )
+        .await;
+        let (backend_url, server) = local_push_server(vec![
+            MockOp::Applied {
+                node_id: "folder-node".into(),
+                server_seq: 4,
+            },
+            MockOp::Applied {
+                node_id: "nested-file".into(),
+                server_seq: 5,
+            },
+        ])
+        .await;
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["node_id"], "folder-node");
+        assert_eq!(requests[1]["node_id"], "nested-file");
+        assert!(node(&db, "folder-node").await.deleted_at.is_some());
+        assert!(node(&db, "nested-file").await.deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn push_local_delete_sweep_independent_of_row_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seeded_db();
+        seed_file_with_version_under(
+            &db,
+            "child-file",
+            "parent-folder",
+            "child.txt",
+            "version-child",
+            8,
+            3,
+        )
+        .await;
+        seed_folder(&db, "parent-folder", "root-node", "parent", 2).await;
+        let (backend_url, server) = local_push_server(vec![
+            MockOp::Applied {
+                node_id: "parent-folder".into(),
+                server_seq: 4,
+            },
+            MockOp::Applied {
+                node_id: "child-file".into(),
+                server_seq: 5,
+            },
+        ])
+        .await;
+
+        push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["node_id"], "parent-folder");
+        assert_eq!(requests[1]["node_id"], "child-file");
+        assert!(node(&db, "parent-folder").await.deleted_at.is_some());
+        assert!(node(&db, "child-file").await.deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn push_local_tombstones_folder_so_materialization_skips_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seeded_db();
+        seed_folder(&db, "folder-node", "root-node", "removed", 2).await;
+        let (backend_url, server) = local_push_server(vec![MockOp::Applied {
+            node_id: "folder-node".into(),
+            server_seq: 3,
+        }])
+        .await;
+
+        push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let deleted_at: Option<String> = {
+            let conn = db.lock().await;
+            conn.query_row(
+                "SELECT deleted_at FROM nodes WHERE node_id = ?1",
+                params!["folder-node"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn push_local_delete_missing_sibling_leaves_other_live() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("file-b.txt"), vec![b'b'; 42]).unwrap();
+        let db = seeded_db();
+        seed_file_with_version_under(&db, "file-a", "root-node", "file-a.txt", "version-a", 42, 2)
+            .await;
+        seed_file_with_version_under(&db, "file-b", "root-node", "file-b.txt", "version-b", 42, 3)
+            .await;
+        let (backend_url, server) = local_push_server(vec![MockOp::Applied {
+            node_id: "file-a".into(),
+            server_seq: 4,
+        }])
+        .await;
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["node_id"], "file-a");
+        assert!(node(&db, "file-a").await.deleted_at.is_some());
+        assert!(node(&db, "file-b").await.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn push_local_scoped_does_not_delete_out_of_scope_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seeded_db();
+        seed_folder(&db, "scope-folder", "root-node", "scope", 2).await;
+        seed_file_with_version_under(
+            &db,
+            "scope-file",
+            "scope-folder",
+            "inside.txt",
+            "version-inside",
+            12,
+            3,
+        )
+        .await;
+        seed_file_with_version_under(
+            &db,
+            "out-of-scope-file",
+            "root-node",
+            "outside.txt",
+            "version-outside",
+            12,
+            4,
+        )
+        .await;
+        let (backend_url, server) = local_push_server(vec![MockOp::Applied {
+            node_id: "scope-file".into(),
+            server_seq: 5,
+        }])
+        .await;
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            Some("scope-folder"),
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["node_id"], "scope-file");
+        assert!(node(&db, "scope-folder").await.deleted_at.is_none());
+        assert!(node(&db, "scope-file").await.deleted_at.is_some());
+        assert!(node(&db, "out-of-scope-file").await.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn push_local_does_not_delete_folder_with_undownloaded_descendant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seeded_db();
+        seed_folder(&db, "remote-folder", "root-node", "remote", 2).await;
+        seed_file_without_local_version(
+            &db,
+            "remote-file",
+            "remote-folder",
+            "not-downloaded.txt",
+            "remote-version",
+            3,
+        )
+        .await;
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.creates_submitted, 0);
+        assert!(node(&db, "remote-folder").await.deleted_at.is_none());
+        assert!(node(&db, "remote-file").await.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn push_local_superseded_folder_delete_is_skipped_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seeded_db();
+        seed_folder(&db, "folder-node", "root-node", "gone", 2).await;
+        seed_file_with_version_under(
+            &db,
+            "nested-file",
+            "folder-node",
+            "nested.txt",
+            "version-nested",
+            12,
+            3,
+        )
+        .await;
+        let (backend_url, server) = local_push_server(vec![
+            MockOp::Superseded,
+            MockOp::Applied {
+                node_id: "nested-file".into(),
+                server_seq: 5,
+            },
+        ])
+        .await;
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["node_id"], "folder-node");
+        assert_eq!(requests[1]["node_id"], "nested-file");
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.errors, 0);
+        assert!(node(&db, "folder-node").await.deleted_at.is_none());
+        assert!(node(&db, "nested-file").await.deleted_at.is_some());
+    }
+
     fn seeded_db() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(schema_sql()).unwrap();
@@ -856,17 +1289,54 @@ mod tests {
         name: &str,
         size_bytes: u64,
     ) {
+        seed_file_with_version_under(db, node_id, "root-node", name, "version-1", size_bytes, 3)
+            .await;
+    }
+
+    async fn seed_folder(
+        db: &Arc<Mutex<Connection>>,
+        node_id: &str,
+        parent_id: &str,
+        name: &str,
+        server_seq: i64,
+    ) {
         let conn = db.lock().await;
         upsert_node(
             &conn,
             &LocalNode {
                 node_id: node_id.into(),
                 folder_id: "folder-1".into(),
-                parent_id: Some("root-node".into()),
+                parent_id: Some(parent_id.into()),
+                name: name.into(),
+                node_type: "folder".into(),
+                current_version_id: None,
+                server_seq,
+                deleted_at: None,
+            },
+        )
+        .unwrap();
+    }
+
+    async fn seed_file_with_version_under(
+        db: &Arc<Mutex<Connection>>,
+        node_id: &str,
+        parent_id: &str,
+        name: &str,
+        version_id: &str,
+        size_bytes: u64,
+        server_seq: i64,
+    ) {
+        let conn = db.lock().await;
+        upsert_node(
+            &conn,
+            &LocalNode {
+                node_id: node_id.into(),
+                folder_id: "folder-1".into(),
+                parent_id: Some(parent_id.into()),
                 name: name.into(),
                 node_type: "file".into(),
-                current_version_id: Some("version-1".into()),
-                server_seq: 3,
+                current_version_id: Some(version_id.into()),
+                server_seq,
                 deleted_at: None,
             },
         )
@@ -874,7 +1344,7 @@ mod tests {
         upsert_version(
             &conn,
             &LocalVersion {
-                version_id: "version-1".into(),
+                version_id: version_id.into(),
                 node_id: node_id.into(),
                 folder_id: "folder-1".into(),
                 content_hash: "hash".into(),
@@ -885,8 +1355,39 @@ mod tests {
         .unwrap();
     }
 
+    async fn seed_file_without_local_version(
+        db: &Arc<Mutex<Connection>>,
+        node_id: &str,
+        parent_id: &str,
+        name: &str,
+        version_id: &str,
+        server_seq: i64,
+    ) {
+        let conn = db.lock().await;
+        upsert_node(
+            &conn,
+            &LocalNode {
+                node_id: node_id.into(),
+                folder_id: "folder-1".into(),
+                parent_id: Some(parent_id.into()),
+                name: name.into(),
+                node_type: "file".into(),
+                current_version_id: Some(version_id.into()),
+                server_seq,
+                deleted_at: None,
+            },
+        )
+        .unwrap();
+    }
+
+    async fn node(db: &Arc<Mutex<Connection>>, node_id: &str) -> LocalNode {
+        let conn = db.lock().await;
+        get_node(&conn, node_id).unwrap().unwrap()
+    }
+
     enum MockOp {
         Applied { node_id: String, server_seq: i64 },
+        Superseded,
         Error,
     }
 
@@ -915,6 +1416,13 @@ mod tests {
                             let body = serde_json::to_vec(&SubmitOpResponse::Applied {
                                 node_id,
                                 server_seq,
+                            })
+                            .unwrap();
+                            write_response(&mut stream, "200 OK", &body).await;
+                        }
+                        MockOp::Superseded => {
+                            let body = serde_json::to_vec(&SubmitOpResponse::Superseded {
+                                current_seq: 99,
                             })
                             .unwrap();
                             write_response(&mut stream, "200 OK", &body).await;
