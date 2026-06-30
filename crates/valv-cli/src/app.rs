@@ -1,10 +1,11 @@
-use std::process::Command as ProcessCommand;
+use std::{fs, process::Command as ProcessCommand};
 
 use anyhow::{anyhow, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use reqwest::StatusCode;
 use valv_sync::protocol::ipc::{
-    DaemonStatus, MountRequest, MountResponse, SyncRequest, SyncSummary,
+    DaemonStatus, MountRequest, MountResponse, RestoreRequest, RestoreResponse, SyncRequest,
+    SyncSummary, VersionsRequest, VersionsResponse,
 };
 
 use crate::{
@@ -35,6 +36,13 @@ enum Command {
     Sync {
         #[arg(long)]
         folder: Option<String>,
+    },
+    Versions {
+        path: String,
+    },
+    Restore {
+        path: String,
+        version_id: String,
     },
     Grant {
         #[command(subcommand)]
@@ -87,6 +95,8 @@ pub(crate) async fn run() -> Result<()> {
         Command::Pause => cmd_pause_resume("pause", "Sync paused").await,
         Command::Resume => cmd_pause_resume("resume", "Sync resumed").await,
         Command::Sync { folder } => cmd_sync(folder).await,
+        Command::Versions { path } => cmd_versions(path).await,
+        Command::Restore { path, version_id } => cmd_restore(path, version_id).await,
         Command::Grant { command } => match command {
             GrantCommand::Create(args) => cmd_grant_create(args).await,
             GrantCommand::Revoke { grant_id } => cmd_grant_revoke(grant_id).await,
@@ -120,6 +130,65 @@ async fn cmd_mount(path: String, folder: Option<String>, grant: Option<String>) 
         );
     }
     Ok(())
+}
+
+async fn cmd_versions(path: String) -> Result<()> {
+    let local_path = canonical_path(&path)?;
+    let response = daemon_client()?
+        .post("http://localhost/versions")
+        .json(&VersionsRequest { local_path })
+        .send()
+        .await
+        .map_err(map_daemon_error)?;
+    let response = parse_daemon_json::<VersionsResponse>(response).await?;
+    for version in response.versions {
+        let suffix = if version.is_conflict_copy {
+            " (conflict copy)"
+        } else {
+            ""
+        };
+        println!(
+            "{}\t{}\t{}\t{}{}",
+            version.version_id,
+            version.created_at,
+            version.size_bytes,
+            version.author_device_name,
+            suffix
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_restore(path: String, version_id: String) -> Result<()> {
+    let local_path = canonical_path(&path)?;
+    let response = daemon_client()?
+        .post("http://localhost/restore")
+        .json(&RestoreRequest {
+            local_path: local_path.clone(),
+            version_id: version_id.clone(),
+        })
+        .send()
+        .await
+        .map_err(map_daemon_error)?;
+    let response = parse_daemon_json::<RestoreResponse>(response).await?;
+    match response.result.as_str() {
+        "applied" => println!("Restored {local_path} to version {version_id}"),
+        "conflict_copy" => {
+            println!("Restored as conflict copy — another write occurred concurrently")
+        }
+        "superseded" => {
+            println!("Restore superseded — a concurrent write already advanced the file")
+        }
+        result => println!("Restore result: {result}"),
+    }
+    Ok(())
+}
+
+fn canonical_path(path: &str) -> Result<String> {
+    Ok(fs::canonicalize(path)
+        .map_err(|error| anyhow!("failed to resolve {path}: {error}"))?
+        .to_string_lossy()
+        .into_owned())
 }
 
 async fn cmd_status() -> Result<()> {
