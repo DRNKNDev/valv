@@ -53,6 +53,7 @@ pub struct WatchMount {
 pub async fn fs_watch_task(
     mount: WatchMount,
     paused: Arc<AtomicBool>,
+    fs_events_paused: Arc<AtomicBool>,
     db: Arc<Mutex<Connection>>,
     client: reqwest::Client,
     backend_url: String,
@@ -62,7 +63,7 @@ pub async fn fs_watch_task(
     watch_mount(&mount.path, tx)?;
 
     while let Some(events) = debounce_next_batch(&mut rx).await {
-        if paused.load(Ordering::Acquire) {
+        if paused.load(Ordering::Acquire) || fs_events_paused.load(Ordering::Acquire) {
             continue;
         }
 
@@ -501,7 +502,7 @@ async fn handle_rename(
     from: &Path,
     to: &Path,
 ) -> Result<()> {
-    let req = {
+    let (req, updated_node) = {
         let conn = db.lock().await;
         let Some(from_node) = resolve_abs_path(&conn, &mount.path, &mount.folder_id, from)? else {
             eprintln!(
@@ -523,27 +524,45 @@ async fn handle_rename(
         let Some(from_parent_id) = from_node.parent_id.clone() else {
             return Ok(());
         };
+        let to_name = file_name(to)?;
+        let node_id = from_node.node_id.clone();
+        let to_parent_id = to_parent.node_id.clone();
 
-        if from_parent_id == to_parent.node_id {
+        let req = if from_parent_id == to_parent.node_id {
             SubmitOpRequest::Rename {
-                node_id: from_node.node_id,
+                node_id,
                 based_on_seq: from_node.server_seq,
                 payload: RenamePayload {
-                    new_name: file_name(to)?,
+                    new_name: to_name.clone(),
                 },
             }
         } else {
             SubmitOpRequest::Move {
-                node_id: from_node.node_id,
+                node_id,
                 based_on_seq: from_node.server_seq,
                 payload: MovePayload {
-                    new_parent_id: to_parent.node_id,
+                    new_parent_id: to_parent_id.clone(),
                 },
             }
-        }
+        };
+        let mut updated_node = from_node;
+        updated_node.parent_id = Some(to_parent_id);
+        updated_node.name = to_name;
+        (req, updated_node)
     };
 
-    submit_op(client, backend_url, token, &mount.folder_id, &req).await?;
+    if let SubmitOpResponse::Applied { server_seq, .. } =
+        submit_op(client, backend_url, token, &mount.folder_id, &req).await?
+    {
+        let conn = db.lock().await;
+        nodes::upsert_node(
+            &conn,
+            &LocalNode {
+                server_seq,
+                ..updated_node
+            },
+        )?;
+    }
     Ok(())
 }
 

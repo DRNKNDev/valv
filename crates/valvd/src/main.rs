@@ -63,6 +63,7 @@ enum DaemonCommand {
 #[derive(Clone)]
 struct DaemonState {
     paused: Arc<AtomicBool>,
+    fs_events_paused: Arc<AtomicBool>,
     mounts: Arc<Mutex<Vec<MountState>>>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     db: Arc<Mutex<Connection>>,
@@ -115,6 +116,7 @@ async fn run() -> Result<()> {
         .collect();
     let state = DaemonState {
         paused: Arc::new(AtomicBool::new(false)),
+        fs_events_paused: Arc::new(AtomicBool::new(false)),
         mounts: Arc::new(Mutex::new(mount_states)),
         tasks: Arc::new(Mutex::new(Vec::new())),
         db: Arc::new(Mutex::new(conn)),

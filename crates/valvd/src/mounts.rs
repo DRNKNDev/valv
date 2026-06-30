@@ -11,7 +11,7 @@ use valv_sync::{
 
 use crate::{
     internal_error,
-    tasks::{cancel_mount_tasks, spawn_mount_tasks},
+    tasks::{cancel_mount_tasks, materialize_mount_files, spawn_mount_tasks},
     DaemonState, ErrorResponse, MountState,
 };
 
@@ -69,6 +69,11 @@ pub(crate) async fn post_mount(
         last_synced_at: None,
         error: None,
     };
+    if let Err(err) = materialize_mount_files(&state, &mount).await {
+        let conn = state.db.lock().await;
+        let _ = mount_store::delete_mount(&conn, &req.path);
+        return Err(internal_error(err));
+    }
     {
         let mut mounts = state.mounts.lock().await;
         if let Some(existing) = mounts

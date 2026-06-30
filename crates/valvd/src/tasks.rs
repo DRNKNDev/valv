@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::Ordering,
     time::Duration,
 };
@@ -11,12 +11,13 @@ use chrono::Utc;
 use serde::Deserialize;
 use tokio::{
     sync::mpsc,
-    time::{interval, MissedTickBehavior},
+    time::{interval, sleep, MissedTickBehavior},
 };
 use valv_sync::{
     persistence::{
         chunks as chunk_store,
-        versions::{upsert_version, LocalVersion},
+        nodes::LocalNode,
+        versions::{self, upsert_version, LocalVersion},
     },
     protocol::{
         ipc::{SyncRequest, SyncSummary},
@@ -24,7 +25,7 @@ use valv_sync::{
     },
     storage::download_chunks,
     sync_engine::{
-        delta_pull::pull_delta,
+        delta_pull::{pull_delta, PulledNode},
         local_push::{push_local, PushSummary},
         ws_client::ws_push_loop,
     },
@@ -91,6 +92,7 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
 
     let fs_handle = tokio::spawn({
         let paused = state.paused.clone();
+        let fs_events_paused = state.fs_events_paused.clone();
         let db = state.db.clone();
         let client = state.client.clone();
         let backend_url = state.config.backend_url.clone();
@@ -101,8 +103,16 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
             device_name,
         };
         async move {
-            if let Err(error) =
-                fs_watch_task(watch_mount, paused, db, client, backend_url, token).await
+            if let Err(error) = fs_watch_task(
+                watch_mount,
+                paused,
+                fs_events_paused,
+                db,
+                client,
+                backend_url,
+                token,
+            )
+            .await
             {
                 eprintln!("filesystem watch task failed: {error}");
             }
@@ -160,10 +170,23 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
         .await
     };
     let error = match result {
-        Ok(_) => cleanup_deleted_mount_paths(state, mount)
-            .await
-            .err()
-            .map(|err| err.to_string()),
+        Ok((_, pulled)) => {
+            let was_paused = pause_watchers(state);
+            let cleanup_error = cleanup_deleted_mount_paths(state, mount)
+                .await
+                .err()
+                .map(|err| err.to_string());
+            let apply_error = apply_pulled_fs_changes(state, mount, pulled)
+                .await
+                .err()
+                .map(|err| err.to_string());
+            resume_watchers_after_debounce(state, was_paused).await;
+            if apply_error.is_some() {
+                apply_error
+            } else {
+                cleanup_error
+            }
+        }
         Err(err) => Some(err.to_string()),
     };
     set_mount_syncing(state, &mount.folder_id, false, error).await;
@@ -213,12 +236,21 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
         .await
     };
     let error = match pull_result {
-        Ok(pulled_ops) => {
+        Ok((pulled_ops, pulled)) => {
             summary.pulled_ops = pulled_ops;
+            let was_paused = pause_watchers(state);
+            if let Err(error) = apply_pulled_fs_changes(state, mount, pulled).await {
+                eprintln!(
+                    "apply pulled filesystem changes failed for {}: {error}",
+                    mount.folder_id
+                );
+                summary.errors += 1;
+            }
             if let Err(error) = materialize_mount_files(state, mount).await {
                 eprintln!("materialize files failed for {}: {error}", mount.folder_id);
                 summary.errors += 1;
             }
+            resume_watchers_after_debounce(state, was_paused).await;
             None
         }
         Err(error) => {
@@ -230,6 +262,17 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
     set_mount_pending_ops(state, &mount.folder_id, 0).await;
     set_mount_syncing(state, &mount.folder_id, false, error).await;
     summary
+}
+
+fn pause_watchers(state: &DaemonState) -> bool {
+    state.fs_events_paused.swap(true, Ordering::AcqRel)
+}
+
+async fn resume_watchers_after_debounce(state: &DaemonState, was_paused: bool) {
+    if !was_paused {
+        sleep(Duration::from_millis(250)).await;
+        state.fs_events_paused.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Debug)]
@@ -250,7 +293,302 @@ struct RemoteVersion {
     manifest: Vec<ChunkRef>,
 }
 
-async fn materialize_mount_files(state: &DaemonState, mount: &MountState) -> anyhow::Result<()> {
+pub fn node_abs_path(
+    nodes_by_id: &HashMap<String, LocalNode>,
+    mount_root: &Path,
+    scope_node_id: Option<&str>,
+    node_id: &str,
+) -> Option<PathBuf> {
+    let mut segments = Vec::new();
+    let mut current_id = node_id;
+    loop {
+        let node = nodes_by_id.get(current_id)?;
+        if scope_node_id == Some(node.node_id.as_str()) || node.parent_id.is_none() {
+            break;
+        }
+        segments.push(node.name.clone());
+        current_id = node.parent_id.as_deref()?;
+    }
+
+    let mut path = mount_root.to_path_buf();
+    for segment in segments.into_iter().rev() {
+        path.push(segment);
+    }
+    Some(path)
+}
+
+async fn apply_pulled_fs_changes(
+    state: &DaemonState,
+    mount: &MountState,
+    pulled: Vec<PulledNode>,
+) -> anyhow::Result<()> {
+    if pulled.is_empty() {
+        return Ok(());
+    }
+
+    let nodes_by_id = load_nodes_by_id(state, &mount.folder_id).await?;
+    let mount_root = PathBuf::from(&mount.path);
+    for pulled_node in pulled {
+        if let Err(error) =
+            apply_pulled_fs_change(state, mount, &nodes_by_id, &mount_root, &pulled_node).await
+        {
+            eprintln!(
+                "apply_pulled_fs_changes: failed to apply {} for {}: {error}",
+                pulled_node.op_type, pulled_node.node_id
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn load_nodes_by_id(
+    state: &DaemonState,
+    folder_id: &str,
+) -> anyhow::Result<HashMap<String, LocalNode>> {
+    let conn = state.db.lock().await;
+    let mut stmt = conn.prepare(
+        "SELECT node_id, folder_id, parent_id, name, node_type, current_version_id, server_seq, deleted_at
+         FROM nodes
+         WHERE folder_id = ?1",
+    )?;
+    let rows = stmt
+        .query_map([folder_id], |row| {
+            Ok(LocalNode {
+                node_id: row.get(0)?,
+                folder_id: row.get(1)?,
+                parent_id: row.get(2)?,
+                name: row.get(3)?,
+                node_type: row.get(4)?,
+                current_version_id: row.get(5)?,
+                server_seq: row.get(6)?,
+                deleted_at: row.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|node| (node.node_id.clone(), node))
+        .collect())
+}
+
+async fn apply_pulled_fs_change(
+    state: &DaemonState,
+    mount: &MountState,
+    nodes_by_id: &HashMap<String, LocalNode>,
+    mount_root: &Path,
+    pulled: &PulledNode,
+) -> anyhow::Result<()> {
+    match pulled.op_type.as_str() {
+        "create" if pulled.node_type == "folder" => {
+            if let Some(path) = node_abs_path(
+                nodes_by_id,
+                mount_root,
+                mount.scope_node_id.as_deref(),
+                &pulled.node_id,
+            ) {
+                fs::create_dir_all(path)?;
+            }
+        }
+        "create" if pulled.node_type == "file" => {
+            if let Some(version_id) = pulled.new_version_id.as_deref() {
+                write_canonical_version(state, mount, nodes_by_id, mount_root, pulled, version_id)
+                    .await?;
+            }
+        }
+        "rename" => {
+            let Some(old_path) = pre_op_abs_path(nodes_by_id, mount_root, mount, pulled) else {
+                return Ok(());
+            };
+            let Some(new_path) = node_abs_path(
+                nodes_by_id,
+                mount_root,
+                mount.scope_node_id.as_deref(),
+                &pulled.node_id,
+            ) else {
+                return Ok(());
+            };
+            if old_path.exists() && old_path != new_path {
+                if let Some(parent) = new_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(old_path, new_path)?;
+            }
+        }
+        "move" => {
+            let Some(old_path) = pre_op_abs_path(nodes_by_id, mount_root, mount, pulled) else {
+                return Ok(());
+            };
+            let Some(new_path) = node_abs_path(
+                nodes_by_id,
+                mount_root,
+                mount.scope_node_id.as_deref(),
+                &pulled.node_id,
+            ) else {
+                return Ok(());
+            };
+            if old_path.exists() && old_path != new_path {
+                if let Some(parent) = new_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(old_path, new_path)?;
+            }
+        }
+        "new_version" if pulled.is_conflict_copy => {
+            if pulled.actor_device_id == state.config.device_id {
+                return Ok(());
+            }
+            let Some(version_id) = pulled.new_version_id.as_deref() else {
+                return Ok(());
+            };
+            let Some(canonical_path) = node_abs_path(
+                nodes_by_id,
+                mount_root,
+                mount.scope_node_id.as_deref(),
+                &pulled.node_id,
+            ) else {
+                return Ok(());
+            };
+            let date = pulled
+                .applied_at
+                .split('T')
+                .next()
+                .unwrap_or(&pulled.applied_at);
+            let conflict_path = conflict_copy_path(&canonical_path, &pulled.actor_device_id, date)?;
+            if let Some(parent) = conflict_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let bytes =
+                download_and_store_version(state, mount, &pulled.node_id, version_id).await?;
+            fs::write(conflict_path, bytes)?;
+        }
+        "new_version" => {
+            if pulled.old_version_id == pulled.new_version_id {
+                return Ok(());
+            }
+            let Some(version_id) = pulled.new_version_id.as_deref() else {
+                return Ok(());
+            };
+            write_canonical_version(state, mount, nodes_by_id, mount_root, pulled, version_id)
+                .await?;
+        }
+        "delete" => {}
+        _ => {}
+    }
+    Ok(())
+}
+
+fn pre_op_abs_path(
+    nodes_by_id: &HashMap<String, LocalNode>,
+    mount_root: &Path,
+    mount: &MountState,
+    pulled: &PulledNode,
+) -> Option<PathBuf> {
+    let mut old_nodes = nodes_by_id.clone();
+    let node = old_nodes.get_mut(&pulled.node_id)?;
+    if let Some(old_name) = &pulled.old_name {
+        node.name = old_name.clone();
+    }
+    node.parent_id = pulled.old_parent_id.clone();
+    node_abs_path(
+        &old_nodes,
+        mount_root,
+        mount.scope_node_id.as_deref(),
+        &pulled.node_id,
+    )
+}
+
+async fn write_canonical_version(
+    state: &DaemonState,
+    mount: &MountState,
+    nodes_by_id: &HashMap<String, LocalNode>,
+    mount_root: &Path,
+    pulled: &PulledNode,
+    version_id: &str,
+) -> anyhow::Result<()> {
+    let Some(path) = node_abs_path(
+        nodes_by_id,
+        mount_root,
+        mount.scope_node_id.as_deref(),
+        &pulled.node_id,
+    ) else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = download_and_store_version(state, mount, &pulled.node_id, version_id).await?;
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+async fn download_and_store_version(
+    state: &DaemonState,
+    mount: &MountState,
+    node_id: &str,
+    version_id: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let version = fetch_remote_version(state, mount, node_id, version_id).await?;
+    {
+        let conn = state.db.lock().await;
+        upsert_version(
+            &conn,
+            &LocalVersion {
+                version_id: version.version_id.clone(),
+                node_id: node_id.to_owned(),
+                folder_id: mount.folder_id.clone(),
+                content_hash: version.content_hash.clone(),
+                size_bytes: version.size_bytes,
+                manifest_json: serde_json::to_string(&version.manifest)?,
+            },
+        )?;
+    }
+    let token = mount.effective_token(&state.config).to_owned();
+    let bytes = download_chunks(
+        &state.client,
+        &state.config.backend_url,
+        &token,
+        &version.manifest,
+    )
+    .await?;
+    {
+        let conn = state.db.lock().await;
+        for chunk in &version.manifest {
+            chunk_store::mark_uploaded(&conn, &chunk.chunk_hash, chunk.length)?;
+        }
+    }
+    Ok(bytes.to_vec())
+}
+
+fn conflict_copy_path(
+    original_path: &Path,
+    device_name: &str,
+    date: &str,
+) -> anyhow::Result<PathBuf> {
+    let file_name = original_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("path has no valid file name: {}", original_path.display())
+        })?;
+    let conflict_name = match original_path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) => {
+            let stem = original_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("path has no valid file stem: {}", original_path.display())
+                })?;
+            format!("{stem} (conflicted copy, {device_name}, {date}).{ext}")
+        }
+        None => format!("{file_name} (conflicted copy, {device_name}, {date})"),
+    };
+    Ok(original_path.with_file_name(conflict_name))
+}
+
+pub(crate) async fn materialize_mount_files(
+    state: &DaemonState,
+    mount: &MountState,
+) -> anyhow::Result<()> {
     cleanup_deleted_mount_paths(state, mount).await?;
 
     let nodes = {
@@ -311,6 +649,13 @@ async fn materialize_mount_files(state: &DaemonState, mount: &MountState) -> any
             let Some(version_id) = node.current_version_id.as_deref() else {
                 continue;
             };
+            let already_materialized = {
+                let conn = state.db.lock().await;
+                versions::get_version(&conn, version_id)?.is_some() && path.exists()
+            };
+            if already_materialized {
+                continue;
+            }
             let version = fetch_remote_version(state, mount, &node.node_id, version_id).await?;
             {
                 let conn = state.db.lock().await;
