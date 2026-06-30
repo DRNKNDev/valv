@@ -279,7 +279,14 @@ async fn handle_create(
             }
             if matches!(node_type, NodeType::File) && metadata.len() > 0 {
                 upload_file_new_version(
-                    mount, db, client, backend_url, token, &node_id, server_seq, path,
+                    mount,
+                    db,
+                    client,
+                    backend_url,
+                    token,
+                    &node_id,
+                    server_seq,
+                    path,
                 )
                 .await?;
             }
@@ -563,6 +570,10 @@ fn map_notify_event(event: Event) -> Option<FsEvent> {
                 to: event.paths[1].clone(),
             })
         }
+        // 1-path rename: file moved out of the watch tree (e.g. Finder Move to Trash)
+        EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
+            event.paths.into_iter().next().map(FsEvent::Delete)
+        }
         EventKind::Modify(_) => event.paths.into_iter().next().map(FsEvent::Modify),
         EventKind::Remove(_) => event.paths.into_iter().next().map(FsEvent::Delete),
         _ => None,
@@ -608,13 +619,63 @@ mod tests {
     }
 
     #[test]
+    fn collapse_delete_after_create_yields_delete() {
+        let path = PathBuf::from("/sync/report.md");
+        let events = vec![FsEvent::Create(path.clone()), FsEvent::Delete(path.clone())];
+
+        assert_eq!(collapse_events(events), vec![FsEvent::Delete(path)]);
+    }
+
+    #[test]
+    fn map_notify_event_one_path_name_change_maps_to_delete() {
+        let path = PathBuf::from("/sync/file.txt");
+        let event = Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Any,
+        )))
+        .add_path(path.clone());
+
+        assert_eq!(map_notify_event(event), Some(FsEvent::Delete(path)));
+    }
+
+    #[test]
+    fn map_notify_event_two_path_name_change_maps_to_rename() {
+        let src = PathBuf::from("/sync/file.txt");
+        let dst = PathBuf::from("/sync/renamed.txt");
+        let event = Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Any,
+        )))
+        .add_path(src.clone())
+        .add_path(dst.clone());
+
+        assert_eq!(
+            map_notify_event(event),
+            Some(FsEvent::Rename { from: src, to: dst })
+        );
+    }
+
+    #[test]
+    fn map_notify_event_remove_event_maps_to_delete() {
+        let path = PathBuf::from("/sync/file.txt");
+        let event =
+            Event::new(EventKind::Remove(notify::event::RemoveKind::File)).add_path(path.clone());
+
+        assert_eq!(map_notify_event(event), Some(FsEvent::Delete(path)));
+    }
+
+    #[test]
     fn collapse_child_before_parent_orders_parent_first() {
         let parent = PathBuf::from("/sync/docs");
         let child = PathBuf::from("/sync/docs/notes.md");
         // child arrives before parent
-        let events = vec![FsEvent::Create(child.clone()), FsEvent::Create(parent.clone())];
+        let events = vec![
+            FsEvent::Create(child.clone()),
+            FsEvent::Create(parent.clone()),
+        ];
         let result = collapse_events(events);
-        assert_eq!(result, vec![FsEvent::Create(parent), FsEvent::Create(child)]);
+        assert_eq!(
+            result,
+            vec![FsEvent::Create(parent), FsEvent::Create(child)]
+        );
     }
 
     #[test]
@@ -950,8 +1011,7 @@ mod tests {
                     write_response(&mut stream, "204 No Content", b"").await;
                 } else if method == "POST" {
                     requests.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
-                    let body =
-                        serde_json::to_vec(responses.pop_front().as_ref().unwrap()).unwrap();
+                    let body = serde_json::to_vec(responses.pop_front().as_ref().unwrap()).unwrap();
                     write_response(&mut stream, "200 OK", &body).await;
                 } else {
                     write_response(&mut stream, "404 Not Found", b"").await;
