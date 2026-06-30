@@ -30,13 +30,19 @@ use valv_sync::{
 mod config;
 mod control;
 mod fp;
+#[cfg(target_os = "macos")]
 mod launchd;
 mod mounts;
 mod restore;
+#[cfg(target_os = "linux")]
+mod systemd;
 mod tasks;
 
 use config::{config_path, data_dir, load_config, merge_config_mounts, socket_path, DaemonConfig};
+#[cfg(target_os = "macos")]
 use launchd::{install_daemon, uninstall_daemon};
+#[cfg(target_os = "linux")]
+use systemd::{install_daemon, uninstall_daemon};
 use tasks::{cancel_mount_tasks, spawn_mount_tasks};
 
 #[derive(Parser)]

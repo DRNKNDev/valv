@@ -1,5 +1,6 @@
 use std::{
     env, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -62,6 +63,45 @@ pub(crate) fn load_config(path: &Path) -> Result<DaemonConfig> {
     parse_config(&text)
 }
 
+pub(crate) fn ensure_config_template() -> Result<()> {
+    let path = config_path()?;
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let backend_url = prompt_value("Backend URL", "https://api.valv.dev")?;
+    let device_name = prompt_value("Device name", &default_device_name())?;
+    let contents = format!(
+        r#"backend_url = "{}"
+device_id = ""
+device_token = ""
+device_name = "{}"
+mounts = []
+"#,
+        toml_escape(&backend_url),
+        toml_escape(&device_name)
+    );
+    fs::write(&path, contents)?;
+    set_owner_only_permissions(&path)?;
+    Ok(())
+}
+
+fn prompt_value(label: &str, default: &str) -> Result<String> {
+    print!("{label} [{default}]: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let value = input.trim();
+    if value.is_empty() {
+        Ok(default.to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
 fn parse_config(text: &str) -> Result<DaemonConfig> {
     let raw: RawDaemonConfig = toml::from_str(text)?;
     let backend_url = required_config_value(raw.backend_url, "backend_url")?;
@@ -103,6 +143,24 @@ pub(crate) fn socket_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("valvd.sock"))
 }
 
+pub(crate) fn resolve_valvd_path() -> Result<PathBuf> {
+    let current = env::current_exe()?;
+    if current
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "valvd")
+    {
+        return Ok(current);
+    }
+    if let Some(parent) = current.parent() {
+        let sibling = parent.join("valvd");
+        if sibling.exists() {
+            return Ok(sibling);
+        }
+    }
+    Ok(PathBuf::from("/usr/local/bin/valvd"))
+}
+
 pub(crate) fn home_dir() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -111,6 +169,23 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
 
 pub(crate) fn default_device_name() -> String {
     env::var("HOSTNAME").unwrap_or_else(|_| "Valv Device".into())
+}
+
+fn toml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+pub(crate) fn set_owner_only_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
