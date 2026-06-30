@@ -32,6 +32,7 @@ mod control;
 mod fp;
 mod launchd;
 mod mounts;
+mod restore;
 mod tasks;
 
 use config::{config_path, data_dir, load_config, merge_config_mounts, socket_path, DaemonConfig};
@@ -144,6 +145,8 @@ async fn serve_socket(state: DaemonState, socket_path: &Path) -> Result<()> {
         .route("/pause", post(control::post_pause))
         .route("/resume", post(control::post_resume))
         .route("/sync", post(tasks::post_sync))
+        .route("/versions", post(restore::post_versions))
+        .route("/restore", post(restore::post_restore))
         .route("/fp/items", get(fp::fp_items))
         .route("/fp/item/:node_id", get(fp::fp_item))
         .route("/fp/anchor", get(fp::fp_anchor))
