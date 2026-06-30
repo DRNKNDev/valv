@@ -314,6 +314,53 @@ node_id_at_path() {
   node_json_at_path "$folder_id" "$path" | json_eval "process.stdout.write(data.node_id)"
 }
 
+get_node_id_at_path() {
+  local folder_id="$1"
+  local path="$2"
+  local node_id
+  node_id=$(node_id_at_path "$folder_id" "$path") || fail "node not found at ${path} in folder ${folder_id}"
+  [ -n "$node_id" ] || fail "node not found at ${path} in folder ${folder_id}"
+  printf '%s\n' "$node_id"
+}
+
+assert_nodes_at_paths() {
+  local folder_id="$1"
+  shift
+  local path
+  for path in "$@"; do
+    assert_node_at_path "$folder_id" "$path"
+  done
+}
+
+wait_for_file_on_device() {
+  local mount_path="$1"
+  local filename="$2"
+  local timeout_s="${3:-30}"
+  local deadline=$((SECONDS + timeout_s))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if assert_path_present "${mount_path}/${filename}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  fail "file ${filename} did not appear under ${mount_path} within ${timeout_s}s"
+}
+
+wait_for_file_content() {
+  local mount_path="$1"
+  local filename="$2"
+  local expected="$3"
+  local timeout_s="${4:-30}"
+  local deadline=$((SECONDS + timeout_s))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if grep -qF "$expected" "${mount_path}/${filename}" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  fail "timeout waiting for '${expected}' in ${mount_path}/${filename}"
+}
+
 node_seq_at_path() {
   local folder_id="$1"
   local path="$2"
