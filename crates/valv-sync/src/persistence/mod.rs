@@ -46,16 +46,16 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ty: &str)
     Ok(())
 }
 
-pub fn apply_op_log_entry(conn: &Connection, entry: &OpLogEntry) -> Result<()> {
+pub fn apply_op_log_entry(conn: &Connection, entry: &OpLogEntry) -> Result<Option<LocalNode>> {
+    let pre_op = nodes::get_node(conn, &entry.node_id)?;
     match entry.op_type.as_str() {
-        "create" => apply_create(conn, entry),
+        "create" => apply_create(conn, entry)?,
         "rename" => {
             let payload: RenamePayload = serde_json::from_value(entry.op_payload.clone())?;
             conn.execute(
                 "UPDATE nodes SET name = ?1, server_seq = ?2 WHERE node_id = ?3",
                 params![payload.new_name, entry.server_seq, entry.node_id],
             )?;
-            Ok(())
         }
         "move" => {
             let payload: MovePayload = serde_json::from_value(entry.op_payload.clone())?;
@@ -63,7 +63,6 @@ pub fn apply_op_log_entry(conn: &Connection, entry: &OpLogEntry) -> Result<()> {
                 "UPDATE nodes SET parent_id = ?1, server_seq = ?2 WHERE node_id = ?3",
                 params![payload.new_parent_id, entry.server_seq, entry.node_id],
             )?;
-            Ok(())
         }
         "delete" => {
             let deleted_at = Utc::now().to_rfc3339();
@@ -71,11 +70,11 @@ pub fn apply_op_log_entry(conn: &Connection, entry: &OpLogEntry) -> Result<()> {
                 "UPDATE nodes SET deleted_at = ?1, server_seq = ?2 WHERE node_id = ?3",
                 params![deleted_at, entry.server_seq, entry.node_id],
             )?;
-            Ok(())
         }
-        "new_version" => apply_new_version(conn, entry),
-        other => Err(anyhow!("unsupported op_type `{other}`")),
-    }
+        "new_version" => apply_new_version(conn, entry)?,
+        other => return Err(anyhow!("unsupported op_type `{other}`")),
+    };
+    Ok(pre_op)
 }
 
 pub fn apply_tree_snapshot(
@@ -148,10 +147,17 @@ fn apply_new_version(conn: &Connection, entry: &OpLogEntry) -> Result<()> {
             manifest_json,
         },
     )?;
-    conn.execute(
-        "UPDATE nodes SET current_version_id = ?1, server_seq = ?2 WHERE node_id = ?3",
-        params![payload.version_id, entry.server_seq, entry.node_id],
-    )?;
+    if payload.is_conflict_copy != Some(true) {
+        conn.execute(
+            "UPDATE nodes SET current_version_id = ?1, server_seq = ?2 WHERE node_id = ?3",
+            params![payload.version_id, entry.server_seq, entry.node_id],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE nodes SET server_seq = ?1 WHERE node_id = ?2",
+            params![entry.server_seq, entry.node_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -213,6 +219,8 @@ struct NewVersionPayload {
     content_hash: String,
     size_bytes: u64,
     manifest: Vec<crate::protocol::sync::ChunkRef>,
+    #[serde(default)]
+    is_conflict_copy: Option<bool>,
 }
 
 #[cfg(test)]
@@ -262,7 +270,7 @@ mod tests {
                 server_seq: 4,
                 node_id: "n1".into(),
                 op_type: "new_version".into(),
-                op_payload: json!({"version_id":"v1","content_hash":"hash","size_bytes":3,"manifest":[{"chunk_hash":"c1","offset":0,"length":3}]}),
+                op_payload: json!({"version_id":"v1","content_hash":"hash","size_bytes":3,"manifest":[{"chunk_hash":"c1","offset":0,"length":3}],"is_conflict_copy":null}),
                 actor_device_id: "d1".into(),
                 applied_at: "2026-06-28T00:00:03Z".into(),
             },
@@ -287,6 +295,43 @@ mod tests {
         assert_eq!(node.server_seq, 5);
         assert!(node.deleted_at.is_some());
         assert!(versions::get_version(&conn, "v1").unwrap().is_some());
+    }
+
+    #[test]
+    fn apply_new_version_conflict_copy_preserves_current_version() {
+        let conn = memory_db();
+        nodes::upsert_node(
+            &conn,
+            &nodes::LocalNode {
+                node_id: "n1".into(),
+                folder_id: "folder-1".into(),
+                parent_id: None,
+                name: "shared.txt".into(),
+                node_type: "file".into(),
+                current_version_id: Some("winner".into()),
+                server_seq: 10,
+                deleted_at: None,
+            },
+        )
+        .unwrap();
+
+        apply_new_version(
+            &conn,
+            &OpLogEntry {
+                server_seq: 11,
+                node_id: "n1".into(),
+                op_type: "new_version".into(),
+                op_payload: json!({"version_id":"loser","content_hash":"hash","size_bytes":3,"manifest":[{"chunk_hash":"c1","offset":0,"length":3}],"is_conflict_copy":true}),
+                actor_device_id: "d2".into(),
+                applied_at: "2026-06-28T00:00:03Z".into(),
+            },
+        )
+        .unwrap();
+
+        let node = nodes::get_node(&conn, "n1").unwrap().unwrap();
+        assert_eq!(node.current_version_id.as_deref(), Some("winner"));
+        assert_eq!(node.server_seq, 11);
+        assert!(versions::get_version(&conn, "loser").unwrap().is_some());
     }
 
     #[test]

@@ -1,11 +1,27 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use reqwest::StatusCode;
 use rusqlite::Connection;
 
 use crate::{
-    persistence::{apply_op_log_entry, apply_tree_snapshot, mounts},
-    protocol::sync::{DeltaPullResponse, FolderTreeResponse},
+    persistence::{apply_op_log_entry, apply_tree_snapshot, mounts, nodes, LocalNode},
+    protocol::sync::{DeltaPullResponse, FolderTreeResponse, OpLogEntry},
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PulledNode {
+    pub node_id: String,
+    pub op_type: String,
+    pub is_conflict_copy: bool,
+    pub actor_device_id: String,
+    pub applied_at: String,
+    pub old_name: Option<String>,
+    pub old_parent_id: Option<String>,
+    pub old_version_id: Option<String>,
+    pub new_name: String,
+    pub new_parent_id: Option<String>,
+    pub new_version_id: Option<String>,
+    pub node_type: String,
+}
 
 pub async fn pull_delta(
     client: &reqwest::Client,
@@ -13,8 +29,9 @@ pub async fn pull_delta(
     token: &str,
     folder_id: &str,
     conn: &mut Connection,
-) -> Result<i64> {
+) -> Result<(i64, Vec<PulledNode>)> {
     let mut cursor = mounts::get_cursor(conn, folder_id)?;
+    let mut pulled = Vec::new();
 
     loop {
         let url = format!(
@@ -33,12 +50,13 @@ pub async fn pull_delta(
             .json::<DeltaPullResponse>()
             .await?;
         for op in &delta.ops {
-            apply_op_log_entry(conn, op)?;
+            let pre_op = apply_op_log_entry(conn, op)?;
+            pulled.push(build_pulled_node(conn, op, pre_op)?);
         }
         mounts::set_cursor(conn, folder_id, delta.up_to_seq)?;
 
         if delta.ops.is_empty() || delta.up_to_seq <= cursor {
-            return Ok(delta.up_to_seq);
+            return Ok((delta.up_to_seq, pulled));
         }
         cursor = delta.up_to_seq;
     }
@@ -50,7 +68,7 @@ pub async fn tree_resync(
     token: &str,
     folder_id: &str,
     conn: &mut Connection,
-) -> Result<i64> {
+) -> Result<(i64, Vec<PulledNode>)> {
     let url = format!(
         "{}/folders/{}/tree",
         crate::api_base(backend_url),
@@ -65,7 +83,73 @@ pub async fn tree_resync(
         .json::<FolderTreeResponse>()
         .await?;
     apply_tree_snapshot(conn, folder_id, &tree)?;
-    Ok(tree.up_to_seq)
+    Ok((tree.up_to_seq, Vec::new()))
+}
+
+fn build_pulled_node(
+    conn: &Connection,
+    op: &OpLogEntry,
+    pre_op: Option<LocalNode>,
+) -> Result<PulledNode> {
+    let post_op = nodes::get_node(conn, &op.node_id)?;
+    let state = post_op.as_ref().or(pre_op.as_ref()).ok_or_else(|| {
+        anyhow!(
+            "op `{}` references unknown node `{}` after apply",
+            op.op_type,
+            op.node_id
+        )
+    })?;
+    let payload = &op.op_payload;
+    let payload_string = |field: &str| {
+        payload
+            .get(field)
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    };
+
+    let new_name = match op.op_type.as_str() {
+        "create" => payload_string("name"),
+        "rename" => payload_string("new_name"),
+        _ => None,
+    }
+    .unwrap_or_else(|| state.name.clone());
+    let new_parent_id = match op.op_type.as_str() {
+        "create" => payload_string("parent_id"),
+        "move" => payload_string("new_parent_id"),
+        _ => post_op.as_ref().and_then(|node| node.parent_id.clone()),
+    };
+    let new_version_id = match op.op_type.as_str() {
+        "new_version" => payload_string("version_id"),
+        _ => post_op
+            .as_ref()
+            .and_then(|node| node.current_version_id.clone()),
+    };
+    let node_type = if op.op_type == "create" {
+        payload_string("type").unwrap_or_else(|| state.node_type.clone())
+    } else {
+        state.node_type.clone()
+    };
+
+    Ok(PulledNode {
+        node_id: op.node_id.clone(),
+        op_type: op.op_type.clone(),
+        is_conflict_copy: op.op_type == "new_version"
+            && payload
+                .get("is_conflict_copy")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+        actor_device_id: op.actor_device_id.clone(),
+        applied_at: op.applied_at.clone(),
+        old_name: pre_op.as_ref().map(|node| node.name.clone()),
+        old_parent_id: pre_op.as_ref().and_then(|node| node.parent_id.clone()),
+        old_version_id: pre_op
+            .as_ref()
+            .and_then(|node| node.current_version_id.clone()),
+        new_name,
+        new_parent_id,
+        new_version_id,
+        node_type,
+    })
 }
 
 #[cfg(test)]
@@ -101,7 +185,7 @@ mod tests {
             .unwrap();
         mounts::upsert_mount(&conn, "/sync", "folder-1", None, None, None).unwrap();
 
-        let cursor = pull_delta(
+        let (cursor, pulled) = pull_delta(
             &reqwest::Client::new(),
             &base_url,
             "token",
@@ -113,6 +197,7 @@ mod tests {
         server.await.unwrap();
 
         assert_eq!(cursor, 123);
+        assert!(pulled.is_empty());
         assert!(saw_tree.load(Ordering::Acquire));
         assert_eq!(mounts::get_cursor(&conn, "folder-1").unwrap(), 123);
     }
