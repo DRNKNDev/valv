@@ -930,7 +930,10 @@ mod tests {
         assert_eq!(requests[0]["op_type"], "create");
         assert_eq!(requests[1]["op_type"], "new_version");
         assert_eq!(requests[1]["payload"]["size_bytes"], 0);
-        assert_eq!(requests[1]["payload"]["manifest"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            requests[1]["payload"]["manifest"].as_array().unwrap().len(),
+            0
+        );
     }
 
     fn seeded_db() -> Arc<Mutex<Connection>> {
