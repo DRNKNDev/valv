@@ -24,7 +24,7 @@ describe("conflict handling API", () => {
       based_on_seq: basedOn,
       payload: { version_id: randomUUID(), content_hash: "winner", size_bytes: 1, manifest: [] },
     });
-    const conflict = await submitOp<{ result: string; conflict_version_id: string }>(ctx.app, ctx.context.folderId, ctx.context.token, {
+    const conflict = await submitOp<{ result: string; server_seq: number; conflict_version_id: string }>(ctx.app, ctx.context.folderId, ctx.context.token, {
       op_type: "new_version",
       node_id: file.nodeId,
       based_on_seq: basedOn,
@@ -37,6 +37,18 @@ describe("conflict handling API", () => {
       bearerToken: ctx.context.token,
     });
     expect(versions).toEqual(expect.arrayContaining([expect.objectContaining({ version_id: conflict.conflict_version_id, is_conflict_copy: true })]));
+
+    const delta = await requestJson<{
+      ops: Array<{ server_seq: number; op_payload: { version_id?: string; is_conflict_copy?: boolean } }>;
+    }>(ctx.app, `/api/folders/${ctx.context.folderId}/ops?since=${basedOn}`, { bearerToken: ctx.context.token });
+    expect(delta.ops).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          server_seq: conflict.server_seq,
+          op_payload: expect.objectContaining({ version_id: conflict.conflict_version_id, is_conflict_copy: true }),
+        }),
+      ]),
+    );
 
     const staleRename = await submitOp<{ result: string; current_seq: number }>(ctx.app, ctx.context.folderId, ctx.context.token, {
       op_type: "rename",

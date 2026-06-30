@@ -250,7 +250,7 @@ async function submitOpWithStore(
       folderId,
       nodeId: op.node_id,
       opType: op.op_type,
-      opPayload: { ...op.payload, is_conflict_copy: true },
+      opPayload: { ...op.payload, version_id: conflictVersionId, is_conflict_copy: true },
       basedOnSeq: op.based_on_seq,
       actorDeviceId: principal.deviceId,
     });
@@ -440,7 +440,7 @@ async function insertVersionAndOp(
     folderId,
     nodeId,
     opType: op.op_type,
-    opPayload: isConflictCopy ? { ...op.payload, is_conflict_copy: true } : op.payload,
+    opPayload: isConflictCopy ? { ...op.payload, version_id: versionId, is_conflict_copy: true } : op.payload,
     basedOnSeq: op.based_on_seq,
     actorDeviceId,
   });

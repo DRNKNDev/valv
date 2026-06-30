@@ -130,7 +130,7 @@ async function canDownloadChunk(auth: CoreAuth, principal: Principal, oid: strin
   const rows = await auth.db
     .select({ nodeId: auth.schema.nodes.nodeId, manifest: auth.schema.versions.manifest })
     .from(auth.schema.nodes)
-    .innerJoin(auth.schema.versions, eq(auth.schema.nodes.currentVersionId, auth.schema.versions.versionId));
+    .innerJoin(auth.schema.versions, eq(auth.schema.nodes.nodeId, auth.schema.versions.nodeId));
 
   for (const row of rows) {
     const manifest = Array.isArray(row.manifest) ? row.manifest : [];
