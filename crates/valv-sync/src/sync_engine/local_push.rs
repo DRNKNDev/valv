@@ -164,7 +164,6 @@ pub async fn push_local(
                             parent_node_id: &parent_node_id,
                             name: entry.name,
                             node_type: NodeType::Folder,
-                            file_len: 0,
                             device_name,
                             db,
                             client,
@@ -222,7 +221,6 @@ pub async fn push_local(
                             parent_node_id: &parent_node_id,
                             name: entry.name,
                             node_type: NodeType::File,
-                            file_len: entry.len,
                             device_name,
                             db,
                             client,
@@ -611,7 +609,6 @@ struct CreateEntry<'a> {
     parent_node_id: &'a str,
     name: String,
     node_type: NodeType,
-    file_len: u64,
     device_name: &'a str,
     db: &'a Arc<Mutex<Connection>>,
     client: &'a reqwest::Client,
@@ -679,7 +676,7 @@ async fn create_entry(
             summary.creates_submitted += 1;
             if is_dir {
                 queue.push_back((entry.abs_path, node_id));
-            } else if entry.file_len > 0 {
+            } else {
                 let date = today_date_str();
                 let conn = entry.db.lock().await;
                 match upload_then_submit_new_version(
@@ -1165,14 +1162,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_local_does_not_submit_version_for_new_empty_file() {
+    async fn push_local_submits_version_for_new_empty_file() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("empty.txt"), b"").unwrap();
         let db = seeded_db();
-        let (backend_url, server) = local_push_server(vec![MockOp::Applied {
-            node_id: "file-node".into(),
-            server_seq: 1,
-        }])
+        let (backend_url, server) = local_push_server(vec![
+            MockOp::Applied {
+                node_id: "file-node".into(),
+                server_seq: 1,
+            },
+            MockOp::Applied {
+                node_id: "version-node".into(),
+                server_seq: 2,
+            },
+        ])
         .await;
 
         let summary = push_local(
@@ -1193,8 +1196,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.creates_submitted, 1);
-        assert_eq!(summary.versions_submitted, 0);
-        assert_eq!(requests.len(), 1);
+        assert_eq!(summary.versions_submitted, 1);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["op_type"], "create");
+        assert_eq!(requests[1]["op_type"], "new_version");
+        assert_eq!(requests[1]["payload"]["size_bytes"], 0);
+        assert_eq!(requests[1]["payload"]["manifest"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

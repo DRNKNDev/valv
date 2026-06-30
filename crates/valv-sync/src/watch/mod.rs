@@ -278,7 +278,7 @@ async fn handle_create(
                     },
                 )?;
             }
-            if matches!(node_type, NodeType::File) && metadata.len() > 0 {
+            if matches!(node_type, NodeType::File) {
                 upload_file_new_version(
                     mount,
                     db,
@@ -894,15 +894,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_create_does_not_upload_for_new_empty_file() {
+    async fn handle_create_submits_version_for_new_empty_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.txt");
         fs::write(&path, b"").unwrap();
         let db = seeded_db();
-        let (backend_url, server) = submit_op_server(vec![SubmitOpResponse::Applied {
-            node_id: "server-file".into(),
-            server_seq: 42,
-        }])
+        let (backend_url, server) = full_create_server(vec![
+            SubmitOpResponse::Applied {
+                node_id: "server-file".into(),
+                server_seq: 42,
+            },
+            SubmitOpResponse::Applied {
+                node_id: "version-id".into(),
+                server_seq: 43,
+            },
+        ])
         .await;
 
         handle_create(
@@ -920,8 +926,11 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert_eq!(requests[0]["op_type"], "create");
+        assert_eq!(requests[1]["op_type"], "new_version");
+        assert_eq!(requests[1]["payload"]["size_bytes"], 0);
+        assert_eq!(requests[1]["payload"]["manifest"].as_array().unwrap().len(), 0);
     }
 
     fn seeded_db() -> Arc<Mutex<Connection>> {
