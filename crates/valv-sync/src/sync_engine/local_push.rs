@@ -8,16 +8,21 @@ use std::{
 use anyhow::{anyhow, Result};
 use chrono::{Local, Utc};
 use rusqlite::{params, Connection};
+use sha2::Digest;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
+    chunking::chunk_file,
     persistence::{
         chunks as chunk_store,
         nodes::{self, get_node_by_parent_and_name, get_root_node, LocalNode},
         versions,
     },
-    protocol::sync::{CreatePayload, DeletePayload, NodeType, SubmitOpRequest, SubmitOpResponse},
+    protocol::sync::{
+        ChunkRef, CreatePayload, DeletePayload, MovePayload, NodeType, RenamePayload,
+        SubmitOpRequest, SubmitOpResponse,
+    },
     sync_engine::op_submit::{submit_op, upload_then_submit_new_version},
 };
 
@@ -129,6 +134,27 @@ pub async fn push_local(
                 if let Some(node) = mirror_node.filter(|node| node.deleted_at.is_none()) {
                     queue.push_back((entry.abs_path, node.node_id));
                 } else {
+                    if process_moved_entry(
+                        &mut summary,
+                        &mut queue,
+                        MovedEntry {
+                            mount_root,
+                            scope_node_id,
+                            abs_path: entry.abs_path.clone(),
+                            folder_id,
+                            parent_node_id: &parent_node_id,
+                            name: entry.name.clone(),
+                            node_type: NodeType::Folder,
+                            db,
+                            client,
+                            backend_url,
+                            token,
+                        },
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
                     create_entry(
                         &mut summary,
                         &mut queue,
@@ -166,6 +192,27 @@ pub async fn push_local(
                     )
                     .await;
                 } else {
+                    if process_moved_entry(
+                        &mut summary,
+                        &mut queue,
+                        MovedEntry {
+                            mount_root,
+                            scope_node_id,
+                            abs_path: entry.abs_path.clone(),
+                            folder_id,
+                            parent_node_id: &parent_node_id,
+                            name: entry.name.clone(),
+                            node_type: NodeType::File,
+                            db,
+                            client,
+                            backend_url,
+                            token,
+                        },
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
                     create_entry(
                         &mut summary,
                         &mut queue,
@@ -208,6 +255,174 @@ pub async fn push_local(
     .await?;
 
     Ok(summary)
+}
+
+struct MovedEntry<'a> {
+    mount_root: &'a Path,
+    scope_node_id: Option<&'a str>,
+    abs_path: PathBuf,
+    folder_id: &'a str,
+    parent_node_id: &'a str,
+    name: String,
+    node_type: NodeType,
+    db: &'a Arc<Mutex<Connection>>,
+    client: &'a reqwest::Client,
+    backend_url: &'a str,
+    token: &'a str,
+}
+
+async fn process_moved_entry(
+    summary: &mut PushSummary,
+    queue: &mut VecDeque<(PathBuf, String)>,
+    entry: MovedEntry<'_>,
+) -> Result<bool> {
+    let local_node_type = node_type_str(&entry.node_type).to_owned();
+    let candidate = {
+        let conn = entry.db.lock().await;
+        find_missing_move_candidate(
+            &conn,
+            &entry.abs_path,
+            entry.folder_id,
+            entry.mount_root,
+            entry.scope_node_id,
+            entry.parent_node_id,
+            &entry.name,
+            &local_node_type,
+        )?
+    };
+    let Some(mut node) = candidate else {
+        return Ok(false);
+    };
+
+    if node.parent_id.as_deref() != Some(entry.parent_node_id) {
+        let response = submit_op(
+            entry.client,
+            entry.backend_url,
+            entry.token,
+            entry.folder_id,
+            &SubmitOpRequest::Move {
+                node_id: node.node_id.clone(),
+                based_on_seq: node.server_seq,
+                payload: MovePayload {
+                    new_parent_id: entry.parent_node_id.to_owned(),
+                },
+            },
+        )
+        .await?;
+        let SubmitOpResponse::Applied { server_seq, .. } = response else {
+            summary.skipped += 1;
+            return Ok(true);
+        };
+        node.parent_id = Some(entry.parent_node_id.to_owned());
+        node.server_seq = server_seq;
+    }
+
+    if node.name != entry.name {
+        let response = submit_op(
+            entry.client,
+            entry.backend_url,
+            entry.token,
+            entry.folder_id,
+            &SubmitOpRequest::Rename {
+                node_id: node.node_id.clone(),
+                based_on_seq: node.server_seq,
+                payload: RenamePayload {
+                    new_name: entry.name.clone(),
+                },
+            },
+        )
+        .await?;
+        let SubmitOpResponse::Applied { server_seq, .. } = response else {
+            summary.skipped += 1;
+            return Ok(true);
+        };
+        node.name = entry.name;
+        node.server_seq = server_seq;
+    }
+
+    {
+        let conn = entry.db.lock().await;
+        nodes::upsert_node(&conn, &node)?;
+    }
+    if matches!(entry.node_type, NodeType::Folder) {
+        queue.push_back((entry.abs_path, node.node_id));
+    }
+    summary.skipped += 1;
+    Ok(true)
+}
+
+fn find_missing_move_candidate(
+    conn: &Connection,
+    new_abs_path: &Path,
+    folder_id: &str,
+    mount_root: &Path,
+    scope_node_id: Option<&str>,
+    new_parent_id: &str,
+    new_name: &str,
+    node_type: &str,
+) -> Result<Option<LocalNode>> {
+    let mut stmt = conn.prepare(
+        "SELECT node_id, folder_id, parent_id, name, node_type, current_version_id, server_seq, deleted_at
+         FROM nodes
+         WHERE folder_id = ?1 AND deleted_at IS NULL",
+    )?;
+    let nodes = stmt
+        .query_map(params![folder_id], row_to_local_node)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let by_id = nodes
+        .iter()
+        .map(|node| (node.node_id.as_str(), node))
+        .collect::<HashMap<_, _>>();
+    let mut candidates = nodes
+        .iter()
+        .filter(|node| {
+            node.node_type == node_type
+                && (node.parent_id.as_deref() == Some(new_parent_id) || node.name == new_name)
+                && local_node_abs_path(mount_root, scope_node_id, &by_id, node)
+                    .is_some_and(|path| !path.exists() && path != new_abs_path)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        Ok(candidates.pop())
+    } else {
+        Ok(None)
+    }
+}
+
+fn local_node_abs_path(
+    mount_root: &Path,
+    scope_node_id: Option<&str>,
+    by_id: &HashMap<&str, &LocalNode>,
+    node: &LocalNode,
+) -> Option<PathBuf> {
+    let mut parts = Vec::new();
+    let mut current = node;
+    loop {
+        if scope_node_id == Some(current.node_id.as_str()) || current.parent_id.is_none() {
+            break;
+        }
+        parts.push(current.name.clone());
+        current = by_id.get(current.parent_id.as_deref()?)?;
+    }
+    let mut path = mount_root.to_path_buf();
+    for part in parts.into_iter().rev() {
+        path.push(part);
+    }
+    Some(path)
+}
+
+fn row_to_local_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalNode> {
+    Ok(LocalNode {
+        node_id: row.get(0)?,
+        folder_id: row.get(1)?,
+        parent_id: row.get(2)?,
+        name: row.get(3)?,
+        node_type: row.get(4)?,
+        current_version_id: row.get(5)?,
+        server_seq: row.get(6)?,
+        deleted_at: row.get(7)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -534,12 +749,24 @@ async fn process_existing_file(summary: &mut PushSummary, file: ExistingFile<'_>
         }
     };
 
-    if stored_version
-        .as_ref()
-        .is_some_and(|version| version.size_bytes == file.metadata_len)
-    {
-        summary.skipped += 1;
-        return;
+    if let Some(version) = stored_version.as_ref() {
+        if version.size_bytes == file.metadata_len {
+            match file_content_hash(&file.abs_path) {
+                Ok(content_hash) if content_hash == version.content_hash => {
+                    summary.skipped += 1;
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!(
+                        "push_local: failed to hash {}: {error}",
+                        file.abs_path.display()
+                    );
+                    summary.errors += 1;
+                    return;
+                }
+            }
+        }
     }
 
     let date = today_date_str();
@@ -585,6 +812,27 @@ fn node_type_str(node_type: &NodeType) -> &'static str {
 
 fn today_date_str() -> String {
     Local::now().date_naive().to_string()
+}
+
+fn file_content_hash(path: &Path) -> Result<String> {
+    let chunks = chunk_file(path)?;
+    let manifest = chunks
+        .iter()
+        .map(|chunk| ChunkRef {
+            chunk_hash: chunk.hash.clone(),
+            offset: chunk.offset,
+            length: chunk.length,
+        })
+        .collect::<Vec<_>>();
+    Ok(manifest_content_hash(&manifest))
+}
+
+fn manifest_content_hash(manifest: &[ChunkRef]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    for chunk in manifest {
+        hasher.update(chunk.chunk_hash.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
@@ -717,9 +965,17 @@ mod tests {
     #[tokio::test]
     async fn push_local_skips_file_with_matching_size() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("same.txt"), vec![b'a'; 42]).unwrap();
+        let path = dir.path().join("same.txt");
+        fs::write(&path, vec![b'a'; 42]).unwrap();
         let db = seeded_db();
-        seed_file_with_version(&db, "file-node", "same.txt", 42).await;
+        seed_file_with_version_with_hash(
+            &db,
+            "file-node",
+            "same.txt",
+            42,
+            &file_content_hash(&path).unwrap(),
+        )
+        .await;
 
         let summary = push_local(
             dir.path(),
@@ -736,6 +992,43 @@ mod tests {
 
         assert_eq!(summary.versions_submitted, 0);
         assert_eq!(summary.skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn push_local_submits_new_version_for_same_size_content_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same-size.txt");
+        fs::write(&path, b"aaaa").unwrap();
+        let old_hash = file_content_hash(&path).unwrap();
+        fs::write(&path, b"bbbb").unwrap();
+        let db = seeded_db();
+        seed_file_with_version_with_hash(&db, "file-node", "same-size.txt", 4, &old_hash).await;
+        let (backend_url, server) = local_push_server(vec![MockOp::Applied {
+            node_id: "file-node".into(),
+            server_seq: 4,
+        }])
+        .await;
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(summary.versions_submitted, 1);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["op_type"], "new_version");
     }
 
     #[tokio::test]
@@ -1087,12 +1380,22 @@ mod tests {
     #[tokio::test]
     async fn push_local_delete_missing_sibling_leaves_other_live() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("file-b.txt"), vec![b'b'; 42]).unwrap();
+        let file_b = dir.path().join("file-b.txt");
+        fs::write(&file_b, vec![b'b'; 42]).unwrap();
         let db = seeded_db();
         seed_file_with_version_under(&db, "file-a", "root-node", "file-a.txt", "version-a", 42, 2)
             .await;
-        seed_file_with_version_under(&db, "file-b", "root-node", "file-b.txt", "version-b", 42, 3)
-            .await;
+        seed_file_with_version_under_with_hash(
+            &db,
+            "file-b",
+            "root-node",
+            "file-b.txt",
+            "version-b",
+            42,
+            3,
+            &file_content_hash(&file_b).unwrap(),
+        )
+        .await;
         let (backend_url, server) = local_push_server(vec![MockOp::Applied {
             node_id: "file-a".into(),
             server_seq: 4,
@@ -1293,6 +1596,26 @@ mod tests {
             .await;
     }
 
+    async fn seed_file_with_version_with_hash(
+        db: &Arc<Mutex<Connection>>,
+        node_id: &str,
+        name: &str,
+        size_bytes: u64,
+        content_hash: &str,
+    ) {
+        seed_file_with_version_under_with_hash(
+            db,
+            node_id,
+            "root-node",
+            name,
+            "version-1",
+            size_bytes,
+            3,
+            content_hash,
+        )
+        .await;
+    }
+
     async fn seed_folder(
         db: &Arc<Mutex<Connection>>,
         node_id: &str,
@@ -1326,6 +1649,22 @@ mod tests {
         size_bytes: u64,
         server_seq: i64,
     ) {
+        seed_file_with_version_under_with_hash(
+            db, node_id, parent_id, name, version_id, size_bytes, server_seq, "hash",
+        )
+        .await;
+    }
+
+    async fn seed_file_with_version_under_with_hash(
+        db: &Arc<Mutex<Connection>>,
+        node_id: &str,
+        parent_id: &str,
+        name: &str,
+        version_id: &str,
+        size_bytes: u64,
+        server_seq: i64,
+        content_hash: &str,
+    ) {
         let conn = db.lock().await;
         upsert_node(
             &conn,
@@ -1347,7 +1686,7 @@ mod tests {
                 version_id: version_id.into(),
                 node_id: node_id.into(),
                 folder_id: "folder-1".into(),
-                content_hash: "hash".into(),
+                content_hash: content_hash.into(),
                 size_bytes,
                 manifest_json: "[]".into(),
             },
