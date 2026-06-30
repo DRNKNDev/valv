@@ -5,30 +5,20 @@ set -euo pipefail
 SMOKE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "${SMOKE_DIR}/harness.sh"
 
-scripts=(
-  01-mount-sync.sh
-  02-create-file.sh
-  03-create-folder.sh
-  04-edit-file.sh
-  05-delete-file.sh
-  06-rename-file.sh
-  07-two-device-sync.sh
-  08-conflict-copy.sh
-  09-grant-scope.sh
-  10-pause-resume.sh
-)
+mapfile -t scripts < <(find "$SMOKE_DIR" -maxdepth 1 -name '[0-9][0-9]-*.sh' | sort)
 
 declare -a results=()
 failures=0
 
 for script in "${scripts[@]}"; do
-  printf 'Running %s\n' "$script"
-  if bash "${SMOKE_DIR}/${script}"; then
-    printf '[PASS] %s\n' "$script"
-    results+=("PASS ${script}")
+  script_name=$(basename "$script")
+  printf 'Running %s\n' "$script_name"
+  if bash "$script"; then
+    printf '[PASS] %s\n' "$script_name"
+    results+=("PASS ${script_name}")
   else
-    printf '[FAIL] %s\n' "$script" >&2
-    results+=("FAIL ${script}")
+    printf '[FAIL] %s\n' "$script_name" >&2
+    results+=("FAIL ${script_name}")
     failures=$((failures + 1))
   fi
 done

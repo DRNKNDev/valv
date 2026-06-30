@@ -251,6 +251,63 @@ wait_for_deleted_node_at_path() {
   fail "node at ${path} was not tombstoned in folder ${folder_id}"
 }
 
+assert_path_absent() {
+  local path="$1"
+  [ ! -e "$path" ] || fail "expected path absent: ${path}"
+}
+
+assert_path_present() {
+  local path="$1"
+  [ -e "$path" ] || fail "expected path present: ${path}"
+}
+
+wait_for_path_absent() {
+  local path="$1"
+  local timeout_s="${2:-30}"
+  local deadline=$((SECONDS + timeout_s))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ ! -e "$path" ]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  fail "path still exists after ${timeout_s}s: ${path}"
+}
+
+live_node_count_at_path() {
+  local folder_id="$1"
+  local path="$2"
+  tree_json "$folder_id" | node -e '
+    const fs = require("fs");
+    const target = process.argv[1];
+    const data = JSON.parse(fs.readFileSync(0, "utf8"));
+    const byParent = new Map();
+    for (const node of data.nodes || []) {
+      const key = node.parent_id || "__root__";
+      if (!byParent.has(key)) byParent.set(key, []);
+      byParent.get(key).push(node);
+    }
+    let matches = (byParent.get("__root__") || []).filter((node) => !node.deleted_at);
+    if (target !== "/") {
+      for (const part of target.split("/").filter(Boolean)) {
+        matches = matches.flatMap((node) =>
+          (byParent.get(node.node_id) || []).filter((child) => child.name === part && !child.deleted_at),
+        );
+      }
+    }
+    process.stdout.write(String(matches.length));
+  ' "$path"
+}
+
+assert_live_node_count_at_path() {
+  local folder_id="$1"
+  local path="$2"
+  local expected="$3"
+  local actual
+  actual=$(live_node_count_at_path "$folder_id" "$path")
+  [ "$actual" = "$expected" ] || fail "expected ${expected} live nodes at ${path}, found ${actual}"
+}
+
 node_id_at_path() {
   local folder_id="$1"
   local path="$2"
@@ -309,4 +366,43 @@ upload_file_for_api_version() {
     curl -fsS -X PUT "$href" -H "Content-Type: application/octet-stream" --data-binary "@${file}" >/dev/null
   fi
   printf '%s\t%s\n' "$hash" "$size"
+}
+
+api_create_node() {
+  local folder_id="$1"
+  local parent_path="$2"
+  local name="$3"
+  local node_type="$4"
+  local parent_id node_id response
+  parent_id=$(node_id_at_path "$folder_id" "$parent_path")
+  node_id=$(uuid)
+  response=$(api POST "/api/folders/${folder_id}/ops" "{\"op_type\":\"create\",\"payload\":{\"node_id\":\"${node_id}\",\"parent_id\":\"${parent_id}\",\"name\":$(json_string "$name"),\"type\":\"${node_type}\"}}")
+  printf '%s\t%s\n' \
+    "$(printf '%s' "$response" | json_eval "process.stdout.write(data.node_id)")" \
+    "$(printf '%s' "$response" | json_eval "process.stdout.write(String(data.server_seq))")"
+}
+
+api_create_file_with_content() {
+  local folder_id="$1"
+  local parent_path="$2"
+  local name="$3"
+  local content="$4"
+  local node_id based_on_seq tmp_file hash size version_id content_hash
+  read -r node_id based_on_seq < <(api_create_node "$folder_id" "$parent_path" "$name" file)
+  tmp_file="${TMPDIR}/api-file-${node_id}"
+  printf '%s' "$content" > "$tmp_file"
+  read -r hash size < <(upload_file_for_api_version "$tmp_file")
+  version_id=$(uuid)
+  content_hash=$(manifest_content_hash "$hash")
+  api POST "/api/folders/${folder_id}/ops" "{\"op_type\":\"new_version\",\"node_id\":\"${node_id}\",\"based_on_seq\":${based_on_seq},\"payload\":{\"version_id\":\"${version_id}\",\"content_hash\":\"${content_hash}\",\"size_bytes\":${size},\"manifest\":[{\"chunk_hash\":\"${hash}\",\"offset\":0,\"length\":${size}}]}}" >/dev/null
+  printf '%s\n' "$node_id"
+}
+
+api_delete_node_at_path() {
+  local folder_id="$1"
+  local path="$2"
+  local node_id based_on_seq
+  node_id=$(node_id_at_path "$folder_id" "$path")
+  based_on_seq=$(node_seq_at_path "$folder_id" "$path")
+  api POST "/api/folders/${folder_id}/ops" "{\"op_type\":\"delete\",\"node_id\":\"${node_id}\",\"based_on_seq\":${based_on_seq},\"payload\":{}}" >/dev/null
 }

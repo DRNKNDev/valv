@@ -123,7 +123,7 @@ cleanup() {
   if [ -n "${BUCKET_NAME:-}" ]; then
     mc rb --force "local/${BUCKET_NAME}" >/dev/null 2>&1 || true
   fi
-  if [ -n "${TMPDIR:-}" ] && [[ "$TMPDIR" == /tmp/valv-e2e-* ]]; then
+  if [ -n "${TMPDIR:-}" ] && [ -n "${SMOKE_TMP_ROOT:-}" ] && [[ "$TMPDIR" == "${SMOKE_TMP_ROOT}"/valv-e2e-* ]]; then
     rm -rf "$TMPDIR"
   fi
   exit "$status"
@@ -132,12 +132,14 @@ cleanup() {
 require_tools
 
 RUN_ID=$(node -e "process.stdout.write(require('crypto').randomUUID().slice(0, 8))")
-TMPDIR=$(mktemp -d /tmp/valv-e2e-XXXX)
+SMOKE_TMP_ROOT="${VALV_SMOKE_TMP_ROOT:-${REAL_HOME}/ValvSmoke}"
+mkdir -p "$SMOKE_TMP_ROOT"
+TMPDIR=$(mktemp -d "${SMOKE_TMP_ROOT}/valv-e2e-XXXX")
 BACKEND_URL="http://localhost:14747"
 BUCKET_NAME="valv-smoke-${RUN_ID}"
 HOME_A="${TMPDIR}/home-a"
 HOME_B="${TMPDIR}/home-b"
-export RUN_ID TMPDIR BACKEND_URL BUCKET_NAME HOME_A HOME_B
+export RUN_ID SMOKE_TMP_ROOT TMPDIR BACKEND_URL BUCKET_NAME HOME_A HOME_B
 
 trap cleanup EXIT
 
