@@ -89,6 +89,16 @@ pub enum SubmitOpResponse {
     },
 }
 
+impl SubmitOpResponse {
+    pub fn result_str(&self) -> &'static str {
+        match self {
+            Self::Applied { .. } => "applied",
+            Self::ConflictCopy { .. } => "conflict_copy",
+            Self::Superseded { .. } => "superseded",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpLogEntry {
     pub server_seq: i64,

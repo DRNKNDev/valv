@@ -56,6 +56,36 @@ pub struct SyncSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionEntry {
+    pub version_id: String,
+    pub created_at: String,
+    pub size_bytes: u64,
+    pub author_device_name: String,
+    pub is_conflict_copy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionsRequest {
+    pub local_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionsResponse {
+    pub versions: Vec<VersionEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreRequest {
+    pub local_path: String,
+    pub version_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreResponse {
+    pub result: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FpItem {
     pub node_id: String,
     pub parent_id: Option<String>,
