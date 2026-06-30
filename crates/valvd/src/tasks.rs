@@ -1,4 +1,10 @@
-use std::{collections::HashMap, fs, path::PathBuf, sync::atomic::Ordering, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    fs,
+    path::PathBuf,
+    sync::atomic::Ordering,
+    time::Duration,
+};
 
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::Utc;
@@ -8,7 +14,10 @@ use tokio::{
     time::{interval, MissedTickBehavior},
 };
 use valv_sync::{
-    persistence::versions::{upsert_version, LocalVersion},
+    persistence::{
+        chunks as chunk_store,
+        versions::{upsert_version, LocalVersion},
+    },
     protocol::{
         ipc::{SyncRequest, SyncSummary},
         sync::{ChunkRef, WsPushNotification},
@@ -150,7 +159,13 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
         )
         .await
     };
-    let error = result.err().map(|err| err.to_string());
+    let error = match result {
+        Ok(_) => cleanup_deleted_mount_paths(state, mount)
+            .await
+            .err()
+            .map(|err| err.to_string()),
+        Err(err) => Some(err.to_string()),
+    };
     set_mount_syncing(state, &mount.folder_id, false, error).await;
 }
 
@@ -224,6 +239,7 @@ struct MaterializeNode {
     name: String,
     node_type: String,
     current_version_id: Option<String>,
+    deleted_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +251,8 @@ struct RemoteVersion {
 }
 
 async fn materialize_mount_files(state: &DaemonState, mount: &MountState) -> anyhow::Result<()> {
+    cleanup_deleted_mount_paths(state, mount).await?;
+
     let nodes = {
         let conn = state.db.lock().await;
         let mut stmt = conn.prepare(
@@ -243,67 +261,162 @@ async fn materialize_mount_files(state: &DaemonState, mount: &MountState) -> any
              WHERE folder_id = ?1 AND deleted_at IS NULL
              ORDER BY parent_id IS NOT NULL, name ASC",
         )?;
-        let rows = stmt.query_map([&mount.folder_id], |row| {
-            Ok(MaterializeNode {
-                node_id: row.get(0)?,
-                parent_id: row.get(1)?,
-                name: row.get(2)?,
-                node_type: row.get(3)?,
-                current_version_id: row.get(4)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt
+            .query_map([&mount.folder_id], |row| {
+                Ok(MaterializeNode {
+                    node_id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    name: row.get(2)?,
+                    node_type: row.get(3)?,
+                    current_version_id: row.get(4)?,
+                    deleted_at: None,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
     let Some(root) = nodes.iter().find(|node| node.parent_id.is_none()) else {
         return Ok(());
     };
 
+    let mut children_map: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, node) in nodes.iter().enumerate() {
+        if let Some(parent_id) = &node.parent_id {
+            children_map.entry(parent_id.clone()).or_default().push(idx);
+        }
+    }
+
     let mut paths = HashMap::from([(root.node_id.clone(), PathBuf::from(&mount.path))]);
     fs::create_dir_all(&mount.path)?;
 
-    for node in nodes.iter().filter(|node| node.parent_id.is_some()) {
-        let Some(parent_path) = node.parent_id.as_ref().and_then(|parent_id| paths.get(parent_id)) else {
+    let mut queue = VecDeque::new();
+    queue.push_back(root.node_id.clone());
+
+    while let Some(parent_id) = queue.pop_front() {
+        let Some(child_indices) = children_map.get(&parent_id).cloned() else {
             continue;
         };
-        let path = parent_path.join(&node.name);
-        paths.insert(node.node_id.clone(), path.clone());
+        for idx in child_indices {
+            let node = &nodes[idx];
+            let parent_path = paths[&parent_id].clone();
+            let path = parent_path.join(&node.name);
+            paths.insert(node.node_id.clone(), path.clone());
+            queue.push_back(node.node_id.clone());
 
-        if node.node_type == "folder" {
-            fs::create_dir_all(path)?;
-            continue;
+            if node.node_type == "folder" {
+                fs::create_dir_all(&path)?;
+                continue;
+            }
+
+            let Some(version_id) = node.current_version_id.as_deref() else {
+                continue;
+            };
+            let version = fetch_remote_version(state, mount, &node.node_id, version_id).await?;
+            {
+                let conn = state.db.lock().await;
+                upsert_version(
+                    &conn,
+                    &LocalVersion {
+                        version_id: version.version_id.clone(),
+                        node_id: node.node_id.clone(),
+                        folder_id: mount.folder_id.clone(),
+                        content_hash: version.content_hash.clone(),
+                        size_bytes: version.size_bytes,
+                        manifest_json: serde_json::to_string(&version.manifest)?,
+                    },
+                )?;
+            }
+            let token = mount.effective_token(&state.config).to_owned();
+            let bytes = download_chunks(
+                &state.client,
+                &state.config.backend_url,
+                &token,
+                &version.manifest,
+            )
+            .await?;
+            {
+                let conn = state.db.lock().await;
+                for chunk in &version.manifest {
+                    chunk_store::mark_uploaded(&conn, &chunk.chunk_hash, chunk.length)?;
+                }
+            }
+            fs::write(&path, bytes)?;
         }
+    }
 
-        let Some(version_id) = node.current_version_id.as_deref() else {
+    Ok(())
+}
+
+async fn cleanup_deleted_mount_paths(
+    state: &DaemonState,
+    mount: &MountState,
+) -> anyhow::Result<()> {
+    let nodes = {
+        let conn = state.db.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT node_id, parent_id, name, node_type, current_version_id, deleted_at
+             FROM nodes
+             WHERE folder_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map([&mount.folder_id], |row| {
+                Ok(MaterializeNode {
+                    node_id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    name: row.get(2)?,
+                    node_type: row.get(3)?,
+                    current_version_id: row.get(4)?,
+                    deleted_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let Some(root) = nodes.iter().find(|node| node.parent_id.is_none()) else {
+        return Ok(());
+    };
+
+    let mut children_map: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, node) in nodes.iter().enumerate() {
+        if let Some(parent_id) = &node.parent_id {
+            children_map.entry(parent_id.clone()).or_default().push(idx);
+        }
+    }
+
+    let mut paths = HashMap::from([(root.node_id.clone(), PathBuf::from(&mount.path))]);
+    let mut queue = VecDeque::new();
+    let mut deleted_paths = Vec::new();
+    queue.push_back(root.node_id.clone());
+
+    while let Some(parent_id) = queue.pop_front() {
+        let Some(child_indices) = children_map.get(&parent_id).cloned() else {
             continue;
         };
-        let version = fetch_remote_version(state, mount, &node.node_id, version_id).await?;
-        {
-            let conn = state.db.lock().await;
-            upsert_version(
-                &conn,
-                &LocalVersion {
-                    version_id: version.version_id.clone(),
-                    node_id: node.node_id.clone(),
-                    folder_id: mount.folder_id.clone(),
-                    content_hash: version.content_hash.clone(),
-                    size_bytes: version.size_bytes,
-                    manifest_json: serde_json::to_string(&version.manifest)?,
-                },
-            )?;
+        for idx in child_indices {
+            let node = &nodes[idx];
+            let parent_path = paths[&parent_id].clone();
+            let path = parent_path.join(&node.name);
+            paths.insert(node.node_id.clone(), path.clone());
+            queue.push_back(node.node_id.clone());
+
+            if node.deleted_at.is_some() {
+                deleted_paths.push((path, node.node_type.clone()));
+            }
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+    }
+
+    deleted_paths.sort_by_key(|(path, _)| path.components().count());
+    for (path, node_type) in deleted_paths.into_iter().rev() {
+        let result = if node_type == "folder" {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        if let Err(error) = result {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.into());
+            }
         }
-        let token = mount.effective_token(&state.config).to_owned();
-        let bytes = download_chunks(
-            &state.client,
-            &state.config.backend_url,
-            &token,
-            &version.manifest,
-        )
-        .await?;
-        fs::write(path, bytes)?;
     }
 
     Ok(())

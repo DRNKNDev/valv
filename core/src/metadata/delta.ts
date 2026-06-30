@@ -62,7 +62,6 @@ export async function pullDelta(auth: CoreAuth, folderId: string, principal: Pri
           SELECT node_id FROM nodes WHERE node_id = ${grant.scopeNodeId}
           UNION ALL
           SELECT n.node_id FROM nodes n INNER JOIN subtree s ON n.parent_id = s.node_id
-          WHERE n.deleted_at IS NULL
         )
         SELECT server_seq, node_id, op_type, op_payload, actor_device_id, applied_at
         FROM op_log
