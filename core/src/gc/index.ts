@@ -1,8 +1,8 @@
-import { DeleteObjectCommand, type S3Client } from "@aws-sdk/client-s3";
+import type { AwsClient } from "aws4fetch";
 import { sql } from "drizzle-orm";
 
 import type { CoreDb } from "../auth/index.js";
-import { chunkKey } from "../blobstore/index.js";
+import { chunkKey, objectUrl } from "../blobstore/index.js";
 
 export const DEFAULT_CHUNK_GC_INTERVAL_MS = 60 * 60 * 1000;
 export const DEFAULT_CHUNK_GRACE_PERIOD_MS = 24 * 60 * 60 * 1000;
@@ -22,8 +22,9 @@ export type GcOptions = {
 
 export function startGc(
   db: CoreDb,
-  s3Client: S3Client,
+  s3: AwsClient,
   bucketName: string,
+  bucketEndpoint?: string,
   opts: GcOptions = {},
 ): () => void {
   const config = {
@@ -36,7 +37,7 @@ export function startGc(
   };
 
   const timers = [
-    setInterval(() => void runChunkGc(db, s3Client, bucketName, config.chunkGracePeriodMs), config.chunkGcIntervalMs),
+    setInterval(() => void runChunkGc(db, s3, bucketName, bucketEndpoint, config.chunkGracePeriodMs), config.chunkGcIntervalMs),
     setInterval(() => void runTombstonePurge(db, config.tombstoneRetentionMs), config.tombstonePurgeIntervalMs),
     setInterval(() => void runOpLogTruncation(db, config.opLogRetentionMs), config.opLogTruncationIntervalMs),
   ];
@@ -50,8 +51,9 @@ export function startGc(
 
 async function runChunkGc(
   db: CoreDb,
-  s3Client: S3Client,
+  s3: AwsClient,
   bucketName: string,
+  bucketEndpoint: string | undefined,
   gracePeriodMs: number,
 ): Promise<void> {
   try {
@@ -62,7 +64,7 @@ async function runChunkGc(
     for (const chunk of chunks) {
       const chunkHash = String(chunk.chunk_hash);
       try {
-        await s3Client.send(new DeleteObjectCommand({ Bucket: bucketName, Key: chunkKey(chunkHash) }));
+        await s3.fetch(objectUrl({ bucketEndpoint, bucketName }, chunkKey(chunkHash)), { method: "DELETE" });
         await executeMutation(db, sql`DELETE FROM chunks WHERE chunk_hash = ${chunkHash} AND refcount = 0`);
       } catch (error) {
         console.error("Chunk GC failed", { chunkHash, error });

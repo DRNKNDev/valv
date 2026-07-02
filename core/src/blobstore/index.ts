@@ -1,5 +1,4 @@
-import { GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import type { AwsClient } from "aws4fetch";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 
@@ -30,8 +29,10 @@ type BatchResponseObject = {
 export type CreateBlobstoreRouterOptions = {
   db?: CoreAuth["db"];
   auth: CoreAuth;
-  s3Client: S3Client;
+  s3: AwsClient;
+  bucketEndpoint?: string;
   bucketName: string;
+  getQuota?: (deviceId: string) => Promise<{ quota_bytes: number; usage_bytes: number; subscription_status: string } | null>;
 };
 
 export function chunkKey(hash: string): string {
@@ -49,8 +50,25 @@ export function createBlobstoreRouter(opts: CreateBlobstoreRouterOptions): Hono<
     }
     const body = (await ctx.req.json()) as BatchRequest;
     if (body.operation === "upload") {
+      const uploadPlans = await Promise.all(
+        body.objects.map(async (object) => ({ object, existing: await getExistingChunk(opts, object.oid) })),
+      );
+      if (opts.getQuota && principal.type === "device") {
+        const quota = await opts.getQuota(principal.deviceId);
+        if (quota) {
+          if (quota.subscription_status === "canceled" || quota.subscription_status === "revoked") {
+            return ctx.json({ error: "subscription_inactive", status: quota.subscription_status }, 402);
+          }
+          const newBytes = uploadPlans
+            .filter((plan) => !plan.existing)
+            .reduce((sum, plan) => sum + plan.object.size, 0);
+          if (quota.usage_bytes + newBytes > quota.quota_bytes) {
+            return ctx.json({ error: "over_quota", usage_bytes: quota.usage_bytes, quota_bytes: quota.quota_bytes }, 402);
+          }
+        }
+      }
       const objects = await Promise.all(
-        body.objects.map((object) => handleUploadObject(opts, object.oid, object.size)),
+        uploadPlans.map((plan) => handleUploadObject(opts, plan.object.oid, plan.object.size, plan.existing)),
       );
       return ctx.json({ transfer: "basic", objects });
     }
@@ -70,28 +88,16 @@ async function handleUploadObject(
   opts: CreateBlobstoreRouterOptions,
   oid: string,
   size: number,
+  existing: { refcount: number } | undefined,
 ): Promise<BatchResponseObject> {
-  const existing = await opts.auth.db
-    .select({ chunkHash: opts.auth.schema.chunks.chunkHash, refcount: opts.auth.schema.chunks.refcount })
-    .from(opts.auth.schema.chunks)
-    .where(eq(opts.auth.schema.chunks.chunkHash, oid))
-    .limit(1);
-  if (existing[0] && existing[0].refcount > 0) {
+  if (existing && existing.refcount > 0) {
     return { oid, size, already_exists: true };
   }
 
-  if (!existing[0]) {
+  if (!existing) {
     await opts.auth.db.insert(opts.auth.schema.chunks).values({ chunkHash: oid, sizeBytes: size, refcount: 0 });
   }
-  const href = await getSignedUrl(
-    opts.s3Client,
-    new PutObjectCommand({
-      Bucket: opts.bucketName,
-      Key: chunkKey(oid),
-      ContentType: "application/octet-stream",
-    }),
-    { expiresIn: 900 },
-  );
+  const href = await presignS3(opts, chunkKey(oid), "PUT", { "Content-Type": "application/octet-stream" });
 
   return {
     oid,
@@ -118,12 +124,41 @@ async function handleDownloadObject(
     return { oid, size, error: { code: 403, message: "no grant" } };
   }
 
-  const href = await getSignedUrl(
-    opts.s3Client,
-    new GetObjectCommand({ Bucket: opts.bucketName, Key: chunkKey(oid) }),
-    { expiresIn: 900 },
-  );
+  const href = await presignS3(opts, chunkKey(oid), "GET");
   return { oid, size, actions: { download: { href, expires_in: 900 } } };
+}
+
+async function getExistingChunk(
+  opts: CreateBlobstoreRouterOptions,
+  oid: string,
+): Promise<{ refcount: number } | undefined> {
+  const existing = await opts.auth.db
+    .select({ refcount: opts.auth.schema.chunks.refcount })
+    .from(opts.auth.schema.chunks)
+    .where(eq(opts.auth.schema.chunks.chunkHash, oid))
+    .limit(1);
+  return existing[0];
+}
+
+async function presignS3(
+  opts: CreateBlobstoreRouterOptions,
+  key: string,
+  method: "GET" | "PUT",
+  headers?: Record<string, string>,
+): Promise<string> {
+  const request = await opts.s3.sign(objectUrl(opts, key), {
+    method,
+    headers,
+    aws: { signQuery: true },
+  });
+  return request.url;
+}
+
+export function objectUrl(opts: { bucketEndpoint?: string; bucketName: string }, key: string): string {
+  const endpoint = opts.bucketEndpoint ?? `https://${opts.bucketName}.s3.amazonaws.com`;
+  const url = new URL(endpoint.endsWith("/") ? endpoint : `${endpoint}/`);
+  url.pathname = `${url.pathname}${opts.bucketName}/${key}`.replace(/\/+/g, "/");
+  return url.toString();
 }
 
 async function canDownloadChunk(auth: CoreAuth, principal: Principal, oid: string): Promise<boolean> {

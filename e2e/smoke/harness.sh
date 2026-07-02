@@ -79,7 +79,6 @@ start_backend() {
   export BUCKET_ENDPOINT="http://localhost:9000"
   export BUCKET_ACCESS_KEY_ID="minioadmin"
   export BUCKET_SECRET_ACCESS_KEY="minioadmin"
-  export BUCKET_FORCE_PATH_STYLE="true"
 
   apply_sqlite_migrations "${TMPDIR}/backend.db"
   HOME="$REAL_HOME" "$TSX_BIN" "${REPO_ROOT}/oss/core/src/server.ts" > "${TMPDIR}/backend.log" 2>&1 &

@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 
-import { S3Client } from "@aws-sdk/client-s3";
+import { AwsClient } from "aws4fetch";
 import { serve } from "@hono/node-server";
 import Database from "better-sqlite3";
 import { drizzle as drizzleSqlite } from "drizzle-orm/better-sqlite3";
@@ -29,6 +29,7 @@ const databaseUrl = requiredEnv("VALV_DATABASE_URL");
 const port = Number(process.env.VALV_PORT ?? 4747);
 const appBaseUrl = process.env.VALV_BASE_URL ?? `http://localhost:${port}`;
 const bucketName = requiredEnv("BUCKET_NAME");
+const bucketEndpoint = requiredEnv("BUCKET_ENDPOINT");
 
 const db = createDb(databaseUrl);
 const provider = isSqliteUrl(databaseUrl) ? "sqlite" : "pg";
@@ -39,14 +40,11 @@ const auth = createAuth(db, {
   provider,
   schema,
 });
-const s3Client = new S3Client({
-  endpoint: requiredEnv("BUCKET_ENDPOINT"),
+const s3 = new AwsClient({
   region: "auto",
-  forcePathStyle: process.env.BUCKET_FORCE_PATH_STYLE === "true",
-  credentials: {
-    accessKeyId: requiredEnv("BUCKET_ACCESS_KEY_ID"),
-    secretAccessKey: requiredEnv("BUCKET_SECRET_ACCESS_KEY"),
-  },
+  service: "s3",
+  accessKeyId: requiredEnv("BUCKET_ACCESS_KEY_ID"),
+  secretAccessKey: requiredEnv("BUCKET_SECRET_ACCESS_KEY"),
 });
 const hub = createHub();
 const sendInviteEmail = maybeCreateSendInviteEmail();
@@ -55,11 +53,11 @@ const app = new Hono();
 app.on(["POST", "GET"], "/api/auth/*", (ctx) => auth.handler(ctx.req.raw));
 app.route("/auth", createDeviceAuthRouter(auth));
 app.route("/api", createMetadataRouter({ auth, hub, sendInviteEmail }));
-app.route("/api", createBlobstoreRouter({ auth, s3Client, bucketName }));
+app.route("/api", createBlobstoreRouter({ auth, s3, bucketName, bucketEndpoint }));
 app.route("/ws", createRealtimeRouter({ auth, hub }));
 app.get("/health", (c) => c.json({ ok: true }));
 
-startGc(auth.db, s3Client, bucketName);
+startGc(auth.db, s3, bucketName, bucketEndpoint);
 
 serve(
   {
