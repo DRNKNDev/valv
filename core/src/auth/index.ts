@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 
-import { betterAuth, type Auth } from "better-auth";
+import { betterAuth, type Auth, type BetterAuthOptions } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { eq } from "drizzle-orm";
 import type { Context, MiddlewareHandler } from "hono";
@@ -38,6 +38,7 @@ export type CreateAuthOptions = {
   baseURL?: string;
   provider?: "pg" | "sqlite";
   schema?: CoreSchema;
+  betterAuthConfig?: Partial<BetterAuthOptions>;
 };
 
 export type AuthVariables = {
@@ -55,7 +56,7 @@ export function generateDeviceToken(): string {
 
 export function createAuth(db: CoreDb, opts: CreateAuthOptions): CoreAuth {
   const schema = opts.schema ?? (opts.provider === "sqlite" ? sqliteSchema : pgSchema);
-  const auth = betterAuth({
+  const coreConfig = {
     secret: opts.secret,
     baseURL: opts.baseURL,
     database: drizzleAdapter(db, {
@@ -65,7 +66,8 @@ export function createAuth(db: CoreDb, opts: CreateAuthOptions): CoreAuth {
     emailAndPassword: {
       enabled: true,
     },
-  });
+  } satisfies BetterAuthOptions;
+  const auth = betterAuth({ ...coreConfig, ...opts.betterAuthConfig });
 
   return Object.assign(auth, { db, schema });
 }

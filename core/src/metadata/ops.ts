@@ -69,12 +69,13 @@ export function registerOpRoutes(
   router: Hono<{ Variables: MetadataVariables }>,
   auth: CoreAuth,
   hub: MetadataHub,
+  onOpCommitted?: (folderId: string, serverSeq: number) => Promise<void>,
 ): void {
   router.post("/folders/:id/ops", async (ctx) => {
     const principal = requirePrincipal(ctx);
     const body = (await ctx.req.json()) as SubmitOpRequest;
     try {
-      const response = await submitOp(auth, hub, ctx.req.param("id"), principal, body);
+      const response = await submitOp(auth, hub, ctx.req.param("id"), principal, body, onOpCommitted);
       return ctx.json(response);
     } catch (error) {
       if (error instanceof Response) {
@@ -91,13 +92,14 @@ export async function submitOp(
   folderId: string,
   principal: Principal,
   op: SubmitOpRequest,
+  onOpCommitted?: (folderId: string, serverSeq: number) => Promise<void>,
 ): Promise<SubmitOpResponse> {
   if (principal.type !== "device") {
     throw new Response(JSON.stringify({ error: "device_required" }), { status: 403 });
   }
 
   if (hasOpStore(auth.db)) {
-    return submitOpWithStore(auth.db, hub, folderId, principal, op);
+    return submitOpWithStore(auth.db, hub, folderId, principal, op, onOpCommitted);
   }
 
   if (op.op_type === "create") {
@@ -105,7 +107,7 @@ export async function submitOp(
     if (!grant.granted) {
       throw new Response(JSON.stringify({ error: grant.reason }), { status: 403 });
     }
-    return createNode(auth, hub, folderId, principal.deviceId, op);
+    return createNode(auth, hub, folderId, principal.deviceId, op, onOpCommitted);
   }
 
   const grant = await checkGrant(auth.db, op.node_id, principal, "write", auth.schema);
@@ -144,7 +146,7 @@ export async function submitOp(
       }
       const conflictVersionId = await insertVersionAndOp(auth, tx, folderId, op.node_id, principal.deviceId, op, true);
       const serverSeq = await latestSeqForNode(auth, tx, folderId, op.node_id);
-      hub.notify(folderId, serverSeq);
+      await notifyCommitted(hub, folderId, serverSeq, onOpCommitted);
       return {
         result: "conflict_copy",
         server_seq: serverSeq,
@@ -177,7 +179,7 @@ export async function submitOp(
       .update(auth.schema.nodes)
       .set({ serverSeq })
       .where(eq(auth.schema.nodes.nodeId, op.node_id));
-    hub.notify(folderId, serverSeq);
+    await notifyCommitted(hub, folderId, serverSeq, onOpCommitted);
     return { result: "applied", server_seq: serverSeq, node_id: op.node_id } satisfies SubmitOpResponse;
   });
 }
@@ -188,6 +190,7 @@ async function submitOpWithStore(
   folderId: string,
   principal: Extract<Principal, { type: "device" }>,
   op: SubmitOpRequest,
+  onOpCommitted?: (folderId: string, serverSeq: number) => Promise<void>,
 ): Promise<SubmitOpResponse> {
   if (op.op_type === "create") {
     const grant = await checkGrant(db, op.payload.parent_id, principal, "write");
@@ -218,7 +221,7 @@ async function submitOpWithStore(
       actorDeviceId: principal.deviceId,
     });
     await db.updateNodeForOp(nodeId, { serverSeq });
-    hub.notify(folderId, serverSeq);
+    await notifyCommitted(hub, folderId, serverSeq, onOpCommitted);
     return { result: "applied", server_seq: serverSeq, node_id: nodeId };
   }
 
@@ -254,7 +257,7 @@ async function submitOpWithStore(
       basedOnSeq: op.based_on_seq,
       actorDeviceId: principal.deviceId,
     });
-    hub.notify(folderId, serverSeq);
+    await notifyCommitted(hub, folderId, serverSeq, onOpCommitted);
     return { result: "conflict_copy", server_seq: serverSeq, node_id: op.node_id, conflict_version_id: conflictVersionId };
   }
 
@@ -305,7 +308,7 @@ async function submitOpWithStore(
     actorDeviceId: principal.deviceId,
   });
   await db.updateNodeForOp(op.node_id, { serverSeq });
-  hub.notify(folderId, serverSeq);
+  await notifyCommitted(hub, folderId, serverSeq, onOpCommitted);
   return { result: "applied", server_seq: serverSeq, node_id: op.node_id };
 }
 
@@ -319,6 +322,7 @@ async function createNode(
   folderId: string,
   actorDeviceId: string,
   op: Extract<SubmitOpRequest, { op_type: "create" }>,
+  onOpCommitted?: (folderId: string, serverSeq: number) => Promise<void>,
 ): Promise<SubmitOpResponse> {
   const nodeId = op.payload.node_id;
   try {
@@ -341,7 +345,7 @@ async function createNode(
       });
       const serverSeq = await latestSeqForNode(auth, tx, folderId, nodeId);
       await tx.update(auth.schema.nodes).set({ serverSeq }).where(eq(auth.schema.nodes.nodeId, nodeId));
-      hub.notify(folderId, serverSeq);
+      await notifyCommitted(hub, folderId, serverSeq, onOpCommitted);
       return { result: "applied", server_seq: serverSeq, node_id: nodeId } satisfies SubmitOpResponse;
     });
   } catch (error) {
@@ -357,6 +361,16 @@ async function createNode(
     }
     throw error;
   }
+}
+
+async function notifyCommitted(
+  hub: MetadataHub,
+  folderId: string,
+  serverSeq: number,
+  onOpCommitted?: (folderId: string, serverSeq: number) => Promise<void>,
+): Promise<void> {
+  hub.notify(folderId, serverSeq);
+  await onOpCommitted?.(folderId, serverSeq);
 }
 
 async function applyMetadataMutation(

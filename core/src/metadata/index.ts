@@ -15,6 +15,7 @@ export type CreateMetadataRouterOptions = {
   auth: CoreAuth;
   hub: MetadataHub;
   sendInviteEmail?: SendInviteEmail;
+  onOpCommitted?: (folderId: string, serverSeq: number) => Promise<void>;
 };
 
 export function createMetadataRouter(opts: CreateMetadataRouterOptions): Hono<{ Variables: MetadataVariables }> {
@@ -23,7 +24,7 @@ export function createMetadataRouter(opts: CreateMetadataRouterOptions): Hono<{ 
   registerFolderRoutes(router, opts.auth);
   registerInviteRoutes(router, opts.auth, opts.sendInviteEmail);
   registerGrantRoutes(router, opts.auth);
-  registerOpRoutes(router, opts.auth, opts.hub);
+  registerOpRoutes(router, opts.auth, opts.hub, opts.onOpCommitted);
   registerDeltaRoutes(router, opts.auth);
   registerVersionRoutes(router, opts.auth, opts.hub);
   return router;
