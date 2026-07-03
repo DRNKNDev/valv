@@ -21,6 +21,7 @@ pub(crate) async fn get_status(State(state): State<DaemonState>) -> impl IntoRes
     Json(DaemonStatus {
         paused: state.paused.load(Ordering::Acquire),
         backend_connected,
+        version: env!("CARGO_PKG_VERSION").to_owned(),
         mounts,
     })
 }

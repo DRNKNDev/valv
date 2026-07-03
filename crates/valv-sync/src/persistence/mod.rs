@@ -32,6 +32,8 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     conn.execute_batch(schema_sql())?;
     add_column_if_missing(&conn, "mounts", "scope_node_id", "TEXT")?;
     add_column_if_missing(&conn, "mounts", "mount_token", "TEXT")?;
+    add_column_if_missing(&conn, "mounts", "can_write", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(&conn, "mounts", "name", "TEXT")?;
     Ok(conn)
 }
 
@@ -239,7 +241,7 @@ mod tests {
     #[test]
     fn apply_op_log_sequence_updates_mirror_state() {
         let conn = memory_db();
-        mounts::upsert_mount(&conn, "/sync", "folder-1", None, None, None).unwrap();
+        mounts::upsert_mount(&conn, "/sync", "folder-1", None, None, None, true).unwrap();
 
         let entries = vec![
             OpLogEntry {
@@ -337,7 +339,7 @@ mod tests {
     #[test]
     fn apply_tree_snapshot_replaces_stale_rows() {
         let mut conn = memory_db();
-        mounts::upsert_mount(&conn, "/sync", "folder-1", None, None, None).unwrap();
+        mounts::upsert_mount(&conn, "/sync", "folder-1", None, None, None, true).unwrap();
         nodes::upsert_node(
             &conn,
             &nodes::LocalNode {

@@ -20,10 +20,12 @@ export interface FpEnumerateResponse {
   items: FpItem[];
   total: number;
   synced_to_seq: number;
+  can_write: boolean;
 }
 
 export interface FpAnchorResponse {
   server_seq: number;
+  can_write: boolean;
 }
 
 export interface FpChangesResponse {
@@ -63,3 +65,19 @@ export interface FpDeleteRequest {
   node_id: string;
   based_on_seq: number;
 }
+
+export interface FpShareRequest {
+  node_id: string;
+  invited_email: string;
+}
+
+export interface FpShareResponse {
+  invite_url: string;
+}
+
+export interface FpWatchQuery {
+  folder_id?: string;
+  since_seq: number;
+}
+
+export type FpWatchResponse = FpAnchorResponse;

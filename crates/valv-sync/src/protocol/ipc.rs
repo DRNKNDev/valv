@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct MountStatus {
     pub path: String,
     pub folder_id: String,
+    pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope_node_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19,6 +20,7 @@ pub struct MountStatus {
 pub struct DaemonStatus {
     pub paused: bool,
     pub backend_connected: bool,
+    pub version: String,
     pub mounts: Vec<MountStatus>,
 }
 
@@ -113,11 +115,13 @@ pub struct FpEnumerateResponse {
     pub items: Vec<FpItem>,
     pub total: u64,
     pub synced_to_seq: i64,
+    pub can_write: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FpAnchorResponse {
     pub server_seq: i64,
+    pub can_write: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,4 +166,20 @@ pub struct FpUploadQueued {
 pub struct FpDeleteRequest {
     pub node_id: String,
     pub based_on_seq: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FpShareRequest {
+    pub node_id: String,
+    pub invited_email: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FpShareResponse {
+    pub invite_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodePathResponse {
+    pub path: String,
 }

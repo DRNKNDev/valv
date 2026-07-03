@@ -22,7 +22,12 @@ use hyper_util::{
 };
 use rusqlite::Connection;
 use serde::Serialize;
-use tokio::{net::UnixListener, signal, sync::Mutex, task::JoinHandle};
+use tokio::{
+    net::UnixListener,
+    signal,
+    sync::{Mutex, Notify},
+    task::JoinHandle,
+};
 use valv_sync::{
     persistence::{mounts as mount_store, open_db},
     protocol::ipc::MountStatus,
@@ -34,6 +39,7 @@ mod fp;
 #[cfg(target_os = "macos")]
 mod launchd;
 mod mounts;
+mod nodes;
 mod restore;
 #[cfg(target_os = "linux")]
 mod systemd;
@@ -88,6 +94,8 @@ struct MountState {
     grant_id: Option<String>,
     scope_node_id: Option<String>,
     mount_token: Option<String>,
+    can_write: bool,
+    name: String,
     active_syncs: u32,
     pending_ops: u64,
     last_synced_at: Option<String>,
@@ -96,6 +104,11 @@ struct MountState {
     // pull can't mutate the local mirror mid-flight through an explicit sync's
     // push_local pass (see oss/crates/valv-sync/src/sync_engine/local_push.rs).
     sync_lock: Arc<Mutex<()>>,
+    // Wakes any pending GET /fp/watch long-poll for this mount after its cursor
+    // advances. Shared (not per-clone) so every MountState clone for the same
+    // mount notifies the same waiters; unrelated to sync_lock, which guards a
+    // different concern (mutual exclusion of mirror-mutating work).
+    cursor_notify: Arc<Notify>,
 }
 
 #[tokio::main]
@@ -122,11 +135,14 @@ async fn run() -> Result<()> {
             grant_id: mount.grant_id,
             scope_node_id: mount.scope_node_id,
             mount_token: mount.mount_token,
+            can_write: mount.can_write,
+            name: mount.name.unwrap_or_default(),
             active_syncs: 0,
             pending_ops: 0,
             last_synced_at: None,
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
+            cursor_notify: Arc::new(Notify::new()),
         })
         .collect();
     let state = DaemonState {
@@ -168,6 +184,9 @@ async fn serve_socket(state: DaemonState, socket_path: &Path) -> Result<()> {
         .route("/fp/content/:node_id", get(fp::fp_content))
         .route("/fp/upload", post(fp::fp_upload))
         .route("/fp/delete", post(fp::fp_delete).delete(fp::fp_delete))
+        .route("/fp/share", post(fp::fp_share))
+        .route("/fp/watch", get(fp::fp_watch))
+        .route("/nodes/:node_id/path", get(nodes::get_node_path))
         .with_state(state.clone());
 
     tokio::select! {
@@ -226,6 +245,7 @@ impl MountState {
         MountStatus {
             path: self.path.clone(),
             folder_id: self.folder_id.clone(),
+            name: self.name.clone(),
             scope_node_id: self.scope_node_id.clone(),
             grant_id: self.grant_id.clone(),
             syncing: self.active_syncs > 0,

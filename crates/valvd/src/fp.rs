@@ -19,7 +19,8 @@ use valv_sync::{
         http::{BatchOperation, BatchRequest, BatchRequestObject, BatchResponse},
         ipc::{
             FpAnchorResponse, FpChangesResponse, FpChunkDownload, FpContentResponse,
-            FpDeleteRequest, FpEnumerateResponse, FpItem, FpUploadQueued, FpUploadRequest,
+            FpDeleteRequest, FpEnumerateResponse, FpItem, FpShareRequest, FpShareResponse,
+            FpUploadQueued, FpUploadRequest,
         },
         sync::{
             ChunkRef, CreatePayload, DeletePayload, NewVersionPayload, NodeType, SubmitOpRequest,
@@ -55,6 +56,7 @@ pub(crate) async fn fp_items(
         items,
         total,
         synced_to_seq,
+        can_write: mount.can_write,
     }))
 }
 
@@ -84,6 +86,53 @@ pub(crate) async fn fp_anchor(
     let conn = state.db.lock().await;
     Ok(Json(FpAnchorResponse {
         server_seq: mounts::get_cursor(&conn, &mount.folder_id).map_err(internal_error)?,
+        can_write: mount.can_write,
+    }))
+}
+
+const FP_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
+pub(crate) async fn fp_watch(
+    State(state): State<DaemonState>,
+    Query(query): Query<FpWatchQuery>,
+) -> Result<Json<FpAnchorResponse>, (StatusCode, Json<ErrorResponse>)> {
+    fp_watch_inner(state, query, FP_WATCH_TIMEOUT).await
+}
+
+async fn fp_watch_inner(
+    state: DaemonState,
+    query: FpWatchQuery,
+    timeout: std::time::Duration,
+) -> Result<Json<FpAnchorResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let Ok(mount) = resolve_mount_for_query(&state, query.folder_id.as_deref()).await else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new("mount_not_found")),
+        ));
+    };
+    // Register as a waiter before checking the cursor: `Notify::notified()`'s
+    // future, once created, captures any `notify_waiters()` call that happens
+    // after this point even if we haven't started awaiting it yet - checking
+    // the cursor first and only then calling `.notified()` would leave a race
+    // where a cursor advance between the check and the call is silently missed.
+    let notified = mount.cursor_notify.notified();
+    let current_seq = {
+        let conn = state.db.lock().await;
+        mounts::get_cursor(&conn, &mount.folder_id).map_err(internal_error)?
+    };
+    if current_seq <= query.since_seq {
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(timeout) => {}
+        }
+    }
+    let server_seq = {
+        let conn = state.db.lock().await;
+        mounts::get_cursor(&conn, &mount.folder_id).map_err(internal_error)?
+    };
+    Ok(Json(FpAnchorResponse {
+        server_seq,
+        can_write: mount.can_write,
     }))
 }
 
@@ -255,6 +304,66 @@ pub(crate) async fn fp_delete(
     })
 }
 
+pub(crate) async fn fp_share(
+    State(state): State<DaemonState>,
+    Json(req): Json<FpShareRequest>,
+) -> Result<Json<FpShareResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let (folder_id, token) = {
+        let conn = state.db.lock().await;
+        let Some(node) = nodes::get_node(&conn, &req.node_id).map_err(internal_error)? else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new("node_not_found")),
+            ));
+        };
+        let mount = resolve_mount_for_folder_id(&state, &node.folder_id)
+            .await
+            .map_err(internal_error)?;
+        (
+            node.folder_id,
+            mount.effective_token(&state.config).to_owned(),
+        )
+    };
+    let invite = state
+        .client
+        .post(format!(
+            "{}/folders/{}/invites",
+            valv_sync::api_base(&state.config.backend_url),
+            folder_id
+        ))
+        .bearer_auth(&token)
+        .json(&InviteCreateRequest {
+            invited_email: req.invited_email,
+            scope_node_id: req.node_id,
+        })
+        .send()
+        .await
+        .map_err(internal_error)?
+        .error_for_status()
+        .map_err(internal_error)?
+        .json::<InviteCreateResponse>()
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(FpShareResponse {
+        invite_url: format!(
+            "{}/invites/{}/accept",
+            valv_sync::api_base(&state.config.backend_url),
+            invite.invite_token
+        ),
+    }))
+}
+
+#[derive(Debug, serde::Serialize)]
+struct InviteCreateRequest {
+    invited_email: String,
+    scope_node_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InviteCreateResponse {
+    invite_token: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct FpItemsQuery {
     parent: String,
@@ -273,6 +382,12 @@ pub(crate) struct FpChangesQuery {
     folder_id: Option<String>,
     #[serde(alias = "since")]
     since_seq: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct FpWatchQuery {
+    folder_id: Option<String>,
+    since_seq: i64,
 }
 
 fn resolve_parent_id(
@@ -354,7 +469,7 @@ async fn upload_job_inner(
     req: FpUploadRequest,
     node_id: String,
 ) -> Result<()> {
-    let (folder_id, token, create_first, based_on_seq, parent_id) = {
+    let (folder_id, token, create_first, based_on_seq, parent_id, cursor_notify) = {
         let conn = state.db.lock().await;
         let (mount, parent_id, parent) = if req.parent_id == "root" {
             let mount = resolve_mount_for_query(state, None).await?;
@@ -387,6 +502,7 @@ async fn upload_job_inner(
             create_first,
             based_on_seq,
             parent_id,
+            mount.cursor_notify.clone(),
         )
     };
 
@@ -466,6 +582,7 @@ async fn upload_job_inner(
     if matches!(response, SubmitOpResponse::ConflictCopy { .. }) {
         materialize_conflict_copy_name(path, &state.config.device_name)?;
     }
+    cursor_notify.notify_waiters();
     Ok(())
 }
 
@@ -550,4 +667,165 @@ fn materialize_conflict_copy_name(path: &Path, device_name: &str) -> Result<()> 
     };
     fs::copy(path, path.with_file_name(conflict_name))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod fp_watch_tests {
+    use std::{
+        collections::HashMap,
+        sync::{atomic::AtomicBool, Arc},
+        time::{Duration, Instant},
+    };
+
+    use tokio::sync::{Mutex, Notify};
+
+    use crate::config::DaemonConfig;
+
+    use super::*;
+
+    fn test_mount(path: &str, folder_id: &str) -> MountState {
+        MountState {
+            path: path.to_owned(),
+            folder_id: folder_id.to_owned(),
+            grant_id: None,
+            scope_node_id: None,
+            mount_token: None,
+            can_write: true,
+            name: "Test Folder".to_owned(),
+            active_syncs: 0,
+            pending_ops: 0,
+            last_synced_at: None,
+            error: None,
+            sync_lock: Arc::new(Mutex::new(())),
+            cursor_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn test_state(mount: MountState) -> DaemonState {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!(
+            "../../valv-sync/src/persistence/schema.sql"
+        ))
+        .unwrap();
+        mounts::upsert_mount(
+            &conn,
+            &mount.path,
+            &mount.folder_id,
+            None,
+            None,
+            None,
+            mount.can_write,
+        )
+        .unwrap();
+        DaemonState {
+            paused: Arc::new(AtomicBool::new(false)),
+            fs_events_paused: Arc::new(AtomicBool::new(false)),
+            mounts: Arc::new(Mutex::new(vec![mount])),
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            db: Arc::new(Mutex::new(conn)),
+            client: reqwest::Client::new(),
+            config: DaemonConfig {
+                backend_url: "http://127.0.0.1:1".to_owned(),
+                device_id: "device-1".to_owned(),
+                device_token: "token".to_owned(),
+                device_name: "Test Device".to_owned(),
+                mounts: Vec::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_immediately_when_already_stale() {
+        let state = test_state(test_mount("/sync", "folder-1"));
+        {
+            let conn = state.db.lock().await;
+            mounts::set_cursor(&conn, "folder-1", 15).unwrap();
+        }
+
+        let started = Instant::now();
+        let response = fp_watch(
+            State(state),
+            Query(FpWatchQuery {
+                folder_id: Some("folder-1".into()),
+                since_seq: 10,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.server_seq, 15);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn wakes_on_notify_instead_of_waiting_out_the_timeout() {
+        let state = test_state(test_mount("/sync", "folder-1"));
+        {
+            let conn = state.db.lock().await;
+            mounts::set_cursor(&conn, "folder-1", 10).unwrap();
+        }
+        let notify = state.mounts.lock().await[0].cursor_notify.clone();
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            {
+                let conn = db.lock().await;
+                mounts::set_cursor(&conn, "folder-1", 11).unwrap();
+            }
+            notify.notify_waiters();
+        });
+
+        let started = Instant::now();
+        let response = fp_watch(
+            State(state),
+            Query(FpWatchQuery {
+                folder_id: Some("folder-1".into()),
+                since_seq: 10,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.server_seq, 11);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn times_out_with_unchanged_seq() {
+        let state = test_state(test_mount("/sync", "folder-1"));
+        {
+            let conn = state.db.lock().await;
+            mounts::set_cursor(&conn, "folder-1", 15).unwrap();
+        }
+
+        let response = fp_watch_inner(
+            state,
+            FpWatchQuery {
+                folder_id: Some("folder-1".into()),
+                since_seq: 15,
+            },
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.server_seq, 15);
+    }
+
+    #[tokio::test]
+    async fn unknown_folder_id_returns_404() {
+        let state = test_state(test_mount("/sync", "folder-1"));
+
+        let (status, _) = fp_watch(
+            State(state),
+            Query(FpWatchQuery {
+                folder_id: Some("unknown-folder".into()),
+                since_seq: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }

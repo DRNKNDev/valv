@@ -4,7 +4,9 @@ CREATE TABLE IF NOT EXISTS mounts (
     grant_id TEXT,
     scope_node_id TEXT,
     mount_token TEXT,
-    cursor INTEGER NOT NULL DEFAULT 0
+    cursor INTEGER NOT NULL DEFAULT 0,
+    can_write INTEGER NOT NULL DEFAULT 1,
+    name TEXT
 );
 
 CREATE TABLE IF NOT EXISTS nodes (

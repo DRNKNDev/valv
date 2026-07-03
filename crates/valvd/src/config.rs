@@ -47,6 +47,7 @@ pub(crate) fn merge_config_mounts(conn: &Connection, config_mounts: &[MountConfi
             mount.grant_id.as_deref(),
             mount.scope_node_id.as_deref(),
             mount.mount_token.as_deref(),
+            true,
         )?;
     }
     Ok(())

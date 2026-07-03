@@ -183,7 +183,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(crate::persistence::schema_sql())
             .unwrap();
-        mounts::upsert_mount(&conn, "/sync", "folder-1", None, None, None).unwrap();
+        mounts::upsert_mount(&conn, "/sync", "folder-1", None, None, None, true).unwrap();
 
         let (cursor, pulled) = pull_delta(
             &reqwest::Client::new(),

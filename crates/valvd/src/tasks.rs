@@ -195,7 +195,11 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
         }
         Err(err) => Some(err.to_string()),
     };
+    let succeeded = error.is_none();
     end_mount_sync(state, &mount.folder_id, error).await;
+    if succeeded {
+        mount.cursor_notify.notify_waiters();
+    }
 }
 
 async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary {
@@ -267,7 +271,11 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
     };
 
     set_mount_pending_ops(state, &mount.folder_id, 0).await;
+    let pull_succeeded = error.is_none();
     end_mount_sync(state, &mount.folder_id, error).await;
+    if pull_succeeded {
+        mount.cursor_notify.notify_waiters();
+    }
     summary
 }
 

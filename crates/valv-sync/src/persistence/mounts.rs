@@ -9,11 +9,13 @@ pub struct LocalMount {
     pub scope_node_id: Option<String>,
     pub mount_token: Option<String>,
     pub cursor: i64,
+    pub can_write: bool,
+    pub name: Option<String>,
 }
 
 pub fn list_mounts(conn: &Connection) -> Result<Vec<LocalMount>> {
     let mut stmt = conn.prepare(
-        "SELECT path, folder_id, grant_id, scope_node_id, mount_token, cursor FROM mounts ORDER BY path ASC",
+        "SELECT path, folder_id, grant_id, scope_node_id, mount_token, cursor, can_write, name FROM mounts ORDER BY path ASC",
     )?;
     let mounts = stmt
         .query_map([], row_to_mount)?
@@ -28,16 +30,26 @@ pub fn upsert_mount(
     grant_id: Option<&str>,
     scope_node_id: Option<&str>,
     mount_token: Option<&str>,
+    can_write: bool,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO mounts (path, folder_id, grant_id, scope_node_id, mount_token)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO mounts (path, folder_id, grant_id, scope_node_id, mount_token, can_write)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(path) DO UPDATE SET
             folder_id = excluded.folder_id,
             grant_id = excluded.grant_id,
             scope_node_id = excluded.scope_node_id,
-            mount_token = excluded.mount_token",
-        params![path, folder_id, grant_id, scope_node_id, mount_token],
+            mount_token = excluded.mount_token,
+            can_write = excluded.can_write",
+        params![path, folder_id, grant_id, scope_node_id, mount_token, can_write],
+    )?;
+    Ok(())
+}
+
+pub fn set_mount_name(conn: &Connection, path: &str, name: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE mounts SET name = ?1 WHERE path = ?2",
+        params![name, path],
     )?;
     Ok(())
 }
@@ -75,5 +87,7 @@ fn row_to_mount(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalMount> {
         scope_node_id: row.get(3)?,
         mount_token: row.get(4)?,
         cursor: row.get(5)?,
+        can_write: row.get(6)?,
+        name: row.get(7)?,
     })
 }

@@ -1,6 +1,7 @@
 export interface MountStatus {
   path: string;
   folder_id: string;
+  name: string;
   grant_id?: string;
   syncing: boolean;
   pending_ops: number;
@@ -11,7 +12,12 @@ export interface MountStatus {
 export interface DaemonStatus {
   paused: boolean;
   backend_connected: boolean;
+  version: string;
   mounts: MountStatus[];
+}
+
+export interface NodePathResponse {
+  path: string;
 }
 
 export interface MountRequest {
