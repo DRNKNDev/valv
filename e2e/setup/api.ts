@@ -3,14 +3,16 @@ import { randomUUID } from "node:crypto";
 import { createTestBucket, deleteTestBucket } from "./bucket.js";
 import { requestJson, seedContext, type SeedContext } from "./helpers.js";
 import { createSmokeApp } from "./server.js";
+import type { RequestApp } from "../api/scenarios/types.js";
 
-export type AppContext = Awaited<ReturnType<typeof createSmokeApp>> & {
+type SmokeApp = Awaited<ReturnType<typeof createSmokeApp>>;
+
+export type AppContext = SmokeApp & {
   bucket: string;
   context: SeedContext;
-};
-
-type RequestApp = {
-  request: (path: string, init?: RequestInit) => Response | Promise<Response>;
+  row<T = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T | undefined>;
+  rows<T = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T[]>;
+  exec(sql: string, ...params: unknown[]): Promise<void>;
 };
 
 export async function createAppContext(): Promise<AppContext> {
@@ -20,7 +22,34 @@ export async function createAppContext(): Promise<AppContext> {
 
   const app = await createSmokeApp(bucket);
   const context = await seedContext(app.db, app.sqlite);
-  return { ...app, bucket, context };
+  return {
+    ...app,
+    bucket,
+    context,
+    row: async <T = Record<string, unknown>>(sql: string, ...params: unknown[]) => row<T>(app.sqlite, sql, ...params),
+    rows: async <T = Record<string, unknown>>(sql: string, ...params: unknown[]) => rows<T>(app.sqlite, sql, ...params),
+    exec: async (sql: string, ...params: unknown[]) => {
+      app.sqlite.prepare(sql).run(...params);
+    },
+  };
+}
+
+export async function createBareApp(): Promise<{ app: RequestApp; cleanup: () => Promise<void> }> {
+  const bootstrap = await createSmokeApp("bootstrap");
+  const bucket = await createTestBucket(bootstrap.s3);
+  bootstrap.cleanup();
+
+  const setup = await createSmokeApp(bucket);
+  return {
+    app: setup.app,
+    cleanup: async () => {
+      try {
+        await deleteTestBucket(setup.s3, bucket);
+      } finally {
+        setup.cleanup();
+      }
+    },
+  };
 }
 
 export async function cleanupAppContext(ctx: AppContext | undefined): Promise<void> {

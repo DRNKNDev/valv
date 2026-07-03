@@ -1,0 +1,57 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { requestJson } from "./helpers.js";
+import type { SeededHarness } from "./types.js";
+
+export function inviteScenarios(harness: SeededHarness): void {
+  describe("invite API", () => {
+    let ctx: Awaited<ReturnType<SeededHarness["createApp"]>>;
+
+    beforeAll(async () => {
+      ctx = await harness.createApp();
+    });
+
+    afterAll(async () => ctx?.cleanup());
+
+    it("creates, accepts, idempotently re-accepts, and rejects expired invites", async () => {
+      const invite = await requestJson<{ invite_token: string }>(ctx.app, `/api/folders/${ctx.context.folderId}/invites`, {
+        method: "POST",
+        cookie: ctx.context.cookie,
+        body: { invited_email: "friend@example.com" },
+      });
+      expect(await ctx.row("SELECT invite_token FROM folder_invites WHERE invite_token = ?", invite.invite_token)).toBeTruthy();
+
+      const signup = await ctx.app.request("/api/auth/sign-up/email", {
+        method: "POST",
+        body: JSON.stringify({ name: "Friend", email: "friend@example.com", password: "password1234" }),
+        headers: { "content-type": "application/json" },
+      });
+      const friendCookie = signup.headers.get("set-cookie")?.split(";")[0];
+      expect(friendCookie).toContain("better-auth.session_token");
+
+      const first = await requestJson<{ accepted: boolean }>(ctx.app, `/api/invites/${invite.invite_token}/accept`, {
+        method: "POST",
+        cookie: friendCookie,
+      });
+      const second = await requestJson<{ accepted: boolean }>(ctx.app, `/api/invites/${invite.invite_token}/accept`, {
+        method: "POST",
+        cookie: friendCookie,
+      });
+      expect(first.accepted).toBe(true);
+      expect(second.accepted).toBe(true);
+      expect((await ctx.row<{ count: number }>("SELECT COUNT(*) AS count FROM folder_grants WHERE user_id IS NOT NULL AND folder_id = ?", ctx.context.folderId))?.count).toBe(2);
+
+      const expired = await requestJson<{ invite_token: string }>(ctx.app, `/api/folders/${ctx.context.folderId}/invites`, {
+        method: "POST",
+        cookie: ctx.context.cookie,
+        body: { invited_email: "late@example.com" },
+      });
+      await ctx.exec("UPDATE folder_invites SET expires_at = ? WHERE invite_token = ?", Date.now() - 1000, expired.invite_token);
+      const expiredResponse = await ctx.app.request(`/api/invites/${expired.invite_token}/accept`, {
+        method: "POST",
+        headers: { cookie: friendCookie ?? "" },
+      });
+      expect(expiredResponse.status).toBe(410);
+    });
+  });
+}
