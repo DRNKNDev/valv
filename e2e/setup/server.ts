@@ -18,7 +18,7 @@ import {
 } from "@valv/core";
 
 import { authSecret } from "./helpers.js";
-import { createTestS3Client } from "./bucket.js";
+import { createTestS3Client, testBucketEndpoint } from "./bucket.js";
 
 const currentDir = dirname(fileURLToPath(import.meta.url));
 const migrationDir = join(currentDir, "../../core/src/db/migrations/sqlite");
@@ -40,7 +40,7 @@ export async function createSmokeApp(bucketName: string) {
   app.on(["POST", "GET"], "/api/auth/*", (ctx: any) => auth.handler(ctx.req.raw));
   app.route("/auth", createDeviceAuthRouter(auth));
   app.route("/api", createMetadataRouter({ auth, hub }));
-  app.route("/api", createBlobstoreRouter({ auth, s3Client: s3, bucketName }));
+  app.route("/api", createBlobstoreRouter({ auth, s3, bucketName, bucketEndpoint: testBucketEndpoint }));
   app.route("/ws", createRealtimeRouter({ auth, hub }));
 
   return {

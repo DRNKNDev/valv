@@ -6,8 +6,8 @@ export default defineConfig({
   resolve: {
     alias: [
       { find: "@valv/core", replacement: path.resolve("../core/src/index.ts") },
-      { find: /^@aws-sdk\/(.*)$/, replacement: path.resolve("../core/node_modules/@aws-sdk") + "/$1" },
       { find: /^@hono\/(.*)$/, replacement: path.resolve("../core/node_modules/@hono") + "/$1" },
+      { find: "aws4fetch", replacement: path.resolve("../core/node_modules/aws4fetch/dist/aws4fetch.esm.mjs") },
       { find: "better-auth/adapters/drizzle", replacement: path.resolve("../core/node_modules/better-auth/dist/adapters/drizzle-adapter/index.mjs") },
       { find: "better-auth", replacement: path.resolve("../core/node_modules/better-auth/dist/index.mjs") },
       { find: "better-sqlite3", replacement: path.resolve("../core/node_modules/better-sqlite3") },

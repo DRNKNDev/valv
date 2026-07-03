@@ -1,42 +1,55 @@
-import {
-  CreateBucketCommand,
-  DeleteBucketCommand,
-  DeleteObjectsCommand,
-  ListObjectsV2Command,
-  S3Client,
-} from "@aws-sdk/client-s3";
+import { AwsClient } from "aws4fetch";
 import { v4 as uuidv4 } from "uuid";
 
-export function createTestS3Client(): S3Client {
-  return new S3Client({
-    endpoint: "http://localhost:9000",
-    forcePathStyle: true,
+export const testBucketEndpoint = "http://localhost:9000";
+
+export function createTestS3Client(): AwsClient {
+  return new AwsClient({
     region: "auto",
-    credentials: {
-      accessKeyId: "minioadmin",
-      secretAccessKey: "minioadmin",
-    },
+    service: "s3",
+    accessKeyId: "minioadmin",
+    secretAccessKey: "minioadmin",
   });
 }
 
-export async function createTestBucket(s3: S3Client): Promise<string> {
+export async function createTestBucket(s3: AwsClient): Promise<string> {
   const bucket = `valv-e2e-${uuidv4()}`;
-  await s3.send(new CreateBucketCommand({ Bucket: bucket }));
+  await expectOk(s3.fetch(bucketUrl(bucket), { method: "PUT" }), `create bucket ${bucket}`);
   return bucket;
 }
 
-export async function deleteTestBucket(s3: S3Client, bucket: string): Promise<void> {
-  let token: string | undefined;
-  do {
-    const listed = await s3.send(new ListObjectsV2Command({ Bucket: bucket, ContinuationToken: token }));
-    const objects = listed.Contents?.map((object: { Key?: string }) => (object.Key ? { Key: object.Key } : undefined)).filter(
-      (object: { Key: string } | undefined): object is { Key: string } => object !== undefined,
-    );
-    if (objects && objects.length > 0) {
-      await s3.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: objects } }));
-    }
-    token = listed.NextContinuationToken;
-  } while (token);
+export async function deleteTestBucket(s3: AwsClient, bucket: string): Promise<void> {
+  for (const key of await listKeys(s3, bucket)) {
+    await expectOk(s3.fetch(bucketUrl(bucket, key), { method: "DELETE" }), `delete object ${key}`);
+  }
 
-  await s3.send(new DeleteBucketCommand({ Bucket: bucket }));
+  await expectOk(s3.fetch(bucketUrl(bucket), { method: "DELETE" }), `delete bucket ${bucket}`);
+}
+
+function bucketUrl(bucket: string, key = ""): string {
+  const path = key ? `/${bucket}/${key}` : `/${bucket}`;
+  return `${testBucketEndpoint}${path}`;
+}
+
+async function listKeys(s3: AwsClient, bucket: string): Promise<string[]> {
+  const response = await expectOk(s3.fetch(`${bucketUrl(bucket)}?list-type=2`), `list bucket ${bucket}`);
+  const xml = await response.text();
+  return Array.from(xml.matchAll(/<Key>(.*?)<\/Key>/g), (match) => decodeXml(match[1] ?? ""));
+}
+
+async function expectOk(responsePromise: Promise<Response>, action: string): Promise<Response> {
+  const response = await responsePromise;
+  if (!response.ok) {
+    throw new Error(`${action} failed: ${response.status} ${await response.text()}`);
+  }
+  return response;
+}
+
+function decodeXml(value: string): string {
+  return value
+    .replaceAll("&amp;", "&")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'");
 }
