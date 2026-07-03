@@ -118,6 +118,7 @@ describe("submitOp", () => {
     expect(db.versions[0]?.versionId).not.toBe("client-version");
     expect(db.chunkRefcounts.get("chunk-1")).toBe(1);
     expect(db.nodes.get("doc")?.currentVersionId).toBeNull();
+    expect(db.nodes.get("doc")?.serverSeq).toBe(response.server_seq);
     expect(hub.notifications).toEqual([{ folderId: "folder-1", serverSeq: 2 }]);
   });
 

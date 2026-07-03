@@ -29,6 +29,14 @@ type SubmitOpResponse =
   | { result: "conflict_copy"; server_seq: number; node_id: string; conflict_version_id: string }
   | { result: "superseded"; current_seq: number };
 
+export type CommittedOp = {
+  folderId: string;
+  serverSeq: number;
+  nodeId: string;
+  opType: SubmitOpRequest["op_type"];
+  previousParentId?: string | null;
+};
+
 type OpNode = {
   nodeId: string;
   folderId: string;
@@ -69,7 +77,7 @@ export function registerOpRoutes(
   router: Hono<{ Variables: MetadataVariables }>,
   auth: CoreAuth,
   hub: MetadataHub,
-  onOpCommitted?: (folderId: string, serverSeq: number) => Promise<void>,
+  onOpCommitted?: (op: CommittedOp) => Promise<void>,
 ): void {
   router.post("/folders/:id/ops", async (ctx) => {
     const principal = requirePrincipal(ctx);
@@ -92,7 +100,7 @@ export async function submitOp(
   folderId: string,
   principal: Principal,
   op: SubmitOpRequest,
-  onOpCommitted?: (folderId: string, serverSeq: number) => Promise<void>,
+  onOpCommitted?: (op: CommittedOp) => Promise<void>,
 ): Promise<SubmitOpResponse> {
   if (principal.type !== "device") {
     throw new Response(JSON.stringify({ error: "device_required" }), { status: 403 });
@@ -126,7 +134,7 @@ export async function submitOp(
     }
   }
 
-  return inTransaction(auth, async (tx) => {
+  const { response, committedOp } = await inTransaction(auth, async (tx) => {
     if (auth.schema === pgSchema && typeof tx.execute === "function") {
       await tx.execute(sql`SELECT node_id FROM nodes WHERE node_id = ${op.node_id} FOR UPDATE`);
     }
@@ -142,17 +150,26 @@ export async function submitOp(
 
     if (node.serverSeq !== op.based_on_seq) {
       if (op.op_type !== "new_version") {
-        return { result: "superseded", current_seq: node.serverSeq } satisfies SubmitOpResponse;
+        return {
+          response: { result: "superseded", current_seq: node.serverSeq } satisfies SubmitOpResponse,
+          committedOp: undefined,
+        };
       }
       const conflictVersionId = await insertVersionAndOp(auth, tx, folderId, op.node_id, principal.deviceId, op, true);
       const serverSeq = await latestSeqForNode(auth, tx, folderId, op.node_id);
-      await notifyCommitted(hub, folderId, serverSeq, onOpCommitted);
+      await tx
+        .update(auth.schema.nodes)
+        .set({ serverSeq })
+        .where(eq(auth.schema.nodes.nodeId, op.node_id));
       return {
-        result: "conflict_copy",
-        server_seq: serverSeq,
-        node_id: op.node_id,
-        conflict_version_id: conflictVersionId,
-      } satisfies SubmitOpResponse;
+        response: {
+          result: "conflict_copy",
+          server_seq: serverSeq,
+          node_id: op.node_id,
+          conflict_version_id: conflictVersionId,
+        } satisfies SubmitOpResponse,
+        committedOp: { folderId, serverSeq, nodeId: op.node_id, opType: op.op_type } satisfies CommittedOp,
+      };
     }
 
     if (op.op_type === "rename" || op.op_type === "move") {
@@ -172,6 +189,7 @@ export async function submitOp(
       }
     }
 
+    const previousParentId = op.op_type === "move" ? (await currentNode(auth, tx, op.node_id))?.parentId : undefined;
     await applyMetadataMutation(auth, tx, op.node_id, op);
     await insertVersionAndOp(auth, tx, folderId, op.node_id, principal.deviceId, op, false);
     const serverSeq = await latestSeqForNode(auth, tx, folderId, op.node_id);
@@ -179,9 +197,15 @@ export async function submitOp(
       .update(auth.schema.nodes)
       .set({ serverSeq })
       .where(eq(auth.schema.nodes.nodeId, op.node_id));
-    await notifyCommitted(hub, folderId, serverSeq, onOpCommitted);
-    return { result: "applied", server_seq: serverSeq, node_id: op.node_id } satisfies SubmitOpResponse;
+    return {
+      response: { result: "applied", server_seq: serverSeq, node_id: op.node_id } satisfies SubmitOpResponse,
+      committedOp: { folderId, serverSeq, nodeId: op.node_id, opType: op.op_type, previousParentId } satisfies CommittedOp,
+    };
   });
+  if (committedOp) {
+    await notifyCommitted(hub, committedOp, onOpCommitted);
+  }
+  return response;
 }
 
 async function submitOpWithStore(
@@ -190,7 +214,7 @@ async function submitOpWithStore(
   folderId: string,
   principal: Extract<Principal, { type: "device" }>,
   op: SubmitOpRequest,
-  onOpCommitted?: (folderId: string, serverSeq: number) => Promise<void>,
+  onOpCommitted?: (op: CommittedOp) => Promise<void>,
 ): Promise<SubmitOpResponse> {
   if (op.op_type === "create") {
     const grant = await checkGrant(db, op.payload.parent_id, principal, "write");
@@ -221,7 +245,7 @@ async function submitOpWithStore(
       actorDeviceId: principal.deviceId,
     });
     await db.updateNodeForOp(nodeId, { serverSeq });
-    await notifyCommitted(hub, folderId, serverSeq, onOpCommitted);
+    await notifyCommitted(hub, { folderId, serverSeq, nodeId, opType: op.op_type }, onOpCommitted);
     return { result: "applied", server_seq: serverSeq, node_id: nodeId };
   }
 
@@ -257,7 +281,8 @@ async function submitOpWithStore(
       basedOnSeq: op.based_on_seq,
       actorDeviceId: principal.deviceId,
     });
-    await notifyCommitted(hub, folderId, serverSeq, onOpCommitted);
+    await db.updateNodeForOp(op.node_id, { serverSeq });
+    await notifyCommitted(hub, { folderId, serverSeq, nodeId: op.node_id, opType: op.op_type }, onOpCommitted);
     return { result: "conflict_copy", server_seq: serverSeq, node_id: op.node_id, conflict_version_id: conflictVersionId };
   }
 
@@ -308,7 +333,7 @@ async function submitOpWithStore(
     actorDeviceId: principal.deviceId,
   });
   await db.updateNodeForOp(op.node_id, { serverSeq });
-  await notifyCommitted(hub, folderId, serverSeq, onOpCommitted);
+  await notifyCommitted(hub, { folderId, serverSeq, nodeId: op.node_id, opType: op.op_type, previousParentId: op.op_type === "move" ? node.parentId : undefined }, onOpCommitted);
   return { result: "applied", server_seq: serverSeq, node_id: op.node_id };
 }
 
@@ -322,11 +347,12 @@ async function createNode(
   folderId: string,
   actorDeviceId: string,
   op: Extract<SubmitOpRequest, { op_type: "create" }>,
-  onOpCommitted?: (folderId: string, serverSeq: number) => Promise<void>,
+  onOpCommitted?: (op: CommittedOp) => Promise<void>,
 ): Promise<SubmitOpResponse> {
   const nodeId = op.payload.node_id;
+  let result: { response: SubmitOpResponse; committedOp: CommittedOp };
   try {
-    return await inTransaction(auth, async (tx) => {
+    result = await inTransaction(auth, async (tx) => {
       await tx.insert(auth.schema.nodes).values({
         nodeId,
         folderId,
@@ -345,8 +371,10 @@ async function createNode(
       });
       const serverSeq = await latestSeqForNode(auth, tx, folderId, nodeId);
       await tx.update(auth.schema.nodes).set({ serverSeq }).where(eq(auth.schema.nodes.nodeId, nodeId));
-      await notifyCommitted(hub, folderId, serverSeq, onOpCommitted);
-      return { result: "applied", server_seq: serverSeq, node_id: nodeId } satisfies SubmitOpResponse;
+      return {
+        response: { result: "applied", server_seq: serverSeq, node_id: nodeId } satisfies SubmitOpResponse,
+        committedOp: { folderId, serverSeq, nodeId, opType: op.op_type } satisfies CommittedOp,
+      };
     });
   } catch (error) {
     const winners = await auth.db
@@ -361,16 +389,21 @@ async function createNode(
     }
     throw error;
   }
+  await notifyCommitted(hub, result.committedOp, onOpCommitted);
+  return result.response;
 }
 
 async function notifyCommitted(
   hub: MetadataHub,
-  folderId: string,
-  serverSeq: number,
-  onOpCommitted?: (folderId: string, serverSeq: number) => Promise<void>,
+  op: CommittedOp,
+  onOpCommitted?: (op: CommittedOp) => Promise<void>,
 ): Promise<void> {
-  hub.notify(folderId, serverSeq);
-  await onOpCommitted?.(folderId, serverSeq);
+  try {
+    hub.notify(op.folderId, op.serverSeq);
+    await onOpCommitted?.(op);
+  } catch (error) {
+    console.error("metadata notification failed", error);
+  }
 }
 
 async function applyMetadataMutation(

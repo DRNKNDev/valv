@@ -26,7 +26,7 @@ export {
 } from "./gc/index.js";
 export { checkGrant, MAX_GRANT_WALK_DEPTH } from "./metadata/authz.js";
 export { createMetadataRouter } from "./metadata/index.js";
-export type { MetadataHub } from "./metadata/index.js";
+export type { CommittedOp, MetadataHub } from "./metadata/index.js";
 export { createHub, createRealtimeRouter } from "./realtime/index.js";
 export type { Hub, RealtimeSocket } from "./realtime/index.js";
 

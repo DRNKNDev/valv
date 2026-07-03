@@ -3,12 +3,13 @@ import { Hono } from "hono";
 import type { CoreAuth } from "../auth/index.js";
 import { checkGrant } from "./authz.js";
 import { desc, eq, requirePrincipal, toIso, type MetadataHub, type MetadataVariables } from "./common.js";
-import { submitOp } from "./ops.js";
+import { submitOp, type CommittedOp } from "./ops.js";
 
 export function registerVersionRoutes(
   router: Hono<{ Variables: MetadataVariables }>,
   auth: CoreAuth,
   hub: MetadataHub,
+  onOpCommitted?: (op: CommittedOp) => Promise<void>,
 ): void {
   const listVersions = async (ctx: any) => {
     const principal = requirePrincipal(ctx);
@@ -70,17 +71,24 @@ export function registerVersionRoutes(
       return ctx.json({ error: "node_not_found" }, 404);
     }
 
-    const response = await submitOp(auth, hub, folderId, principal, {
-      op_type: "new_version",
-      node_id: nodeId,
-      based_on_seq: node.serverSeq,
-      payload: {
-        version_id: crypto.randomUUID(),
-        content_hash: version.contentHash,
-        size_bytes: version.sizeBytes,
-        manifest: version.manifest as any,
+    const response = await submitOp(
+      auth,
+      hub,
+      folderId,
+      principal,
+      {
+        op_type: "new_version",
+        node_id: nodeId,
+        based_on_seq: node.serverSeq,
+        payload: {
+          version_id: crypto.randomUUID(),
+          content_hash: version.contentHash,
+          size_bytes: version.sizeBytes,
+          manifest: version.manifest as any,
+        },
       },
-    });
+      onOpCommitted,
+    );
     return ctx.json(response);
   });
 }
