@@ -54,7 +54,7 @@ export function registerInviteRoutes(
       return ctx.json({ error: "folder_not_found" }, 404);
     }
 
-    const grant = await checkGrant(auth.db, scopeNodeId, principal, "read", auth.schema);
+    const grant = await checkGrant(auth.db, scopeNodeId, principal, "write", auth.schema);
     if (!grant.granted) {
       return ctx.json({ error: grant.reason }, 403);
     }

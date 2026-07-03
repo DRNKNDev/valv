@@ -34,7 +34,7 @@ export function registerGrantRoutes(router: Hono<{ Variables: MetadataVariables 
       return ctx.json({ error: "invalid_scope_node_id" }, 400);
     }
 
-    const grant = await checkGrant(auth.db, scopeNodeId, principal, "read", auth.schema);
+    const grant = await checkGrant(auth.db, scopeNodeId, principal, "write", auth.schema);
     if (!grant.granted) {
       return ctx.json({ error: grant.reason }, 403);
     }

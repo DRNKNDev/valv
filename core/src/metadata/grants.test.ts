@@ -38,6 +38,22 @@ describe("grant routes", () => {
     await expect(response.json()).resolves.toEqual({ error: "invalid_scope_node_id" });
   });
 
+  it("rejects agent grant provisioning from a read-only grant holder", async () => {
+    const db = new LifecycleDb();
+    db.folderGrants.push(grant("grant-readonly", { scopeNodeId: "work", userId: "user-1", canWrite: false }));
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" });
+
+    const response = await app.request("/folders/folder-1/grants", {
+      method: "POST",
+      body: JSON.stringify({ scope_node_id: "work", name: "Agent" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(403);
+    expect(db.devices).toHaveLength(0);
+    expect(db.folderGrants).toHaveLength(1);
+  });
+
   it("provisions agent grants with null user_id and hashed token", async () => {
     const db = new LifecycleDb();
     db.authorizedScopes.add("work");

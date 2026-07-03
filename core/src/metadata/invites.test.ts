@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { LifecycleDb, metadataAppFor } from "../../tests/support.js";
+import { grant, LifecycleDb, metadataAppFor } from "../../tests/support.js";
 
 describe("invite routes", () => {
   it("defaults invite scope to folder root and does not roll back when email fails", async () => {
@@ -49,6 +49,21 @@ describe("invite routes", () => {
     expect(second.status).toBe(200);
     expect(db.folderGrants).toHaveLength(1);
     expect(db.folderGrants[0]).toMatchObject({ userId: "user-2", deviceId: null, scopeNodeId: "root" });
+  });
+
+  it("rejects invite creation from a read-only grant holder", async () => {
+    const db = new LifecycleDb();
+    db.folderGrants.push(grant("grant-readonly", { scopeNodeId: "root", userId: "user-1", canWrite: false }));
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" });
+
+    const response = await app.request("/folders/folder-1/invites", {
+      method: "POST",
+      body: JSON.stringify({ invited_email: "friend@example.com" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(403);
+    expect(db.folderInvites).toHaveLength(0);
   });
 
   it("rejects expired invites with 410", async () => {
