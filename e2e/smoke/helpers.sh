@@ -122,12 +122,25 @@ stop_daemon() {
 
 wait_for_idle() {
   local home_dir="${1:-$HOME_A}"
+  local folder_id="${2:-}"
+  local mount_path=""
+  if [ -n "$folder_id" ]; then
+    mount_path=$(sqlite3 "${home_dir}/.local/share/valv/sync.db" "SELECT path FROM mounts WHERE folder_id = '${folder_id}' LIMIT 1" 2>/dev/null || true)
+  fi
   local deadline=$((SECONDS + 30))
   while [ "$SECONDS" -lt "$deadline" ]; do
     local status
     status=$(HOME="$home_dir" "$VALV_BIN" status 2>/dev/null || true)
-    if [ -n "$status" ] && ! printf '%s\n' "$status" | grep -q $'\ttrue\t'; then
-      return 0
+    if [ -n "$status" ]; then
+      if [ -n "$mount_path" ]; then
+        local mount_status
+        mount_status=$(printf '%s\n' "$status" | awk -v path="$mount_path" 'BEGIN { FS = "\t" } $1 == path { print; found = 1 } END { if (!found) exit 1 }' || true)
+        if [ -n "$mount_status" ] && ! printf '%s\n' "$mount_status" | grep -q $'\ttrue\t'; then
+          return 0
+        fi
+      elif ! printf '%s\n' "$status" | grep -q $'\ttrue\t'; then
+        return 0
+      fi
     fi
     sleep 0.5
   done
@@ -137,8 +150,13 @@ wait_for_idle() {
 
 sync_mount() {
   local home_dir="${1:-$HOME_A}"
-  HOME="$home_dir" "$VALV_BIN" sync >/dev/null
-  wait_for_idle "$home_dir"
+  local folder_id="${2:-}"
+  if [ -n "$folder_id" ]; then
+    HOME="$home_dir" "$VALV_BIN" sync --folder "$folder_id" >/dev/null
+  else
+    HOME="$home_dir" "$VALV_BIN" sync >/dev/null
+  fi
+  wait_for_idle "$home_dir" "$folder_id"
 }
 
 mount_folder() {

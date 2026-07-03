@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use axum::{extract::State, response::IntoResponse, Json};
+use tokio::time::{sleep, Duration};
 use valv_sync::protocol::ipc::DaemonStatus;
 
 use crate::DaemonState;
@@ -41,6 +42,7 @@ pub(crate) async fn post_pause(State(state): State<DaemonState>) -> axum::http::
 }
 
 pub(crate) async fn post_resume(State(state): State<DaemonState>) -> axum::http::StatusCode {
+    sleep(Duration::from_millis(250)).await;
     state.paused.store(false, Ordering::Release);
     axum::http::StatusCode::NO_CONTENT
 }

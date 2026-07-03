@@ -19,12 +19,12 @@ mount_folder "$HOME_B" "$mount_b" --folder "$folder_id" >/dev/null
 sleep 1
 
 printf 'ws-push content\n' > "${mount_a}/ws-file.txt"
-sync_mount "$HOME_A"
+sync_mount "$HOME_A" "$folder_id"
 wait_for_file_on_device "$mount_b" "ws-file.txt" 30
 assert_file_contains "${mount_b}/ws-file.txt" "ws-push content"
 
 printf 'second file\n' > "${mount_a}/ws-file-2.txt"
-sync_mount "$HOME_A"
+sync_mount "$HOME_A" "$folder_id"
 wait_for_file_on_device "$mount_b" "ws-file-2.txt" 30
 assert_file_contains "${mount_b}/ws-file-2.txt" "second file"
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::Path,
     sync::{
@@ -72,7 +73,9 @@ struct DaemonState {
     paused: Arc<AtomicBool>,
     fs_events_paused: Arc<AtomicBool>,
     mounts: Arc<Mutex<Vec<MountState>>>,
-    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    // Keyed by mount path so mounting/remounting one folder only cancels and
+    // respawns that mount's own tasks instead of every persisted mount's.
+    tasks: Arc<Mutex<HashMap<String, Vec<JoinHandle<()>>>>>,
     db: Arc<Mutex<Connection>>,
     client: reqwest::Client,
     config: DaemonConfig,
@@ -85,10 +88,14 @@ struct MountState {
     grant_id: Option<String>,
     scope_node_id: Option<String>,
     mount_token: Option<String>,
-    syncing: bool,
+    active_syncs: u32,
     pending_ops: u64,
     last_synced_at: Option<String>,
     error: Option<String>,
+    // Serializes pull_mount_once/full_sync_mount for this mount so a background
+    // pull can't mutate the local mirror mid-flight through an explicit sync's
+    // push_local pass (see oss/crates/valv-sync/src/sync_engine/local_push.rs).
+    sync_lock: Arc<Mutex<()>>,
 }
 
 #[tokio::main]
@@ -115,17 +122,18 @@ async fn run() -> Result<()> {
             grant_id: mount.grant_id,
             scope_node_id: mount.scope_node_id,
             mount_token: mount.mount_token,
-            syncing: false,
+            active_syncs: 0,
             pending_ops: 0,
             last_synced_at: None,
             error: None,
+            sync_lock: Arc::new(Mutex::new(())),
         })
         .collect();
     let state = DaemonState {
         paused: Arc::new(AtomicBool::new(false)),
         fs_events_paused: Arc::new(AtomicBool::new(false)),
         mounts: Arc::new(Mutex::new(mount_states)),
-        tasks: Arc::new(Mutex::new(Vec::new())),
+        tasks: Arc::new(Mutex::new(HashMap::new())),
         db: Arc::new(Mutex::new(conn)),
         client: reqwest::Client::new(),
         config,
@@ -220,7 +228,7 @@ impl MountState {
             folder_id: self.folder_id.clone(),
             scope_node_id: self.scope_node_id.clone(),
             grant_id: self.grant_id.clone(),
-            syncing: self.syncing,
+            syncing: self.active_syncs > 0,
             pending_ops: self.pending_ops,
             last_synced_at: self.last_synced_at.clone(),
             error: self.error.clone(),

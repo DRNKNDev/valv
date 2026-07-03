@@ -16,7 +16,7 @@ mount_a="${TMPDIR}/mount-19-a"
 folder_id=$(mount_folder "$HOME_A" "$mount_a")
 mkdir -p "${mount_a}/read-target"
 printf 'top secret\n' > "${mount_a}/read-target/secret.txt"
-sync_mount "$HOME_A"
+sync_mount "$HOME_A" "$folder_id"
 
 scope_node_id=$(get_node_id_at_path "$folder_id" "/read-target")
 grant=$(api POST "/api/folders/${folder_id}/grants" "{\"scope_node_id\":\"${scope_node_id}\",\"name\":\"Read Only Smoke\",\"can_read\":true,\"can_write\":false}")
@@ -27,16 +27,16 @@ write_device_config "$HOME_C" "$DEVICE_ID_C" "$DEVICE_TOKEN_C" "Smoke Device C"
 start_daemon HOME_C DAEMON_PID_C
 mount_c="${TMPDIR}/mount-19-c"
 mount_folder "$HOME_C" "$mount_c" --grant "$DEVICE_TOKEN_C" >/dev/null
-sync_mount "$HOME_C"
+sync_mount "$HOME_C" "$folder_id"
 assert_file_contains "${mount_c}/secret.txt" "top secret"
 
 printf 'injected\n' > "${mount_c}/attempt.txt"
-HOME="$HOME_C" "$VALV_BIN" sync >/dev/null 2>&1 || true
+HOME="$HOME_C" "$VALV_BIN" sync --folder "$folder_id" >/dev/null 2>&1 || true
 assert_no_live_node_at_path "$folder_id" "/read-target/attempt.txt"
 
 HOME="$HOME_C" "$VALV_BIN" pause >/dev/null
 mv "${mount_c}/secret.txt" "${mount_c}/renamed.txt"
 HOME="$HOME_C" "$VALV_BIN" resume >/dev/null
-HOME="$HOME_C" "$VALV_BIN" sync >/dev/null 2>&1 || true
+HOME="$HOME_C" "$VALV_BIN" sync --folder "$folder_id" >/dev/null 2>&1 || true
 assert_node_at_path "$folder_id" "/read-target/secret.txt"
 assert_no_live_node_at_path "$folder_id" "/read-target/renamed.txt"

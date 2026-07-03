@@ -18,5 +18,5 @@ sleep 2
 assert_no_live_node_at_path "$folder_id" "/paused.txt"
 
 HOME="$HOME_A" "$VALV_BIN" resume >/dev/null
-sync_mount "$HOME_A"
+sync_mount "$HOME_A" "$folder_id"
 assert_node_at_path "$folder_id" "/paused.txt"

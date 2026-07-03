@@ -17,7 +17,7 @@ folder_id=$(mount_folder "$HOME_A" "$mount_a")
 mkdir -p "${mount_a}/subdir-a" "${mount_a}/subdir-b"
 printf 'inside\n' > "${mount_a}/subdir-a/inside.txt"
 printf 'outside\n' > "${mount_a}/subdir-b/outside.txt"
-sync_mount "$HOME_A"
+sync_mount "$HOME_A" "$folder_id"
 
 scope_node_id=$(node_id_at_path "$folder_id" "/subdir-a")
 grant=$(api POST "/api/folders/${folder_id}/grants" "{\"scope_node_id\":\"${scope_node_id}\",\"name\":\"Scoped Smoke Device\",\"can_read\":true,\"can_write\":true}")
@@ -28,6 +28,6 @@ write_device_config "$HOME_C" "$DEVICE_ID_C" "$DEVICE_TOKEN_C" "Smoke Device C"
 start_daemon HOME_C DAEMON_PID_C
 mount_c="${TMPDIR}/mount-09-c"
 mount_folder "$HOME_C" "$mount_c" --grant "$DEVICE_TOKEN_C" >/dev/null
-sync_mount "$HOME_C"
+sync_mount "$HOME_C" "$folder_id"
 
 [ ! -e "${mount_c}/subdir-b/outside.txt" ] || fail "scoped mount contains out-of-scope file"

@@ -26,13 +26,14 @@ use crate::{
     persistence::{
         chunks as chunk_store,
         nodes::{self, get_node_by_parent_and_name, get_root_node, LocalNode},
+        versions,
     },
     protocol::http::{BatchOperation, BatchRequest, BatchRequestObject, BatchResponse},
     protocol::sync::{
         ChunkRef, CreatePayload, DeletePayload, MovePayload, NewVersionPayload, NodeType,
         RenamePayload, SubmitOpRequest, SubmitOpResponse,
     },
-    sync_engine::op_submit::{materialize_conflict_copy, submit_op},
+    sync_engine::op_submit::{apply_submitted_new_version, materialize_conflict_copy, submit_op},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,10 +61,30 @@ pub async fn fs_watch_task(
     token: String,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(256);
-    watch_mount(&mount.path, tx)?;
+    watch_mount(&mount.path, tx, paused.clone(), fs_events_paused.clone())?;
+    let mut dropped_paused_events = false;
 
-    while let Some(events) = debounce_next_batch(&mut rx).await {
+    loop {
         if paused.load(Ordering::Acquire) || fs_events_paused.load(Ordering::Acquire) {
+            drain_pending_events(&mut rx);
+            dropped_paused_events = true;
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+
+        if dropped_paused_events {
+            sleep(Duration::from_millis(150)).await;
+            drain_pending_events(&mut rx);
+            dropped_paused_events = false;
+            continue;
+        }
+
+        let Some(events) = debounce_next_batch(&mut rx).await else {
+            break;
+        };
+        if paused.load(Ordering::Acquire) || fs_events_paused.load(Ordering::Acquire) {
+            drain_pending_events(&mut rx);
+            dropped_paused_events = true;
             continue;
         }
 
@@ -75,10 +96,22 @@ pub async fn fs_watch_task(
     Ok(())
 }
 
-pub fn watch_mount(path: &Path, tx: mpsc::Sender<FsEvent>) -> Result<()> {
+fn drain_pending_events(rx: &mut mpsc::Receiver<FsEvent>) {
+    while rx.try_recv().is_ok() {}
+}
+
+pub fn watch_mount(
+    path: &Path,
+    tx: mpsc::Sender<FsEvent>,
+    paused: Arc<AtomicBool>,
+    fs_events_paused: Arc<AtomicBool>,
+) -> Result<()> {
     let sender = tx.clone();
     let mut watcher = RecommendedWatcher::new(
         move |result: notify::Result<Event>| {
+            if paused.load(Ordering::Acquire) || fs_events_paused.load(Ordering::Acquire) {
+                return;
+            }
             let Ok(event) = result else {
                 return;
             };
@@ -231,6 +264,9 @@ async fn handle_create(
         NodeType::File
     };
     let name = file_name(path)?;
+    if !metadata.is_dir() && is_conflict_copy_name(&name) {
+        return Ok(());
+    }
     let (req, parent_id, local_name, local_node_type) = {
         let conn = db.lock().await;
         let Some(parent) = resolve_parent_for_path(&conn, &mount.path, &mount.folder_id, path)?
@@ -351,6 +387,29 @@ async fn upload_file_new_version(
     path: &Path,
 ) -> Result<()> {
     let chunks = chunk_file(path)?;
+    let size_bytes = chunks.iter().map(|chunk| chunk.length).sum();
+    let manifest = chunks
+        .iter()
+        .map(|chunk| ChunkRef {
+            chunk_hash: chunk.hash.clone(),
+            offset: chunk.offset,
+            length: chunk.length,
+        })
+        .collect::<Vec<_>>();
+    let content_hash = manifest_content_hash(&manifest);
+    {
+        let conn = db.lock().await;
+        if let Some(node) = nodes::get_node(&conn, node_id)? {
+            if let Some(version_id) = node.current_version_id.as_deref() {
+                if let Some(version) = versions::get_version(&conn, version_id)? {
+                    if version.size_bytes == size_bytes && version.content_hash == content_hash {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
     let pending = {
         let conn = db.lock().await;
         chunks
@@ -370,31 +429,21 @@ async fn upload_file_new_version(
         }
     }
 
-    let manifest = chunks
-        .iter()
-        .map(|chunk| ChunkRef {
-            chunk_hash: chunk.hash.clone(),
-            offset: chunk.offset,
-            length: chunk.length,
-        })
-        .collect::<Vec<_>>();
-    let response = submit_op(
-        client,
-        backend_url,
-        token,
-        &mount.folder_id,
-        &SubmitOpRequest::NewVersion {
+    let req = SubmitOpRequest::NewVersion {
             node_id: node_id.to_owned(),
             based_on_seq,
             payload: NewVersionPayload {
                 version_id: Uuid::new_v4().to_string(),
-                content_hash: manifest_content_hash(&manifest),
-                size_bytes: chunks.iter().map(|chunk| chunk.length).sum(),
+                content_hash,
+                size_bytes,
                 manifest,
             },
-        },
-    )
-    .await?;
+        };
+    let response = submit_op(client, backend_url, token, &mount.folder_id, &req).await?;
+    {
+        let conn = db.lock().await;
+        apply_submitted_new_version(&conn, &mount.folder_id, node_id, &req, &response)?;
+    }
     if matches!(response, SubmitOpResponse::ConflictCopy { .. }) {
         let date = Local::now().date_naive().to_string();
         materialize_conflict_copy(path, &mount.device_name, &date)?;
@@ -462,6 +511,10 @@ fn manifest_content_hash(manifest: &[ChunkRef]) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn is_conflict_copy_name(name: &str) -> bool {
+    name.contains(" (conflicted copy, ")
+}
+
 async fn handle_delete(
     mount: &WatchMount,
     db: &Arc<Mutex<Connection>>,
@@ -470,6 +523,15 @@ async fn handle_delete(
     token: &str,
     path: &Path,
 ) -> Result<()> {
+    // notify's single-path `ModifyKind::Name` events are ambiguous: the OS uses
+    // them both for genuine out-of-tree moves (e.g. Finder "Move to Trash") and,
+    // on some platforms, for one half of an in-tree rename delivered as two
+    // separate single-path events instead of one two-path event. In the latter
+    // case the path is still present on disk, so trust the filesystem over the
+    // event classification before treating this as a real delete.
+    if path.exists() {
+        return Ok(());
+    }
     let req = {
         let conn = db.lock().await;
         let Some(node) = resolve_abs_path(&conn, &mount.path, &mount.folder_id, path)? else {

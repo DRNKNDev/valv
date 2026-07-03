@@ -4,12 +4,13 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
     chunking::chunk_file,
+    persistence::versions::{self, LocalVersion},
     protocol::sync::{ChunkRef, NewVersionPayload, SubmitOpRequest, SubmitOpResponse},
     storage::upload_chunks,
 };
@@ -93,10 +94,52 @@ pub async fn upload_then_submit_new_version(
         },
     };
     let response = submit_op(client, backend_url, token, folder_id, &req).await?;
+    apply_submitted_new_version(conn, folder_id, node_id, &req, &response)?;
     if matches!(response, SubmitOpResponse::ConflictCopy { .. }) {
         materialize_conflict_copy(path, device_name, date)?;
     }
     Ok(response)
+}
+
+pub fn apply_submitted_new_version(
+    conn: &Connection,
+    folder_id: &str,
+    node_id: &str,
+    req: &SubmitOpRequest,
+    response: &SubmitOpResponse,
+) -> Result<()> {
+    let SubmitOpRequest::NewVersion { payload, .. } = req else {
+        return Ok(());
+    };
+    let (version_id, server_seq, is_conflict_copy) = match response {
+        SubmitOpResponse::Applied { server_seq, .. } => (&payload.version_id, *server_seq, false),
+        SubmitOpResponse::ConflictCopy { server_seq, conflict_version_id, .. } => (conflict_version_id, *server_seq, true),
+        SubmitOpResponse::Superseded { .. } => return Ok(()),
+    };
+
+    versions::upsert_version(
+        conn,
+        &LocalVersion {
+            version_id: version_id.clone(),
+            node_id: node_id.to_owned(),
+            folder_id: folder_id.to_owned(),
+            content_hash: payload.content_hash.clone(),
+            size_bytes: payload.size_bytes,
+            manifest_json: serde_json::to_string(&payload.manifest)?,
+        },
+    )?;
+    if is_conflict_copy {
+        conn.execute(
+            "UPDATE nodes SET server_seq = ?1 WHERE node_id = ?2",
+            params![server_seq, node_id],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE nodes SET current_version_id = ?1, server_seq = ?2 WHERE node_id = ?3",
+            params![version_id, server_seq, node_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn manifest_content_hash(manifest: &[ChunkRef]) -> String {

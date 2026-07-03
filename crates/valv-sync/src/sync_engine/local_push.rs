@@ -129,6 +129,10 @@ pub async fn push_local(
                 let conn = db.lock().await;
                 get_node_by_parent_and_name(&conn, folder_id, Some(&parent_node_id), &entry.name)?
             };
+            if entry.is_file && mirror_node.is_none() && is_conflict_copy_name(&entry.name) {
+                summary.skipped += 1;
+                continue;
+            }
 
             if entry.is_dir {
                 if let Some(node) = mirror_node.filter(|node| node.deleted_at.is_none()) {
@@ -805,6 +809,10 @@ fn node_type_str(node_type: &NodeType) -> &'static str {
         NodeType::File => "file",
         NodeType::Folder => "folder",
     }
+}
+
+fn is_conflict_copy_name(name: &str) -> bool {
+    name.contains(" (conflicted copy, ")
 }
 
 fn today_date_str() -> String {

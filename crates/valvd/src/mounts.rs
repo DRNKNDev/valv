@@ -1,8 +1,9 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use anyhow::{anyhow, Result};
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use valv_sync::{
     persistence::mounts as mount_store,
     protocol::ipc::{MountRequest, MountResponse},
@@ -11,7 +12,7 @@ use valv_sync::{
 
 use crate::{
     internal_error,
-    tasks::{cancel_mount_tasks, materialize_mount_files, spawn_mount_tasks},
+    tasks::{cancel_tasks_for_mount, materialize_mount_files, spawn_tasks_for_mount},
     DaemonState, ErrorResponse, MountState,
 };
 
@@ -64,10 +65,11 @@ pub(crate) async fn post_mount(
         grant_id: resolved.grant_id.clone(),
         scope_node_id: resolved.scope_node_id.clone(),
         mount_token: resolved.mount_token,
-        syncing: false,
+        active_syncs: 0,
         pending_ops: 0,
         last_synced_at: None,
         error: None,
+        sync_lock: Arc::new(Mutex::new(())),
     };
     if let Err(err) = materialize_mount_files(&state, &mount).await {
         let conn = state.db.lock().await;
@@ -85,8 +87,8 @@ pub(crate) async fn post_mount(
             mounts.push(mount.clone());
         }
     }
-    cancel_mount_tasks(&state).await;
-    spawn_mount_tasks(&state).await;
+    cancel_tasks_for_mount(&state, &mount.path).await;
+    spawn_tasks_for_mount(&state, mount).await;
 
     Ok(Json(MountResponse {
         folder_id: resolved.folder_id,

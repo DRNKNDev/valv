@@ -11,7 +11,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use tokio::{
     sync::mpsc,
-    time::{interval, sleep, MissedTickBehavior},
+    time::{interval_at, sleep, Instant, MissedTickBehavior},
 };
 use valv_sync::{
     persistence::{
@@ -123,7 +123,7 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
         .tasks
         .lock()
         .await
-        .extend([sync_handle, ws_handle, fs_handle]);
+        .insert(mount.path.clone(), vec![sync_handle, ws_handle, fs_handle]);
 }
 
 async fn sync_loop(
@@ -131,7 +131,16 @@ async fn sync_loop(
     mount: MountState,
     mut notify_rx: mpsc::Receiver<WsPushNotification>,
 ) {
-    let mut ticker = interval(Duration::from_secs(30));
+    // interval_at (not interval) delays the first tick by a full period.
+    // post_mount already runs tree_resync + materialize_mount_files before
+    // this task is spawned, so an immediate first tick buys no correctness
+    // benefit; it only means every mount on a daemon fires a redundant pull
+    // the instant it's spawned. With many persisted mounts on one daemon
+    // (e.g. a device that has mounted many folders over time), those pulls
+    // all serialize on the daemon's single sync.db connection, which can
+    // stall an unrelated foreground `valv sync` for many seconds.
+    let period = Duration::from_secs(30);
+    let mut ticker = interval_at(Instant::now() + period, period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
@@ -156,7 +165,8 @@ async fn sync_loop(
 }
 
 async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
-    set_mount_syncing(state, &mount.folder_id, true, None).await;
+    let _sync_guard = mount.sync_lock.lock().await;
+    begin_mount_sync(state, &mount.folder_id).await;
     let result = {
         let mut conn = state.db.lock().await;
         let token = mount.effective_token(&state.config).to_owned();
@@ -181,19 +191,16 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
                 .err()
                 .map(|err| err.to_string());
             resume_watchers_after_debounce(state, was_paused).await;
-            if apply_error.is_some() {
-                apply_error
-            } else {
-                cleanup_error
-            }
+            apply_error.or(cleanup_error)
         }
         Err(err) => Some(err.to_string()),
     };
-    set_mount_syncing(state, &mount.folder_id, false, error).await;
+    end_mount_sync(state, &mount.folder_id, error).await;
 }
 
 async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary {
-    set_mount_syncing(state, &mount.folder_id, true, None).await;
+    let _sync_guard = mount.sync_lock.lock().await;
+    begin_mount_sync(state, &mount.folder_id).await;
 
     let mut summary = SyncSummary::default();
     let push_result = push_local(
@@ -260,7 +267,7 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
     };
 
     set_mount_pending_ops(state, &mount.folder_id, 0).await;
-    set_mount_syncing(state, &mount.folder_id, false, error).await;
+    end_mount_sync(state, &mount.folder_id, error).await;
     summary
 }
 
@@ -395,7 +402,7 @@ async fn apply_pulled_fs_change(
                     .await?;
             }
         }
-        "rename" => {
+        "rename" | "move" => {
             let Some(old_path) = pre_op_abs_path(nodes_by_id, mount_root, mount, pulled) else {
                 return Ok(());
             };
@@ -407,30 +414,27 @@ async fn apply_pulled_fs_change(
             ) else {
                 return Ok(());
             };
-            if old_path.exists() && old_path != new_path {
-                if let Some(parent) = new_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::rename(old_path, new_path)?;
+            if old_path == new_path {
+                return Ok(());
             }
-        }
-        "move" => {
-            let Some(old_path) = pre_op_abs_path(nodes_by_id, mount_root, mount, pulled) else {
-                return Ok(());
-            };
-            let Some(new_path) = node_abs_path(
-                nodes_by_id,
-                mount_root,
-                mount.scope_node_id.as_deref(),
-                &pulled.node_id,
-            ) else {
-                return Ok(());
-            };
-            if old_path.exists() && old_path != new_path {
+            if old_path.exists() {
                 if let Some(parent) = new_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
                 fs::rename(old_path, new_path)?;
+            } else {
+                // old_path is already gone locally (e.g. a concurrent local
+                // rename/delete raced this same node). We can't move it into
+                // place, but the mirror DB now tracks this node at new_path
+                // regardless, so materialize just this one node there.
+                // Deliberately scoped to this single node rather than a full
+                // materialize_mount_files sweep: that would also re-download
+                // any other node the DB still tracks as live but which is
+                // merely missing on disk because the user deleted it locally
+                // and push_local (which would tell the server about that)
+                // hasn't run yet.
+                materialize_single_node(state, mount, nodes_by_id, &pulled.node_id, &new_path)
+                    .await?;
             }
         }
         "new_version" if pulled.is_conflict_copy => {
@@ -474,6 +478,43 @@ async fn apply_pulled_fs_change(
         "delete" => {}
         _ => {}
     }
+    Ok(())
+}
+
+/// Materializes a single tracked node at `path`, downloading file content if
+/// needed. Unlike `materialize_mount_files`, this touches only the given
+/// node rather than sweeping the whole tree, so it can safely be used from
+/// background pull handling without risking resurrecting other nodes the
+/// user has deleted locally but not yet pushed.
+async fn materialize_single_node(
+    state: &DaemonState,
+    mount: &MountState,
+    nodes_by_id: &HashMap<String, LocalNode>,
+    node_id: &str,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let Some(node) = nodes_by_id.get(node_id) else {
+        return Ok(());
+    };
+    if node.node_type == "folder" {
+        fs::create_dir_all(path)?;
+        return Ok(());
+    }
+    let Some(version_id) = node.current_version_id.as_deref() else {
+        return Ok(());
+    };
+    let already_materialized = {
+        let conn = state.db.lock().await;
+        versions::get_version(&conn, version_id)?.is_some() && path.exists()
+    };
+    if already_materialized {
+        return Ok(());
+    }
+    let bytes = download_and_store_version(state, mount, node_id, version_id).await?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, bytes)?;
     Ok(())
 }
 
@@ -805,22 +846,35 @@ async fn run_full_sync_mount(
 }
 
 pub(crate) async fn cancel_mount_tasks(state: &DaemonState) {
-    for task in state.tasks.lock().await.drain(..) {
-        task.abort();
+    for (_, tasks) in state.tasks.lock().await.drain() {
+        for task in tasks {
+            task.abort();
+        }
     }
 }
 
-async fn set_mount_syncing(
-    state: &DaemonState,
-    folder_id: &str,
-    syncing: bool,
-    error: Option<String>,
-) {
+pub(crate) async fn cancel_tasks_for_mount(state: &DaemonState, path: &str) {
+    if let Some(tasks) = state.tasks.lock().await.remove(path) {
+        for task in tasks {
+            task.abort();
+        }
+    }
+}
+
+async fn begin_mount_sync(state: &DaemonState, folder_id: &str) {
     let mut mounts = state.mounts.lock().await;
     if let Some(mount) = mounts.iter_mut().find(|mount| mount.folder_id == folder_id) {
-        mount.syncing = syncing;
+        mount.active_syncs = mount.active_syncs.saturating_add(1);
+        mount.error = None;
+    }
+}
+
+async fn end_mount_sync(state: &DaemonState, folder_id: &str, error: Option<String>) {
+    let mut mounts = state.mounts.lock().await;
+    if let Some(mount) = mounts.iter_mut().find(|mount| mount.folder_id == folder_id) {
+        mount.active_syncs = mount.active_syncs.saturating_sub(1);
         mount.error = error;
-        if !syncing && mount.error.is_none() {
+        if mount.active_syncs == 0 && mount.error.is_none() {
             mount.last_synced_at = Some(Utc::now().to_rfc3339());
         }
     }

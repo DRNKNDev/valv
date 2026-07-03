@@ -13,13 +13,19 @@ start_daemon HOME_A DAEMON_PID_A
 
 mount_a="${TMPDIR}/mount-18-a"
 folder_id=$(mount_folder "$HOME_A" "$mount_a")
+HOME="$HOME_A" "$VALV_BIN" pause >/dev/null
 printf 'v1 content\n' > "${mount_a}/versioned.txt"
-sync_mount "$HOME_A"
+HOME="$HOME_A" "$VALV_BIN" resume >/dev/null
+sync_mount "$HOME_A" "$folder_id"
 node_id=$(get_node_id_at_path "$folder_id" "/versioned.txt")
+HOME="$HOME_A" "$VALV_BIN" pause >/dev/null
 printf 'v2 content expanded\n' > "${mount_a}/versioned.txt"
-sync_mount "$HOME_A"
+HOME="$HOME_A" "$VALV_BIN" resume >/dev/null
+sync_mount "$HOME_A" "$folder_id"
+HOME="$HOME_A" "$VALV_BIN" pause >/dev/null
 printf 'v3 content expanded again\n' > "${mount_a}/versioned.txt"
-sync_mount "$HOME_A"
+HOME="$HOME_A" "$VALV_BIN" resume >/dev/null
+sync_mount "$HOME_A" "$folder_id"
 
 versions=$(api GET "/api/folders/${folder_id}/versions/${node_id}")
 version_count=$(printf '%s' "$versions" | json_eval 'process.stdout.write(String(data.length))')
@@ -30,7 +36,7 @@ printf '%s' "$versions" | json_eval 'if (!data.every((v) => v.author_device_id &
 start_daemon HOME_B DAEMON_PID_B
 mount_b="${TMPDIR}/mount-18-b"
 mount_folder "$HOME_B" "$mount_b" --folder "$folder_id" >/dev/null
-sync_mount "$HOME_B"
+sync_mount "$HOME_B" "$folder_id"
 assert_file_contains "${mount_b}/versioned.txt" "v3 content expanded again"
 
 version_1_id=$(HOME="$HOME_A" "$VALV_BIN" versions "${mount_a}/versioned.txt" | tail -1 | awk '{print $1}')

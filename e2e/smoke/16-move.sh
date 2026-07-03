@@ -18,14 +18,14 @@ HOME="$HOME_A" "$VALV_BIN" pause >/dev/null
 mkdir -p "${mount_a}/dir-a" "${mount_a}/dir-b"
 printf 'move me\n' > "${mount_a}/dir-a/mover.txt"
 HOME="$HOME_A" "$VALV_BIN" resume >/dev/null
-sync_mount "$HOME_A"
+sync_mount "$HOME_A" "$folder_id"
 
 node_id_before=$(get_node_id_at_path "$folder_id" "/dir-a/mover.txt")
 HOME="$HOME_A" "$VALV_BIN" pause >/dev/null
 mv "${mount_a}/dir-a/mover.txt" "${mount_a}/dir-b/mover.txt"
 sleep 1
 HOME="$HOME_A" "$VALV_BIN" resume >/dev/null
-sync_mount "$HOME_A"
+sync_mount "$HOME_A" "$folder_id"
 assert_node_at_path "$folder_id" "/dir-b/mover.txt"
 assert_no_live_node_at_path "$folder_id" "/dir-a/mover.txt"
 node_id_after=$(get_node_id_at_path "$folder_id" "/dir-b/mover.txt")
@@ -35,7 +35,7 @@ printf 'node_id: %s -> %s\n' "$node_id_before" "$node_id_after"
 start_daemon HOME_B DAEMON_PID_B
 mount_b="${TMPDIR}/mount-16-b"
 mount_folder "$HOME_B" "$mount_b" --folder "$folder_id" >/dev/null
-sync_mount "$HOME_B"
+sync_mount "$HOME_B" "$folder_id"
 assert_path_present "${mount_b}/dir-b/mover.txt"
 assert_path_absent "${mount_b}/dir-a/mover.txt"
 
@@ -43,7 +43,7 @@ HOME="$HOME_A" "$VALV_BIN" pause >/dev/null
 mv "${mount_a}/dir-b/mover.txt" "${mount_a}/dir-b/moved-renamed.txt"
 sleep 1
 HOME="$HOME_A" "$VALV_BIN" resume >/dev/null
-sync_mount "$HOME_A"
+sync_mount "$HOME_A" "$folder_id"
 assert_node_at_path "$folder_id" "/dir-b/moved-renamed.txt"
 assert_no_live_node_at_path "$folder_id" "/dir-b/mover.txt"
 
@@ -51,19 +51,19 @@ HOME="$HOME_A" "$VALV_BIN" pause >/dev/null
 mkdir -p "${mount_a}/parent/child" "${mount_a}/parent2"
 printf 'deep\n' > "${mount_a}/parent/child/deep.txt"
 HOME="$HOME_A" "$VALV_BIN" resume >/dev/null
-sync_mount "$HOME_A"
+sync_mount "$HOME_A" "$folder_id"
 child_id_before=$(get_node_id_at_path "$folder_id" "/parent/child")
 
 HOME="$HOME_A" "$VALV_BIN" pause >/dev/null
 mv "${mount_a}/parent/child" "${mount_a}/parent2/child"
 sleep 1
 HOME="$HOME_A" "$VALV_BIN" resume >/dev/null
-sync_mount "$HOME_A"
+sync_mount "$HOME_A" "$folder_id"
 assert_node_at_path "$folder_id" "/parent2/child/deep.txt"
 assert_no_live_node_at_path "$folder_id" "/parent/child/deep.txt"
 child_id_after=$(get_node_id_at_path "$folder_id" "/parent2/child")
 [ "$child_id_before" = "$child_id_after" ] || fail "folder node_id changed on move"
 
-sync_mount "$HOME_B"
+sync_mount "$HOME_B" "$folder_id"
 assert_path_present "${mount_b}/parent2/child/deep.txt"
 assert_path_absent "${mount_b}/parent/child/deep.txt"
