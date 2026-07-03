@@ -39,6 +39,7 @@ export class LifecycleDb implements CoreDb {
   folderGrants: FolderGrant[] = [];
   folderInvites: FolderInvite[] = [];
   devices: Array<{ deviceId: string; userId: string | null; name: string; tokenHash: string }> = [];
+  users: Array<{ id: string; email: string }> = [];
   authorizedScopes = new Set<string>();
   private devicePrincipalId?: string;
 
@@ -91,6 +92,11 @@ export class LifecycleDb implements CoreDb {
     return this.getDeviceUserIdForAuthz(deviceId);
   }
 
+  async getFolderForRoute(folderId: string): Promise<{ name: string } | undefined> {
+    const folder = this.sharedFolders.find((item) => item.folderId === folderId);
+    return folder ? { name: folder.name } : undefined;
+  }
+
   async createFolderForRoute(opts: {
     folderId: string;
     rootNodeId: string;
@@ -120,6 +126,10 @@ export class LifecycleDb implements CoreDb {
         role: item.role,
         can_read: item.canRead,
         can_write: item.canWrite,
+        user_id: item.userId,
+        device_id: item.deviceId,
+        grantee_email: item.userId ? this.users.find((user) => user.id === item.userId)?.email ?? null : null,
+        device_name: item.deviceId ? this.devices.find((device) => device.deviceId === item.deviceId)?.name ?? null : null,
       }));
   }
 

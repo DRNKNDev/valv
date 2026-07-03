@@ -2,7 +2,8 @@ import { Hono } from "hono";
 import { or } from "drizzle-orm";
 
 import { type CoreAuth } from "../auth/index.js";
-import { type MetadataVariables, eq, inTransaction, newId, requirePrincipal } from "./common.js";
+import { checkGrant } from "./authz.js";
+import { type MetadataVariables, eq, getFolderRoot, inTransaction, newId, requirePrincipal } from "./common.js";
 
 type FolderRouteStore = {
   createFolderForRoute?: (opts: {
@@ -14,6 +15,7 @@ type FolderRouteStore = {
   }) => Promise<void>;
   listGrantsForRoute?: (principal: { type: "user"; userId: string } | { type: "device"; deviceId: string }) => Promise<unknown[]>;
   getDeviceUserIdForRoute?: (deviceId: string) => Promise<string | undefined>;
+  getFolderForRoute?: (folderId: string) => Promise<{ name: string } | undefined>;
 };
 
 export function registerFolderRoutes(router: Hono<{ Variables: MetadataVariables }>, auth: CoreAuth): void {
@@ -83,10 +85,47 @@ export function registerFolderRoutes(router: Hono<{ Variables: MetadataVariables
         role: auth.schema.folderGrants.role,
         can_read: auth.schema.folderGrants.canRead,
         can_write: auth.schema.folderGrants.canWrite,
+        user_id: auth.schema.folderGrants.userId,
+        device_id: auth.schema.folderGrants.deviceId,
+        grantee_email: auth.schema.user.email,
+        device_name: auth.schema.devices.name,
       })
       .from(auth.schema.folderGrants)
+      .leftJoin(auth.schema.user, eq(auth.schema.user.id, auth.schema.folderGrants.userId))
+      .leftJoin(auth.schema.devices, eq(auth.schema.devices.deviceId, auth.schema.folderGrants.deviceId))
       .where(principalCondition);
     return ctx.json(rows);
+  });
+
+  router.get("/folders/:id", async (ctx) => {
+    const principal = requirePrincipal(ctx);
+    const folderId = ctx.req.param("id");
+
+    const rootNodeId = await getFolderRoot(auth, folderId);
+    if (!rootNodeId) {
+      return ctx.json({ error: "folder_not_found" }, 404);
+    }
+
+    const grant = await checkGrant(auth.db, rootNodeId, principal, "read", auth.schema);
+    if (!grant.granted) {
+      return ctx.json({ error: grant.reason }, 403);
+    }
+
+    const folder =
+      hasFolderRouteStore(auth.db) && auth.db.getFolderForRoute
+        ? await auth.db.getFolderForRoute(folderId)
+        : (
+            await auth.db
+              .select({ name: auth.schema.sharedFolders.name })
+              .from(auth.schema.sharedFolders)
+              .where(eq(auth.schema.sharedFolders.folderId, folderId))
+              .limit(1)
+          )[0];
+    if (!folder) {
+      return ctx.json({ error: "folder_not_found" }, 404);
+    }
+
+    return ctx.json({ folder_id: folderId, name: folder.name });
   });
 }
 
@@ -113,5 +152,5 @@ async function resolveDeviceUserId(auth: CoreAuth, deviceId: string): Promise<st
 }
 
 function hasFolderRouteStore(db: CoreAuth["db"]): db is CoreAuth["db"] & FolderRouteStore {
-  return "createFolderForRoute" in db || "listGrantsForRoute" in db;
+  return "createFolderForRoute" in db || "listGrantsForRoute" in db || "getFolderForRoute" in db;
 }
