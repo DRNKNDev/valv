@@ -44,5 +44,42 @@ export function folderScenarios(harness: SeededHarness): void {
       });
       expect(response.status).toBe(401);
     });
+
+    it("GET /api/folders/:id returns the folder's name for an authorized principal", async () => {
+      const created = await requestJson<{ folder_id: string }>(ctx.app, "/api/folders", {
+        method: "POST",
+        cookie: ctx.context.cookie,
+        body: { name: "Design Docs" },
+      });
+
+      const folder = await requestJson<{ folder_id: string; name: string }>(ctx.app, `/api/folders/${created.folder_id}`, {
+        cookie: ctx.context.cookie,
+      });
+
+      expect(folder).toEqual({ folder_id: created.folder_id, name: "Design Docs" });
+    });
+
+    it("GET /api/folders/:id returns 403 for a principal with no covering grant", async () => {
+      const signup = await ctx.app.request("/api/auth/sign-up/email", {
+        method: "POST",
+        body: JSON.stringify({ name: "Outsider", email: "outsider-folders@example.com", password: "password1234" }),
+        headers: { "content-type": "application/json" },
+      });
+      const outsiderCookie = signup.headers.get("set-cookie")?.split(";")[0];
+
+      const response = await ctx.app.request(`/api/folders/${ctx.context.folderId}`, {
+        headers: { cookie: outsiderCookie ?? "" },
+      });
+
+      expect(response.status).toBe(403);
+    });
+
+    it("GET /api/folders/:id returns 404 for an unknown folder_id", async () => {
+      const response = await ctx.app.request("/api/folders/00000000-0000-0000-0000-000000000000", {
+        headers: { cookie: ctx.context.cookie },
+      });
+
+      expect(response.status).toBe(404);
+    });
   });
 }

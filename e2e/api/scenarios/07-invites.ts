@@ -53,5 +53,21 @@ export function inviteScenarios(harness: SeededHarness): void {
       });
       expect(expiredResponse.status).toBe(410);
     });
+
+    it("rejects invite creation from a read-only grant holder", async () => {
+      const readOnlyGrant = await requestJson<{ grant_id: string; device_id: string; token: string }>(ctx.app, `/api/folders/${ctx.context.folderId}/grants`, {
+        method: "POST",
+        cookie: ctx.context.cookie,
+        body: { scope_node_id: ctx.context.rootNodeId, name: "Read Only Agent", can_read: true, can_write: false },
+      });
+
+      const response = await ctx.app.request(`/api/folders/${ctx.context.folderId}/invites`, {
+        method: "POST",
+        body: JSON.stringify({ invited_email: "should-fail@example.com" }),
+        headers: { "content-type": "application/json", authorization: `Bearer ${readOnlyGrant.token}` },
+      });
+
+      expect(response.status).toBe(403);
+    });
   });
 }

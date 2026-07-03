@@ -42,6 +42,23 @@ api_with_token() {
   fi
 }
 
+daemon() {
+  local method="$1"
+  local path="$2"
+  local home_var="$3"
+  local body="${4:-}"
+  local home_dir="${!home_var}"
+  local socket="${home_dir}/.local/share/valv/valvd.sock"
+
+  if [ -n "$body" ]; then
+    curl -fsS -X "$method" --unix-socket "$socket" "http://localhost${path}" \
+      -H "Content-Type: application/json" \
+      --data "$body"
+  else
+    curl -fsS -X "$method" --unix-socket "$socket" "http://localhost${path}"
+  fi
+}
+
 json_eval() {
   local expr="$1"
   node -e "const fs = require('fs'); const data = JSON.parse(fs.readFileSync(0, 'utf8')); ${expr}"
