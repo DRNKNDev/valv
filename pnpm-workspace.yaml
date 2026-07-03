@@ -2,3 +2,6 @@ packages:
   - core
   - contracts/*
   - e2e
+
+onlyBuiltDependencies:
+  - better-sqlite3
