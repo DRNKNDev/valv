@@ -1,0 +1,1 @@
+ALTER TABLE `folder_invites` ADD `can_write` integer DEFAULT true NOT NULL;

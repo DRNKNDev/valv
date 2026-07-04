@@ -22,16 +22,24 @@ type InviteRouteStore = {
     scopeNodeId: string;
     invitedEmail: string;
     invitedByUserId: string;
+    canWrite: boolean;
     expiresAt: Date;
   }) => Promise<{ folderName: string }>;
   getInviteForRoute?: (inviteToken: string) => Promise<{
     inviteToken: string;
     folderId: string;
     scopeNodeId: string;
+    canWrite: boolean;
     status: "pending" | "accepted" | "revoked" | "expired";
     expiresAt: Date;
   } | undefined>;
-  acceptInviteForRoute?: (opts: { inviteToken: string; userId: string; folderId: string; scopeNodeId: string }) => Promise<void>;
+  acceptInviteForRoute?: (opts: {
+    inviteToken: string;
+    userId: string;
+    folderId: string;
+    scopeNodeId: string;
+    canWrite: boolean;
+  }) => Promise<void>;
 };
 
 export function registerInviteRoutes(
@@ -59,6 +67,12 @@ export function registerInviteRoutes(
       return ctx.json({ error: grant.reason }, 403);
     }
 
+    // Defaults to true (read-write) to preserve existing behavior for callers that
+    // don't pass this field. Gated on the caller's own write capability above, not on
+    // what's being requested for the invite - same principle as POST
+    // /folders/:id/grants's can_write (folder-grants spec).
+    const canWrite = typeof body.can_write === "boolean" ? body.can_write : true;
+
     const inviteToken = randomBytes(32).toString("base64url");
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     let folderName = "folder";
@@ -70,6 +84,7 @@ export function registerInviteRoutes(
         scopeNodeId,
         invitedEmail,
         invitedByUserId: principal.type === "user" ? principal.userId : principal.deviceId,
+        canWrite,
         expiresAt,
       });
       folderName = created.folderName;
@@ -87,6 +102,7 @@ export function registerInviteRoutes(
         scopeNodeId,
         invitedEmail,
         invitedByUserId: principal.type === "user" ? principal.userId : principal.deviceId,
+        canWrite,
         status: "pending",
         expiresAt,
       });
@@ -137,6 +153,7 @@ export function registerInviteRoutes(
         userId: principal.userId,
         folderId: invite.folderId,
         scopeNodeId: invite.scopeNodeId,
+        canWrite: invite.canWrite,
       });
     } else {
       await inTransaction(auth, async (tx) => {
@@ -148,7 +165,7 @@ export function registerInviteRoutes(
         deviceId: null,
         role: "collaborator",
         canRead: true,
-        canWrite: true,
+        canWrite: invite.canWrite,
       });
       await tx
         .update(auth.schema.folderInvites)

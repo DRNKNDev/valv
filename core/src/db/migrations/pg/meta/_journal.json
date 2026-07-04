@@ -15,6 +15,13 @@
       "when": 1782561763021,
       "tag": "0001_aromatic_darkstar",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1783077275532,
+      "tag": "0002_last_electro",
+      "breakpoints": true
     }
   ]
 }

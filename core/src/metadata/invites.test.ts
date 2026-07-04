@@ -37,6 +37,7 @@ describe("invite routes", () => {
       scopeNodeId: "root",
       invitedEmail: "friend@example.com",
       invitedByUserId: "user-1",
+      canWrite: true,
       status: "pending",
       expiresAt: new Date(Date.now() + 60_000),
     });
@@ -48,7 +49,7 @@ describe("invite routes", () => {
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
     expect(db.folderGrants).toHaveLength(1);
-    expect(db.folderGrants[0]).toMatchObject({ userId: "user-2", deviceId: null, scopeNodeId: "root" });
+    expect(db.folderGrants[0]).toMatchObject({ userId: "user-2", deviceId: null, scopeNodeId: "root", canWrite: true });
   });
 
   it("rejects invite creation from a read-only grant holder", async () => {
@@ -66,6 +67,56 @@ describe("invite routes", () => {
     expect(db.folderInvites).toHaveLength(0);
   });
 
+  it("defaults invite can_write to true when omitted", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("root");
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" });
+
+    const response = await app.request("/folders/folder-1/invites", {
+      method: "POST",
+      body: JSON.stringify({ invited_email: "friend@example.com" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.folderInvites[0]).toMatchObject({ canWrite: true });
+  });
+
+  it("creates a read-only invite when can_write is false", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("root");
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" });
+
+    const response = await app.request("/folders/folder-1/invites", {
+      method: "POST",
+      body: JSON.stringify({ invited_email: "friend@example.com", can_write: false }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.folderInvites[0]).toMatchObject({ canWrite: false });
+  });
+
+  it("accepting a read-only invite grants a read-only, not read-write, scope", async () => {
+    const db = new LifecycleDb();
+    db.folderInvites.push({
+      inviteToken: "readonly-token",
+      folderId: "folder-1",
+      scopeNodeId: "root",
+      invitedEmail: "friend@example.com",
+      invitedByUserId: "user-1",
+      canWrite: false,
+      status: "pending",
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    const app = metadataAppFor(db, { type: "user", userId: "user-2" });
+
+    const response = await app.request("/invites/readonly-token/accept", { method: "POST" });
+
+    expect(response.status).toBe(200);
+    expect(db.folderGrants[0]).toMatchObject({ canWrite: false, canRead: true });
+  });
+
   it("rejects expired invites with 410", async () => {
     const db = new LifecycleDb();
     db.folderInvites.push({
@@ -74,6 +125,7 @@ describe("invite routes", () => {
       scopeNodeId: "root",
       invitedEmail: "friend@example.com",
       invitedByUserId: "user-1",
+      canWrite: true,
       status: "pending",
       expiresAt: new Date(Date.now() - 60_000),
     });

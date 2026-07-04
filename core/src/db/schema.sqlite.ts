@@ -169,6 +169,7 @@ export const folderInvites = sqliteTable("folder_invites", {
     .references(() => nodes.nodeId),
   invitedEmail: text("invited_email").notNull(),
   invitedByUserId: text("invited_by_user_id").notNull(),
+  canWrite: integer("can_write", { mode: "boolean" }).notNull().default(true),
   status: text("status", { enum: ["pending", "accepted", "revoked", "expired"] })
     .notNull()
     .default("pending"),

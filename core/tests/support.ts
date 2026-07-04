@@ -22,6 +22,7 @@ export type FolderInvite = {
   scopeNodeId: string;
   invitedEmail: string;
   invitedByUserId: string;
+  canWrite: boolean;
   status: "pending" | "accepted" | "revoked" | "expired";
   expiresAt: Date;
 };
@@ -139,6 +140,7 @@ export class LifecycleDb implements CoreDb {
     scopeNodeId: string;
     invitedEmail: string;
     invitedByUserId: string;
+    canWrite: boolean;
     expiresAt: Date;
   }): Promise<{ folderName: string }> {
     this.folderInvites.push({ ...opts, status: "pending" });
@@ -149,12 +151,20 @@ export class LifecycleDb implements CoreDb {
     return this.folderInvites.find((item) => item.inviteToken === inviteToken);
   }
 
-  async acceptInviteForRoute(opts: { inviteToken: string; userId: string; folderId: string; scopeNodeId: string }): Promise<void> {
+  async acceptInviteForRoute(opts: {
+    inviteToken: string;
+    userId: string;
+    folderId: string;
+    scopeNodeId: string;
+    canWrite: boolean;
+  }): Promise<void> {
     const invite = this.folderInvites.find((item) => item.inviteToken === opts.inviteToken);
     if (!invite || invite.status === "accepted") {
       return;
     }
-    this.folderGrants.push(grant(`accepted-${opts.inviteToken}`, { userId: opts.userId, scopeNodeId: opts.scopeNodeId }));
+    this.folderGrants.push(
+      grant(`accepted-${opts.inviteToken}`, { userId: opts.userId, scopeNodeId: opts.scopeNodeId, canWrite: opts.canWrite }),
+    );
     invite.status = "accepted";
   }
 
