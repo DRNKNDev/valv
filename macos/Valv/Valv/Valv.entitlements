@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Deliberately unsandboxed - see design.md D3-2 (added after task 9's daemon
+	     bundling/LaunchAgent-install requirements were discovered mid-implementation
+	     to need real filesystem access outside a sandbox container: writing
+	     ~/Library/LaunchAgents/dev.drnkn.valvd.plist, ~/Library/Application
+	     Support/Valv/bin/, and /usr/local/bin/valv). Apple requires ValvFileProvider
+	     and ValvFileProviderUI to be sandboxed (they still are); it does not require
+	     the host app to be. This is the same pattern other sync-client host apps use.
+	     Rules out Mac App Store distribution for Valv.app unless revisited later - does
+	     not affect valv-cli (never sandboxed) or the two extensions (still sandboxed). -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.dev.drnkn.valv</string>
+	</array>
+</dict>
+</plist>

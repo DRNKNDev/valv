@@ -1,0 +1,989 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		640099A544F68D4A2C0E977D /* DaemonKit in Frameworks */ = {isa = PBXBuildFile; productRef = 1725C69B19D99BAD576DFB24 /* DaemonKit */; };
+		8495E49467511E5F9F6B7CC5 /* DaemonKit in Frameworks */ = {isa = PBXBuildFile; productRef = 218055D4D13F74307806BF25 /* DaemonKit */; };
+		EDE2FAFB1381E0AEE2F64065 /* DaemonKit in Frameworks */ = {isa = PBXBuildFile; productRef = 7C175398AB2EEB0F5DB4573B /* DaemonKit */; };
+		FB5243C32FF7B11700C299B8 /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FB5243C22FF7B11700C299B8 /* UniformTypeIdentifiers.framework */; };
+		FB5243CF2FF7B11700C299B8 /* ValvFileProvider.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = FB5243C02FF7B11700C299B8 /* ValvFileProvider.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		FB5243E72FF7B24600C299B8 /* ValvFileProviderUI.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = FB5243D92FF7B24600C299B8 /* ValvFileProviderUI.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		FB5243A02FF7B09A00C299B8 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FB5243882FF7B09900C299B8 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FB52438F2FF7B09900C299B8;
+			remoteInfo = Valv;
+		};
+		FB5243AA2FF7B09A00C299B8 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FB5243882FF7B09900C299B8 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FB52438F2FF7B09900C299B8;
+			remoteInfo = Valv;
+		};
+		FB5243CD2FF7B11700C299B8 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FB5243882FF7B09900C299B8 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FB5243BF2FF7B11700C299B8;
+			remoteInfo = ValvFileProvider;
+		};
+		FB5243E52FF7B24600C299B8 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = FB5243882FF7B09900C299B8 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FB5243D82FF7B24600C299B8;
+			remoteInfo = ValvFileProviderUI;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		FB5243D42FF7B11700C299B8 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				FB5243E72FF7B24600C299B8 /* ValvFileProviderUI.appex in Embed Foundation Extensions */,
+				FB5243CF2FF7B11700C299B8 /* ValvFileProvider.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		FB5243902FF7B09900C299B8 /* Valv.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Valv.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		FB52439F2FF7B09A00C299B8 /* ValvTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ValvTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		FB5243A92FF7B09A00C299B8 /* ValvUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ValvUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		FB5243C02FF7B11700C299B8 /* ValvFileProvider.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = ValvFileProvider.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		FB5243C22FF7B11700C299B8 /* UniformTypeIdentifiers.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UniformTypeIdentifiers.framework; path = System/Library/Frameworks/UniformTypeIdentifiers.framework; sourceTree = SDKROOT; };
+		FB5243D92FF7B24600C299B8 /* ValvFileProviderUI.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = ValvFileProviderUI.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		F02CA0F34E9C267EAA5B7F59 /* Exceptions for "Valv" folder in "Valv" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = FB52438F2FF7B09900C299B8 /* Valv */;
+		};
+		FB5243D02FF7B11700C299B8 /* Exceptions for "ValvFileProvider" folder in "ValvFileProvider" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = FB5243BF2FF7B11700C299B8 /* ValvFileProvider */;
+		};
+		FB5243E82FF7B24600C299B8 /* Exceptions for "ValvFileProviderUI" folder in "ValvFileProviderUI" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = FB5243D82FF7B24600C299B8 /* ValvFileProviderUI */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		FB5243922FF7B09900C299B8 /* Valv */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				F02CA0F34E9C267EAA5B7F59 /* Exceptions for "Valv" folder in "Valv" target */,
+			);
+			path = Valv;
+			sourceTree = "<group>";
+		};
+		FB5243A22FF7B09A00C299B8 /* ValvTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ValvTests;
+			sourceTree = "<group>";
+		};
+		FB5243AC2FF7B09A00C299B8 /* ValvUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ValvUITests;
+			sourceTree = "<group>";
+		};
+		FB5243C42FF7B11700C299B8 /* ValvFileProvider */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				FB5243D02FF7B11700C299B8 /* Exceptions for "ValvFileProvider" folder in "ValvFileProvider" target */,
+			);
+			path = ValvFileProvider;
+			sourceTree = "<group>";
+		};
+		FB5243DA2FF7B24600C299B8 /* ValvFileProviderUI */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				FB5243E82FF7B24600C299B8 /* Exceptions for "ValvFileProviderUI" folder in "ValvFileProviderUI" target */,
+			);
+			path = ValvFileProviderUI;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		FB52438D2FF7B09900C299B8 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				8495E49467511E5F9F6B7CC5 /* DaemonKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FB52439C2FF7B09A00C299B8 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FB5243A62FF7B09A00C299B8 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FB5243BD2FF7B11700C299B8 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FB5243C32FF7B11700C299B8 /* UniformTypeIdentifiers.framework in Frameworks */,
+				640099A544F68D4A2C0E977D /* DaemonKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FB5243D62FF7B24600C299B8 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				EDE2FAFB1381E0AEE2F64065 /* DaemonKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		FB5243872FF7B09900C299B8 = {
+			isa = PBXGroup;
+			children = (
+				FB5243922FF7B09900C299B8 /* Valv */,
+				FB5243A22FF7B09A00C299B8 /* ValvTests */,
+				FB5243AC2FF7B09A00C299B8 /* ValvUITests */,
+				FB5243C42FF7B11700C299B8 /* ValvFileProvider */,
+				FB5243DA2FF7B24600C299B8 /* ValvFileProviderUI */,
+				FB5243C12FF7B11700C299B8 /* Frameworks */,
+				FB5243912FF7B09900C299B8 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		FB5243912FF7B09900C299B8 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				FB5243902FF7B09900C299B8 /* Valv.app */,
+				FB52439F2FF7B09A00C299B8 /* ValvTests.xctest */,
+				FB5243A92FF7B09A00C299B8 /* ValvUITests.xctest */,
+				FB5243C02FF7B11700C299B8 /* ValvFileProvider.appex */,
+				FB5243D92FF7B24600C299B8 /* ValvFileProviderUI.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		FB5243C12FF7B11700C299B8 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				FB5243C22FF7B11700C299B8 /* UniformTypeIdentifiers.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		FB52438F2FF7B09900C299B8 /* Valv */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FB5243B32FF7B09A00C299B8 /* Build configuration list for PBXNativeTarget "Valv" */;
+			buildPhases = (
+				FB52438C2FF7B09900C299B8 /* Sources */,
+				FB52438D2FF7B09900C299B8 /* Frameworks */,
+				FB52438E2FF7B09900C299B8 /* Resources */,
+				FB5243D42FF7B11700C299B8 /* Embed Foundation Extensions */,
+				11C0DE33273969FB2256FEAC /* Copy Daemon Binaries */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				FB5243CE2FF7B11700C299B8 /* PBXTargetDependency */,
+				FB5243E62FF7B24600C299B8 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				FB5243922FF7B09900C299B8 /* Valv */,
+			);
+			name = Valv;
+			packageProductDependencies = (
+				218055D4D13F74307806BF25 /* DaemonKit */,
+			);
+			productName = Valv;
+			productReference = FB5243902FF7B09900C299B8 /* Valv.app */;
+			productType = "com.apple.product-type.application";
+		};
+		FB52439E2FF7B09A00C299B8 /* ValvTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FB5243B62FF7B09A00C299B8 /* Build configuration list for PBXNativeTarget "ValvTests" */;
+			buildPhases = (
+				FB52439B2FF7B09A00C299B8 /* Sources */,
+				FB52439C2FF7B09A00C299B8 /* Frameworks */,
+				FB52439D2FF7B09A00C299B8 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				FB5243A12FF7B09A00C299B8 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				FB5243A22FF7B09A00C299B8 /* ValvTests */,
+			);
+			name = ValvTests;
+			packageProductDependencies = (
+			);
+			productName = ValvTests;
+			productReference = FB52439F2FF7B09A00C299B8 /* ValvTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		FB5243A82FF7B09A00C299B8 /* ValvUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FB5243B92FF7B09A00C299B8 /* Build configuration list for PBXNativeTarget "ValvUITests" */;
+			buildPhases = (
+				FB5243A52FF7B09A00C299B8 /* Sources */,
+				FB5243A62FF7B09A00C299B8 /* Frameworks */,
+				FB5243A72FF7B09A00C299B8 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				FB5243AB2FF7B09A00C299B8 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				FB5243AC2FF7B09A00C299B8 /* ValvUITests */,
+			);
+			name = ValvUITests;
+			packageProductDependencies = (
+			);
+			productName = ValvUITests;
+			productReference = FB5243A92FF7B09A00C299B8 /* ValvUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		FB5243BF2FF7B11700C299B8 /* ValvFileProvider */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FB5243D12FF7B11700C299B8 /* Build configuration list for PBXNativeTarget "ValvFileProvider" */;
+			buildPhases = (
+				FB5243BC2FF7B11700C299B8 /* Sources */,
+				FB5243BD2FF7B11700C299B8 /* Frameworks */,
+				FB5243BE2FF7B11700C299B8 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				FB5243C42FF7B11700C299B8 /* ValvFileProvider */,
+			);
+			name = ValvFileProvider;
+			packageProductDependencies = (
+				1725C69B19D99BAD576DFB24 /* DaemonKit */,
+			);
+			productName = ValvFileProvider;
+			productReference = FB5243C02FF7B11700C299B8 /* ValvFileProvider.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		FB5243D82FF7B24600C299B8 /* ValvFileProviderUI */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FB5243E92FF7B24600C299B8 /* Build configuration list for PBXNativeTarget "ValvFileProviderUI" */;
+			buildPhases = (
+				FB5243D52FF7B24600C299B8 /* Sources */,
+				FB5243D62FF7B24600C299B8 /* Frameworks */,
+				FB5243D72FF7B24600C299B8 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				FB5243DA2FF7B24600C299B8 /* ValvFileProviderUI */,
+			);
+			name = ValvFileProviderUI;
+			packageProductDependencies = (
+				7C175398AB2EEB0F5DB4573B /* DaemonKit */,
+			);
+			productName = ValvFileProviderUI;
+			productReference = FB5243D92FF7B24600C299B8 /* ValvFileProviderUI.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		FB5243882FF7B09900C299B8 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2630;
+				LastUpgradeCheck = 2630;
+				TargetAttributes = {
+					FB52438F2FF7B09900C299B8 = {
+						CreatedOnToolsVersion = 26.3;
+					};
+					FB52439E2FF7B09A00C299B8 = {
+						CreatedOnToolsVersion = 26.3;
+						TestTargetID = FB52438F2FF7B09900C299B8;
+					};
+					FB5243A82FF7B09A00C299B8 = {
+						CreatedOnToolsVersion = 26.3;
+						TestTargetID = FB52438F2FF7B09900C299B8;
+					};
+					FB5243BF2FF7B11700C299B8 = {
+						CreatedOnToolsVersion = 26.3;
+					};
+					FB5243D82FF7B24600C299B8 = {
+						CreatedOnToolsVersion = 26.3;
+					};
+				};
+			};
+			buildConfigurationList = FB52438B2FF7B09900C299B8 /* Build configuration list for PBXProject "Valv" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = FB5243872FF7B09900C299B8;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				8BD78AFBF91251ED3D7BCB30 /* XCLocalSwiftPackageReference "../DaemonKit" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = FB5243912FF7B09900C299B8 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				FB52438F2FF7B09900C299B8 /* Valv */,
+				FB52439E2FF7B09A00C299B8 /* ValvTests */,
+				FB5243A82FF7B09A00C299B8 /* ValvUITests */,
+				FB5243BF2FF7B11700C299B8 /* ValvFileProvider */,
+				FB5243D82FF7B24600C299B8 /* ValvFileProviderUI */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		FB52438E2FF7B09900C299B8 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FB52439D2FF7B09A00C299B8 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FB5243A72FF7B09A00C299B8 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FB5243BE2FF7B11700C299B8 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FB5243D72FF7B24600C299B8 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		11C0DE33273969FB2256FEAC /* Copy Daemon Binaries */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/../../crates/target/release/valvd",
+				"$(SRCROOT)/../../crates/target/release/valv",
+			);
+			name = "Copy Daemon Binaries";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/bin/valvd",
+				"$(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/bin/valv",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\nREPO_ROOT=\"${SRCROOT}/../../..\"\nRELEASE_DIR=\"${REPO_ROOT}/oss/crates/target/release\"\nDEST_DIR=\"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin\"\nif [ ! -x \"${RELEASE_DIR}/valvd\" ] || [ ! -x \"${RELEASE_DIR}/valv\" ]; then\n  echo \"error: valvd/valv release binaries not found at ${RELEASE_DIR}.\" >&2\n  echo \"Build them first: cd oss/crates && cargo build --release\" >&2\n  exit 1\nfi\nmkdir -p \"${DEST_DIR}\"\ncp \"${RELEASE_DIR}/valvd\" \"${DEST_DIR}/valvd\"\ncp \"${RELEASE_DIR}/valv\" \"${DEST_DIR}/valv\"\necho \"Copied valvd/valv release binaries into ${DEST_DIR}\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		FB52438C2FF7B09900C299B8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FB52439B2FF7B09A00C299B8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FB5243A52FF7B09A00C299B8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FB5243BC2FF7B11700C299B8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FB5243D52FF7B24600C299B8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		FB5243A12FF7B09A00C299B8 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = FB52438F2FF7B09900C299B8 /* Valv */;
+			targetProxy = FB5243A02FF7B09A00C299B8 /* PBXContainerItemProxy */;
+		};
+		FB5243AB2FF7B09A00C299B8 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = FB52438F2FF7B09900C299B8 /* Valv */;
+			targetProxy = FB5243AA2FF7B09A00C299B8 /* PBXContainerItemProxy */;
+		};
+		FB5243CE2FF7B11700C299B8 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = FB5243BF2FF7B11700C299B8 /* ValvFileProvider */;
+			targetProxy = FB5243CD2FF7B11700C299B8 /* PBXContainerItemProxy */;
+		};
+		FB5243E62FF7B24600C299B8 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = FB5243D82FF7B24600C299B8 /* ValvFileProviderUI */;
+			targetProxy = FB5243E52FF7B24600C299B8 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		FB5243B12FF7B09A00C299B8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = YEB6B8BE7X;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		FB5243B22FF7B09A00C299B8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = YEB6B8BE7X;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		FB5243B42FF7B09A00C299B8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Valv/Valv.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = YEB6B8BE7X;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Valv/Info.plist;
+				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.drnkn.valv;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		FB5243B52FF7B09A00C299B8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Valv/Valv.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = YEB6B8BE7X;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Valv/Info.plist;
+				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.drnkn.valv;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		FB5243B72FF7B09A00C299B8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = YEB6B8BE7X;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.drnkn.ValvTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Valv.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Valv";
+			};
+			name = Debug;
+		};
+		FB5243B82FF7B09A00C299B8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = YEB6B8BE7X;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.drnkn.ValvTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Valv.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Valv";
+			};
+			name = Release;
+		};
+		FB5243BA2FF7B09A00C299B8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = YEB6B8BE7X;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.drnkn.ValvUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = Valv;
+			};
+			name = Debug;
+		};
+		FB5243BB2FF7B09A00C299B8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = YEB6B8BE7X;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.drnkn.ValvUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = Valv;
+			};
+			name = Release;
+		};
+		FB5243D22FF7B11700C299B8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ValvFileProvider/ValvFileProvider.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = YEB6B8BE7X;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ValvFileProvider/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = ValvFileProvider;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.drnkn.valv.fileprovider;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		FB5243D32FF7B11700C299B8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ValvFileProvider/ValvFileProvider.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = YEB6B8BE7X;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ValvFileProvider/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = ValvFileProvider;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.drnkn.valv.fileprovider;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		FB5243EA2FF7B24600C299B8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ValvFileProviderUI/ValvFileProviderUI.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = YEB6B8BE7X;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ValvFileProviderUI/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = ValvFileProviderUI;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "dev.drnkn.valv.fileprovider-ui";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		FB5243EB2FF7B24600C299B8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ValvFileProviderUI/ValvFileProviderUI.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = YEB6B8BE7X;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ValvFileProviderUI/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = ValvFileProviderUI;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "dev.drnkn.valv.fileprovider-ui";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		FB52438B2FF7B09900C299B8 /* Build configuration list for PBXProject "Valv" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FB5243B12FF7B09A00C299B8 /* Debug */,
+				FB5243B22FF7B09A00C299B8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		FB5243B32FF7B09A00C299B8 /* Build configuration list for PBXNativeTarget "Valv" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FB5243B42FF7B09A00C299B8 /* Debug */,
+				FB5243B52FF7B09A00C299B8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		FB5243B62FF7B09A00C299B8 /* Build configuration list for PBXNativeTarget "ValvTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FB5243B72FF7B09A00C299B8 /* Debug */,
+				FB5243B82FF7B09A00C299B8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		FB5243B92FF7B09A00C299B8 /* Build configuration list for PBXNativeTarget "ValvUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FB5243BA2FF7B09A00C299B8 /* Debug */,
+				FB5243BB2FF7B09A00C299B8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		FB5243D12FF7B11700C299B8 /* Build configuration list for PBXNativeTarget "ValvFileProvider" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FB5243D22FF7B11700C299B8 /* Debug */,
+				FB5243D32FF7B11700C299B8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		FB5243E92FF7B24600C299B8 /* Build configuration list for PBXNativeTarget "ValvFileProviderUI" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FB5243EA2FF7B24600C299B8 /* Debug */,
+				FB5243EB2FF7B24600C299B8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		8BD78AFBF91251ED3D7BCB30 /* XCLocalSwiftPackageReference "../DaemonKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../DaemonKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		1725C69B19D99BAD576DFB24 /* DaemonKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 8BD78AFBF91251ED3D7BCB30 /* XCLocalSwiftPackageReference "../DaemonKit" */;
+			productName = DaemonKit;
+		};
+		218055D4D13F74307806BF25 /* DaemonKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 8BD78AFBF91251ED3D7BCB30 /* XCLocalSwiftPackageReference "../DaemonKit" */;
+			productName = DaemonKit;
+		};
+		7C175398AB2EEB0F5DB4573B /* DaemonKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 8BD78AFBF91251ED3D7BCB30 /* XCLocalSwiftPackageReference "../DaemonKit" */;
+			productName = DaemonKit;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = FB5243882FF7B09900C299B8 /* Project object */;
+}
