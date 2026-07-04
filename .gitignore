@@ -18,3 +18,9 @@ xcuserdata/
 macos/spike/SpikeApp/SpikeApp/Config.local.swift
 macos/spike/SpikeApp/SpikeApp.xcodeproj/xcuserdata/
 macos/spike/SpikeApp/SpikeApp.xcodeproj/project.xcworkspace/xcuserdata/
+macos/DaemonKit/.build/
+macos/DaemonKit/.swiftpm/
+macos/Valv/Valv.xcodeproj/xcuserdata/
+macos/Valv/Valv.xcodeproj/project.xcworkspace/xcuserdata/
+.build/
+.swiftpm/
