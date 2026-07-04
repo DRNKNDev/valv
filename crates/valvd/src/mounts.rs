@@ -7,7 +7,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use valv_sync::{
     persistence::{mounts as mount_store, nodes},
-    protocol::ipc::{MountRequest, MountResponse},
+    protocol::ipc::{MountRequest, MountResponse, UnmountRequest},
     sync_engine::delta_pull::tree_resync,
 };
 
@@ -113,6 +113,43 @@ pub(crate) async fn post_mount(
         scope_node_id: resolved.scope_node_id,
         path: req.path,
     }))
+}
+
+/// Unmounts a folder locally: stops its background sync tasks and removes its
+/// `mounts` row. Deliberately does not delete the locally materialized files (the
+/// user's data on disk) or call anything on the backend - the shared folder and its
+/// grants are entirely unaffected, and so are any `nodes`/`versions`/`chunks` rows
+/// left in the local mirror for that `folder_id` (harmless leftover cache data,
+/// not a collision risk since `mounts.folder_id` is UNIQUE).
+pub(crate) async fn delete_mount_route(
+    State(state): State<DaemonState>,
+    Json(req): Json<UnmountRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let mount = {
+        let mounts = state.mounts.lock().await;
+        mounts
+            .iter()
+            .find(|mount| mount.folder_id == req.folder_id)
+            .cloned()
+    };
+    let Some(mount) = mount else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new("mount_not_found")),
+        ));
+    };
+
+    cancel_tasks_for_mount(&state, &mount.path).await;
+    {
+        let conn = state.db.lock().await;
+        mount_store::delete_mount(&conn, &mount.path).map_err(internal_error)?;
+    }
+    {
+        let mut mounts = state.mounts.lock().await;
+        mounts.retain(|existing| existing.path != mount.path);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug)]
@@ -330,5 +367,100 @@ mod tests {
 
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].name.as_deref(), Some("Design Docs"));
+    }
+
+    fn test_mount(path: &str, folder_id: &str) -> MountState {
+        MountState {
+            path: path.to_owned(),
+            folder_id: folder_id.to_owned(),
+            grant_id: None,
+            scope_node_id: None,
+            mount_token: None,
+            can_write: true,
+            name: "Test Folder".to_owned(),
+            active_syncs: 0,
+            pending_ops: 0,
+            last_synced_at: None,
+            error: None,
+            sync_lock: Arc::new(Mutex::new(())),
+            cursor_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn test_state(mounts: Vec<MountState>) -> DaemonState {
+        let conn = memory_db();
+        for mount in &mounts {
+            mount_store::upsert_mount(
+                &conn,
+                &mount.path,
+                &mount.folder_id,
+                None,
+                None,
+                None,
+                mount.can_write,
+            )
+            .unwrap();
+        }
+        DaemonState {
+            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fs_events_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mounts: Arc::new(Mutex::new(mounts)),
+            tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            db: Arc::new(Mutex::new(conn)),
+            client: reqwest::Client::new(),
+            config: crate::DaemonConfig {
+                backend_url: "http://127.0.0.1:1".to_owned(),
+                device_id: "device-1".to_owned(),
+                device_token: "token".to_owned(),
+                device_name: "Test Device".to_owned(),
+                mounts: Vec::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_mount_removes_only_the_targeted_mount() {
+        let state = test_state(vec![
+            test_mount("/sync-a", "folder-a"),
+            test_mount("/sync-b", "folder-b"),
+        ]);
+
+        let response = delete_mount_route(
+            axum::extract::State(state.clone()),
+            axum::Json(UnmountRequest {
+                folder_id: "folder-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response, StatusCode::NO_CONTENT);
+
+        let remaining = state.mounts.lock().await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].folder_id, "folder-b");
+        drop(remaining);
+
+        let conn = state.db.lock().await;
+        let persisted = mount_store::list_mounts(&conn).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].folder_id, "folder-b");
+    }
+
+    #[tokio::test]
+    async fn delete_mount_unknown_folder_returns_404() {
+        let state = test_state(vec![test_mount("/sync-a", "folder-a")]);
+
+        let result = delete_mount_route(
+            axum::extract::State(state),
+            axum::Json(UnmountRequest {
+                folder_id: "unknown-folder".to_owned(),
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

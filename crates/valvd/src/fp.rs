@@ -335,6 +335,7 @@ pub(crate) async fn fp_share(
         .json(&InviteCreateRequest {
             invited_email: req.invited_email,
             scope_node_id: req.node_id,
+            can_write: req.can_write,
         })
         .send()
         .await
@@ -357,6 +358,7 @@ pub(crate) async fn fp_share(
 struct InviteCreateRequest {
     invited_email: String,
     scope_node_id: String,
+    can_write: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -448,6 +450,7 @@ fn fp_item_from_node(conn: &Connection, node: &LocalNode) -> Result<FpItem> {
     Ok(FpItem {
         node_id: node.node_id.clone(),
         parent_id: node.parent_id.clone(),
+        folder_id: node.folder_id.clone(),
         name: node.name.clone(),
         node_type: node.node_type.clone(),
         version_id: node.current_version_id.clone(),

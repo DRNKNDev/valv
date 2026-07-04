@@ -144,6 +144,15 @@ pub(crate) fn socket_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("valvd.sock"))
 }
 
+// Shared with the sandboxed macOS Xcode targets (Valv/ValvFileProvider/ValvFileProviderUI),
+// which cannot reach `socket_path()` from inside App Sandbox (validated: EPERM on connect()
+// regardless of entitlement) and instead read the TCP loopback port valvd advertises here.
+pub(crate) fn tcp_port_file_path() -> Result<PathBuf> {
+    Ok(home_dir()?
+        .join("Library/Group Containers/group.dev.drnkn.valv")
+        .join("valvd-tcp-port"))
+}
+
 pub(crate) fn resolve_valvd_path() -> Result<PathBuf> {
     let current = env::current_exe()?;
     if current

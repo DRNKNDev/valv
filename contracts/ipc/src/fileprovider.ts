@@ -1,6 +1,12 @@
 export interface FpItem {
   node_id: string;
   parent_id: string | null;
+  // Lets a client resolve "which mount does this node belong to" from the item
+  // itself, without a separate lookup or a client-maintained cache - needed once a
+  // client (e.g. the macOS File Provider extension, phase-5-macos-gui) deals with
+  // more than one mount at a time, since GET /fp/items/GET /fp/anchor/etc. all
+  // require folder_id explicitly once more than one folder is mounted.
+  folder_id: string;
   name: string;
   type: 'file' | 'folder';
   version_id: string | null;
@@ -12,6 +18,12 @@ export interface FpItem {
 
 export interface FpEnumerateQuery {
   parent: string;
+  // Required once more than one folder is mounted (valvd's resolve_mount_for_query
+  // returns an error otherwise) - optional only in the single-mount case. Previously
+  // missing from this contract even though valvd's actual FpItemsQuery has always
+  // accepted it, discovered while implementing the macOS GUI's synthetic multi-mount
+  // root (phase-5-macos-gui), which always has more than one mount to disambiguate.
+  folder_id?: string;
   offset?: number;
   limit?: number;
 }
@@ -69,6 +81,9 @@ export interface FpDeleteRequest {
 export interface FpShareRequest {
   node_id: string;
   invited_email: string;
+  // Defaults to true (read-write) when omitted - mirrors POST /folders/:id/invites's
+  // own can_write default.
+  can_write?: boolean;
 }
 
 export interface FpShareResponse {

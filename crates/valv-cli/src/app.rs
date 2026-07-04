@@ -5,7 +5,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 use reqwest::StatusCode;
 use valv_sync::protocol::ipc::{
     DaemonStatus, MountRequest, MountResponse, RestoreRequest, RestoreResponse, SyncRequest,
-    SyncSummary, VersionsRequest, VersionsResponse,
+    SyncSummary, UnmountRequest, VersionsRequest, VersionsResponse,
 };
 
 use crate::{
@@ -29,6 +29,12 @@ enum Command {
         folder: Option<String>,
         #[arg(long)]
         grant: Option<String>,
+    },
+    /// Unmounts locally only - does not delete the shared folder or its grants, and
+    /// does not remove the locally materialized files.
+    Unmount {
+        #[arg(long)]
+        folder: String,
     },
     Status,
     Pause,
@@ -91,6 +97,7 @@ pub(crate) async fn run() -> Result<()> {
             folder,
             grant,
         } => cmd_mount(path, folder, grant).await,
+        Command::Unmount { folder } => cmd_unmount(folder).await,
         Command::Status => cmd_status().await,
         Command::Pause => cmd_pause_resume("pause", "Sync paused").await,
         Command::Resume => cmd_pause_resume("resume", "Sync resumed").await,
@@ -129,6 +136,20 @@ async fn cmd_mount(path: String, folder: Option<String>, grant: Option<String>) 
             mounted.folder_id, mounted.path
         );
     }
+    Ok(())
+}
+
+async fn cmd_unmount(folder: String) -> Result<()> {
+    let response = daemon_client()?
+        .delete("http://localhost/mount")
+        .json(&UnmountRequest {
+            folder_id: folder.clone(),
+        })
+        .send()
+        .await
+        .map_err(map_daemon_error)?;
+    expect_status(response, StatusCode::NO_CONTENT).await?;
+    println!("Unmounted folder {folder}");
     Ok(())
 }
 

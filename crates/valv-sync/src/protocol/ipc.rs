@@ -9,6 +9,10 @@ pub struct MountStatus {
     pub scope_node_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grant_id: Option<String>,
+    // Was already tracked internally on MountState (used by GET /fp/items, GET
+    // /fp/anchor) but never surfaced here - needed so a client (the macOS menu bar,
+    // phase-5-macos-gui) can badge a read-only mount without a per-mount extra call.
+    pub can_write: bool,
     pub syncing: bool,
     pub pending_ops: u64,
     pub last_synced_at: Option<String>,
@@ -41,6 +45,15 @@ pub struct MountResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope_node_id: Option<String>,
     pub path: String,
+}
+
+// Unmounts locally only - does not touch the backend folder/grants, and does not
+// delete the locally materialized files. `folder_id` (not `path`) matches the
+// existing `SyncRequest` convention and what GUI/CLI clients already track via
+// `MountStatus.folder_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnmountRequest {
+    pub folder_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +104,12 @@ pub struct RestoreResponse {
 pub struct FpItem {
     pub node_id: String,
     pub parent_id: Option<String>,
+    // Lets a client resolve "which mount does this node belong to" from the item
+    // itself, without a separate lookup or a client-maintained cache - needed once a
+    // client (e.g. the macOS File Provider extension, phase-5-macos-gui) deals with
+    // more than one mount at a time, since GET /fp/items/GET /fp/anchor/etc. all
+    // require folder_id explicitly once more than one folder is mounted.
+    pub folder_id: String,
     pub name: String,
     #[serde(rename = "type")]
     pub node_type: String,
@@ -168,10 +187,18 @@ pub struct FpDeleteRequest {
     pub based_on_seq: i64,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FpShareRequest {
     pub node_id: String,
     pub invited_email: String,
+    // Defaults to true (read-write) so existing callers that omit this field keep
+    // their prior behavior - mirrors POST /folders/:id/invites's own can_write default.
+    #[serde(default = "default_true")]
+    pub can_write: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

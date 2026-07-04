@@ -23,7 +23,7 @@ use hyper_util::{
 use rusqlite::Connection;
 use serde::Serialize;
 use tokio::{
-    net::UnixListener,
+    net::{TcpListener, UnixListener},
     signal,
     sync::{Mutex, Notify},
     task::JoinHandle,
@@ -45,7 +45,10 @@ mod restore;
 mod systemd;
 mod tasks;
 
-use config::{config_path, data_dir, load_config, merge_config_mounts, socket_path, DaemonConfig};
+use config::{
+    config_path, data_dir, load_config, merge_config_mounts, socket_path, tcp_port_file_path,
+    DaemonConfig,
+};
 #[cfg(target_os = "macos")]
 use launchd::{install_daemon, uninstall_daemon};
 #[cfg(target_os = "linux")]
@@ -168,10 +171,38 @@ async fn serve_socket(state: DaemonState, socket_path: &Path) -> Result<()> {
     }
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("bind daemon socket {}", socket_path.display()))?;
-    let app = Router::new()
+
+    let tcp_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .context("bind daemon TCP loopback listener")?;
+    write_tcp_port_file(tcp_listener.local_addr()?.port())?;
+
+    let app = build_router(state.clone());
+
+    tokio::select! {
+        result = accept_loop_unix(listener, app.clone()) => result,
+        result = accept_loop_tcp(tcp_listener, app) => result,
+        result = shutdown_signal() => {
+            state.paused.store(true, Ordering::Release);
+            cancel_mount_tasks(&state).await;
+            if let Err(err) = fs::remove_file(socket_path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(err.into());
+                }
+            }
+            result
+        }
+    }
+}
+
+// Shared by the real Unix-socket/TCP-loopback listeners and by tests, so the two
+// listeners (and any test asserting they agree) can never drift into serving
+// different route sets.
+fn build_router(state: DaemonState) -> Router {
+    Router::new()
         .route("/status", get(control::get_status))
         .route("/mounts", get(control::get_mounts))
-        .route("/mount", post(mounts::post_mount))
+        .route("/mount", post(mounts::post_mount).delete(mounts::delete_mount_route))
         .route("/pause", post(control::post_pause))
         .route("/resume", post(control::post_resume))
         .route("/sync", post(tasks::post_sync))
@@ -187,24 +218,28 @@ async fn serve_socket(state: DaemonState, socket_path: &Path) -> Result<()> {
         .route("/fp/share", post(fp::fp_share))
         .route("/fp/watch", get(fp::fp_watch))
         .route("/nodes/:node_id/path", get(nodes::get_node_path))
-        .with_state(state.clone());
-
-    tokio::select! {
-        result = accept_loop(listener, app) => result,
-        result = shutdown_signal() => {
-            state.paused.store(true, Ordering::Release);
-            cancel_mount_tasks(&state).await;
-            if let Err(err) = fs::remove_file(socket_path) {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    return Err(err.into());
-                }
-            }
-            result
-        }
-    }
+        .with_state(state)
 }
 
-async fn accept_loop(listener: UnixListener, app: Router) -> Result<()> {
+// Advertises the TCP loopback port to the sandboxed macOS Xcode targets via the shared
+// app-group container (see `config::tcp_port_file_path`). Best-effort on non-macOS/CI
+// environments where the Group Containers path may not be meaningful: log and continue
+// rather than fail daemon startup over a macOS-only convenience file.
+fn write_tcp_port_file(port: u16) -> Result<()> {
+    let path = tcp_port_file_path()?;
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            eprintln!("warning: could not create {}: {err}", parent.display());
+            return Ok(());
+        }
+    }
+    if let Err(err) = fs::write(&path, port.to_string()) {
+        eprintln!("warning: could not write {}: {err}", path.display());
+    }
+    Ok(())
+}
+
+async fn accept_loop_unix(listener: UnixListener, app: Router) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let service = TowerToHyperService::new(app.clone());
@@ -216,6 +251,24 @@ async fn accept_loop(listener: UnixListener, app: Router) -> Result<()> {
             {
                 if !err.to_string().contains("shutting down") {
                     eprintln!("daemon socket connection failed: {err}");
+                }
+            }
+        });
+    }
+}
+
+async fn accept_loop_tcp(listener: TcpListener, app: Router) -> Result<()> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let service = TowerToHyperService::new(app.clone());
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            if let Err(err) = HyperBuilder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await
+            {
+                if !err.to_string().contains("shutting down") {
+                    eprintln!("daemon TCP connection failed: {err}");
                 }
             }
         });
@@ -248,6 +301,7 @@ impl MountState {
             name: self.name.clone(),
             scope_node_id: self.scope_node_id.clone(),
             grant_id: self.grant_id.clone(),
+            can_write: self.can_write,
             syncing: self.active_syncs > 0,
             pending_ops: self.pending_ops,
             last_synced_at: self.last_synced_at.clone(),
@@ -274,4 +328,83 @@ pub(crate) fn internal_error(error: impl std::fmt::Display) -> (StatusCode, Json
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse::new(error.to_string())),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    fn test_state() -> DaemonState {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!(
+            "../../valv-sync/src/persistence/schema.sql"
+        ))
+        .unwrap();
+        DaemonState {
+            paused: Arc::new(AtomicBool::new(false)),
+            fs_events_paused: Arc::new(AtomicBool::new(false)),
+            mounts: Arc::new(Mutex::new(Vec::new())),
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            db: Arc::new(Mutex::new(conn)),
+            client: reqwest::Client::new(),
+            config: DaemonConfig {
+                backend_url: "http://127.0.0.1:1".to_owned(),
+                device_id: "device-1".to_owned(),
+                device_token: "token-1".to_owned(),
+                device_name: "Test Device".to_owned(),
+                mounts: Vec::new(),
+            },
+        }
+    }
+
+    // Sends a raw `GET /status HTTP/1.1` request over an already-connected stream and
+    // returns the response's status line, mirroring the minimal hand-rolled framing
+    // DaemonKit's Swift `DaemonClient` will also use against this same server.
+    async fn get_status_line<S: AsyncReadExt + AsyncWriteExt + Unpin>(stream: &mut S) -> String {
+        stream
+            .write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        text.lines().next().unwrap_or_default().to_owned()
+    }
+
+    #[tokio::test]
+    async fn unix_and_tcp_listeners_serve_identical_status_responses() {
+        // /tmp directly, not std::env::temp_dir() - on macOS the latter resolves to a
+        // long per-process path that can exceed AF_UNIX's SUN_LEN limit (~104 bytes).
+        let socket_dir = Path::new("/tmp").join(format!(
+            "valvd-test-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        fs::create_dir_all(&socket_dir).unwrap();
+        let socket_path = socket_dir.join("valvd.sock");
+
+        let unix_listener = UnixListener::bind(&socket_path).unwrap();
+        let tcp_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let tcp_port = tcp_listener.local_addr().unwrap().port();
+
+        let app = build_router(test_state());
+        tokio::spawn(accept_loop_unix(unix_listener, app.clone()));
+        tokio::spawn(accept_loop_tcp(tcp_listener, app));
+
+        let mut unix_stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .unwrap();
+        let unix_status = get_status_line(&mut unix_stream).await;
+
+        let mut tcp_stream = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .unwrap();
+        let tcp_status = get_status_line(&mut tcp_stream).await;
+
+        assert_eq!(unix_status, "HTTP/1.1 200 OK");
+        assert_eq!(unix_status, tcp_status);
+
+        let _ = fs::remove_dir_all(&socket_dir);
+    }
 }
