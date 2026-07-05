@@ -92,6 +92,39 @@ describe("submitOp", () => {
     expect(hub.notifications).toEqual([{ folderId: "folder-1", serverSeq: 2 }]);
   });
 
+  it("decrements previous chunk refcounts when a new_version supersedes the current version", async () => {
+    const db = new OpTestDb();
+    const hub = new TestHub();
+    db.nodes.set("doc", { ...db.nodes.get("doc")!, currentVersionId: "old-version" });
+    db.versions.push({
+      versionId: "old-version",
+      nodeId: "doc",
+      manifest: [{ chunk_hash: "old-chunk", offset: 0, length: 10 }],
+      contentHash: "old-hash",
+      sizeBytes: 10,
+      authorDeviceId: "device-1",
+      isConflictCopy: false,
+    });
+    db.chunkRefcounts.set("old-chunk", 1);
+
+    const response = await submitOp(authFor(db), hub, "folder-1", devicePrincipal, {
+      op_type: "new_version",
+      node_id: "doc",
+      based_on_seq: 1,
+      payload: {
+        version_id: "new-version",
+        content_hash: "new-hash",
+        size_bytes: 12,
+        manifest: [{ chunk_hash: "new-chunk", offset: 0, length: 12 }],
+      },
+    });
+
+    expect(response).toEqual({ result: "applied", server_seq: 2, node_id: "doc" });
+    expect(db.nodes.get("doc")?.currentVersionId).toBe("new-version");
+    expect(db.chunkRefcounts.get("new-chunk")).toBe(1);
+    expect(db.chunkRefcounts.get("old-chunk")).toBe(0);
+  });
+
   it("creates a conflict copy for stale new_version ops", async () => {
     const db = new OpTestDb();
     const hub = new TestHub();
@@ -161,9 +194,6 @@ type TestVersion = {
 };
 
 class OpTestDb implements CoreDb {
-  select: CoreDb["select"];
-  insert: CoreDb["insert"];
-  update: CoreDb["update"];
   delete: CoreDb["delete"];
   nodes = new Map<string, TestNode>([
     [
@@ -207,8 +237,72 @@ class OpTestDb implements CoreDb {
     ],
   ]);
   versions: TestVersion[] = [];
-  ops: Array<{ serverSeq: number; folderId: string; nodeId: string; opType: string }> = [];
+  ops: Array<{ serverSeq: number; folderId: string; nodeId: string; opType: string; opPayload: unknown }> = [];
   chunkRefcounts = new Map<string, number>();
+  private lastInsertedVersionManifest: TestVersion["manifest"] = [];
+  private previousVersionManifest: TestVersion["manifest"] = [];
+  private chunkUpdatePhase: "idle" | "increment" | "decrement" = "idle";
+
+  select(selection?: Record<string, unknown>): any {
+    return {
+      from: (table: unknown) => this.selectFrom(table, selection),
+    };
+  }
+
+  insert(table: unknown): any {
+    return {
+      values: async (value: any) => {
+        if (table === pgSchema.nodes) {
+          const duplicate = [...this.nodes.values()].find(
+            (node) =>
+              node.folderId === value.folderId &&
+              node.parentId === value.parentId &&
+              node.name === value.name &&
+              node.deletedAt === null,
+          );
+          if (duplicate) {
+            throw new Error("duplicate node");
+          }
+          this.nodes.set(value.nodeId, { currentVersionId: null, deletedAt: null, ...value });
+        }
+        if (table === pgSchema.versions) {
+          const version = value as TestVersion;
+          this.versions.push(version);
+          this.lastInsertedVersionManifest = version.manifest;
+          this.chunkUpdatePhase = "increment";
+        }
+        if (table === pgSchema.opLog) {
+          const serverSeq = this.nextServerSeq();
+          this.ops.push({
+            serverSeq,
+            folderId: value.folderId,
+            nodeId: value.nodeId,
+            opType: value.opType,
+            opPayload: value.opPayload,
+          });
+        }
+      },
+    };
+  }
+
+  update(table: unknown): any {
+    return {
+      set: (patch: any) => ({
+        where: async () => {
+          if (table === pgSchema.nodes) {
+            const node = this.nodes.get("doc");
+            if (!node) {
+              throw new Error("missing node doc");
+            }
+            this.nodes.set("doc", { ...node, ...patch });
+          }
+          if (table === pgSchema.chunks) {
+            this.applyChunkUpdate();
+          }
+        },
+      }),
+    };
+  }
 
   async getNodeForAuthz(nodeId: string): Promise<{ nodeId: string; folderId: string; parentId: string | null } | undefined> {
     return this.nodes.get(nodeId);
@@ -225,46 +319,88 @@ class OpTestDb implements CoreDb {
     return undefined;
   }
 
-  async getNodeForOp(nodeId: string): Promise<TestNode | undefined> {
-    return this.nodes.get(nodeId);
+  private selectFrom(table: unknown, selection?: Record<string, unknown>): any {
+    const rows = () => this.selectRows(table, selection);
+    return {
+      where: () => ({
+        limit: async (limit: number) => rows().slice(0, limit),
+        orderBy: () => this.orderable(rows()),
+      }),
+      orderBy: () => this.orderable(rows()),
+      innerJoin: (joinTable: unknown) => ({
+        where: () => ({
+          limit: async (limit: number) => this.innerJoinRows(table, joinTable, selection).slice(0, limit),
+        }),
+      }),
+    };
   }
 
-  async findLiveChildForOp(opts: { folderId: string; parentId: string; name: string }): Promise<TestNode | undefined> {
-    return [...this.nodes.values()].find(
-      (node) =>
-        node.folderId === opts.folderId &&
-        node.parentId === opts.parentId &&
-        node.name === opts.name &&
-        node.deletedAt === null,
-    );
+  private orderable(rows: any[]): any {
+    return {
+      limit: async (limit: number) => rows.slice(0, limit),
+      then: (resolve: (value: any[]) => unknown, reject?: (reason: unknown) => unknown) => Promise.resolve(rows).then(resolve, reject),
+    };
   }
 
-  async insertNodeForOp(node: TestNode): Promise<void> {
-    this.nodes.set(node.nodeId, node);
-  }
-
-  async updateNodeForOp(nodeId: string, patch: Partial<TestNode>): Promise<void> {
-    const node = this.nodes.get(nodeId);
-    if (!node) {
-      throw new Error(`missing node ${nodeId}`);
+  private selectRows(table: unknown, selection?: Record<string, unknown>): any[] {
+    const keys = Object.keys(selection ?? {});
+    if (table === pgSchema.nodes) {
+      const doc = this.nodes.get("doc");
+      if (keys.includes("type")) {
+        return [this.nodes.get("archive")].filter(Boolean);
+      }
+      if (keys.includes("name") && keys.includes("parentId")) {
+        return doc ? [{ name: doc.name, parentId: doc.parentId }] : [];
+      }
+      if (keys.includes("nodeId") && keys.includes("serverSeq")) {
+        return doc ? [{ nodeId: doc.nodeId, serverSeq: doc.serverSeq }] : [];
+      }
+      if (keys.includes("nodeId")) {
+        return [];
+      }
+      if (keys.includes("serverSeq")) {
+        return doc ? [{ serverSeq: doc.serverSeq }] : [];
+      }
+      return [...this.nodes.values()];
     }
-    this.nodes.set(nodeId, { ...node, ...patch });
+    if (table === pgSchema.opLog) {
+      return [...this.ops].sort((left, right) => right.serverSeq - left.serverSeq);
+    }
+    if (table === pgSchema.versions) {
+      return [...this.versions];
+    }
+    return [];
   }
 
-  async insertVersionForOp(version: TestVersion): Promise<void> {
-    this.versions.push(version);
+  private innerJoinRows(table: unknown, joinTable: unknown, selection?: Record<string, unknown>): any[] {
+    if (table !== pgSchema.nodes || joinTable !== pgSchema.versions || !selection?.manifest) {
+      return [];
+    }
+    const currentVersionId = this.nodes.get("doc")?.currentVersionId;
+    const version = this.versions.find((item) => item.versionId === currentVersionId);
+    this.previousVersionManifest = version?.manifest ?? [];
+    return version ? [{ manifest: version.manifest }] : [];
   }
 
-  async incrementChunksForOp(chunkHashes: string[]): Promise<void> {
-    for (const hash of chunkHashes) {
-      this.chunkRefcounts.set(hash, (this.chunkRefcounts.get(hash) ?? 0) + 1);
+  private applyChunkUpdate(): void {
+    if (this.chunkUpdatePhase === "increment") {
+      for (const chunk of this.lastInsertedVersionManifest) {
+        this.chunkRefcounts.set(chunk.chunk_hash, (this.chunkRefcounts.get(chunk.chunk_hash) ?? 0) + 1);
+      }
+      this.chunkUpdatePhase = this.previousVersionManifest.length > 0 ? "decrement" : "idle";
+      return;
+    }
+    if (this.chunkUpdatePhase === "decrement") {
+      for (const chunk of this.previousVersionManifest) {
+        this.chunkRefcounts.set(chunk.chunk_hash, Math.max((this.chunkRefcounts.get(chunk.chunk_hash) ?? 0) - 1, 0));
+      }
+      this.previousVersionManifest = [];
+      this.chunkUpdatePhase = "idle";
     }
   }
 
-  async insertOpForOp(op: { folderId: string; nodeId: string; opType: string }): Promise<number> {
-    const serverSeq = this.ops.length + 2;
-    this.ops.push({ serverSeq, folderId: op.folderId, nodeId: op.nodeId, opType: op.opType });
-    return serverSeq;
+  private nextServerSeq(): number {
+    return Math.max(1, ...this.ops.map((op) => op.serverSeq), ...[...this.nodes.values()].map((node) => node.serverSeq)) + 1;
   }
 }
 

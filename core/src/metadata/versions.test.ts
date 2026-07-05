@@ -95,12 +95,11 @@ type TestVersion = {
 };
 
 class VersionDb implements CoreDb {
-  insert: CoreDb["insert"];
-  update: CoreDb["update"];
   delete: CoreDb["delete"];
   execute: CoreDb["execute"];
   versions: TestVersion[] = [];
   insertedVersions: Array<Omit<TestVersion, "createdAt">> = [];
+  ops: Array<{ serverSeq: number; folderId: string; nodeId: string; opType: string }> = [];
   nodes = new Map([
     ["doc", { nodeId: "doc", folderId: "folder-1", parentId: "root", name: "doc.txt", type: "file" as const, serverSeq: 10, currentVersionId: null, deletedAt: null }],
   ]);
@@ -112,14 +111,39 @@ class VersionDb implements CoreDb {
     this.devicePrincipalId = deviceId;
   }
 
-  select(): any {
+  select(selection?: Record<string, unknown>): any {
     return {
-      from: (table: unknown) => ({
-        where: () => ({
-          limit: async (limit: number) => this.selectRows(table).slice(0, limit),
-          orderBy: async () => this.selectRows(table),
-        }),
-        orderBy: async () => this.selectRows(table),
+      from: (table: unknown) => this.selectFrom(table, selection),
+    };
+  }
+
+  insert(table: unknown): any {
+    return {
+      values: async (value: any) => {
+        if (table === pgSchema.versions) {
+          this.insertedVersions.push(value);
+          this.versions.push({ ...value, createdAt: new Date("2026-01-03T00:00:00.000Z") });
+        }
+        if (table === pgSchema.opLog) {
+          const serverSeq = this.nextServerSeq();
+          this.ops.push({ serverSeq, folderId: value.folderId, nodeId: value.nodeId, opType: value.opType });
+        }
+      },
+    };
+  }
+
+  update(table: unknown): any {
+    return {
+      set: (patch: any) => ({
+        where: async () => {
+          if (table !== pgSchema.nodes) {
+            return;
+          }
+          const node = this.nodes.get("doc");
+          if (node) {
+            this.nodes.set("doc", { ...node, ...patch });
+          }
+        },
       }),
     };
   }
@@ -133,41 +157,60 @@ class VersionDb implements CoreDb {
     return this.opts.authorized ? { grantId: "grant-1", scopeNodeId: "doc", canRead: true, canWrite: true } : undefined;
   }
 
-  async getNodeForOp(nodeId: string) {
-    return this.nodes.get(nodeId);
+  private selectFrom(table: unknown, selection?: Record<string, unknown>): any {
+    const rows = () => this.selectRows(table, selection);
+    return {
+      where: () => ({
+        limit: async (limit: number) => rows().slice(0, limit),
+        orderBy: () => this.orderable(rows()),
+      }),
+      orderBy: () => this.orderable(rows()),
+      innerJoin: (joinTable: unknown) => ({
+        where: () => ({
+          limit: async (limit: number) => this.innerJoinRows(table, joinTable, selection).slice(0, limit),
+        }),
+      }),
+    };
   }
 
-  async findLiveChildForOp(): Promise<undefined> {
-    return undefined;
+  private orderable(rows: any[]): any {
+    return {
+      limit: async (limit: number) => rows.slice(0, limit),
+      then: (resolve: (value: any[]) => unknown, reject?: (reason: unknown) => unknown) => Promise.resolve(rows).then(resolve, reject),
+    };
   }
 
-  async insertNodeForOp(): Promise<void> {}
-
-  async updateNodeForOp(nodeId: string, patch: any): Promise<void> {
-    const node = this.nodes.get(nodeId);
-    if (node) {
-      this.nodes.set(nodeId, { ...node, ...patch });
-    }
-  }
-
-  async insertVersionForOp(versionRow: Omit<TestVersion, "createdAt">): Promise<void> {
-    this.insertedVersions.push(versionRow);
-  }
-
-  async incrementChunksForOp(): Promise<void> {}
-
-  async insertOpForOp(): Promise<number> {
-    return 11;
-  }
-
-  private selectRows(table: unknown): any[] {
+  private selectRows(table: unknown, selection?: Record<string, unknown>): any[] {
     if (table === pgSchema.devices) {
       return this.devicePrincipalId ? [{ deviceId: this.devicePrincipalId }] : [];
     }
     if (table === pgSchema.nodes) {
-      return [{ serverSeq: this.nodes.get("doc")?.serverSeq ?? 0 }];
+      const node = this.nodes.get("doc");
+      if (!node) {
+        return [];
+      }
+      if (selection?.serverSeq) {
+        return [{ serverSeq: node.serverSeq }];
+      }
+      return [node];
+    }
+    if (table === pgSchema.opLog) {
+      return [...this.ops].sort((left, right) => right.serverSeq - left.serverSeq);
     }
     return [...this.versions].sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime());
+  }
+
+  private innerJoinRows(table: unknown, joinTable: unknown, selection?: Record<string, unknown>): any[] {
+    if (table !== pgSchema.nodes || joinTable !== pgSchema.versions || !selection?.manifest) {
+      return [];
+    }
+    const currentVersionId = this.nodes.get("doc")?.currentVersionId;
+    const version = this.versions.find((item) => item.versionId === currentVersionId);
+    return version ? [{ manifest: version.manifest }] : [];
+  }
+
+  private nextServerSeq(): number {
+    return Math.max(10, ...this.ops.map((op) => op.serverSeq), ...[...this.nodes.values()].map((node) => node.serverSeq)) + 1;
   }
 }
 
