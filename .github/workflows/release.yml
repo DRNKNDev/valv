@@ -1,0 +1,105 @@
+# Release runbook:
+# 1. Bump crates/valv-cli/Cargo.toml and crates/valvd/Cargo.toml to the same semver.
+# 2. From the private repo, run tooling/mirror/pull.sh, then tooling/mirror/push.sh.
+# 3. Tag v<semver> on the public remote after the mirror push; never tag the private repo
+#    for public releases, because this workflow only publishes from DRNKNDev/valv.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates
+    outputs:
+      version: ${{ steps.guard.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tags must use v<semver>; got ${tag}" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          cli_version="$(awk -F '"' '/^version = / { print $2; exit }' valv-cli/Cargo.toml)"
+          daemon_version="$(awk -F '"' '/^version = / { print $2; exit }' valvd/Cargo.toml)"
+          if [[ "${cli_version}" != "${version}" || "${daemon_version}" != "${version}" ]]; then
+            echo "Tag ${tag} does not match Cargo.toml versions:" >&2
+            echo "valv-cli=${cli_version}" >&2
+            echo "valvd=${daemon_version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release -p valv-cli -p valvd --target ${{ matrix.target }}
+      - name: Package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.version.outputs.version }}"
+          target="${{ matrix.target }}"
+          asset="valv-${version}-${target}.tar.gz"
+          mkdir -p ../dist
+          tar -C "target/${target}/release" -czf "../dist/${asset}" valv valvd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: valv-${{ needs.version.outputs.version }}-${{ matrix.target }}
+          path: dist/valv-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - version
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum valv-${{ needs.version.outputs.version }}-*.tar.gz > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: |
+            dist/valv-${{ needs.version.outputs.version }}-aarch64-apple-darwin.tar.gz
+            dist/valv-${{ needs.version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            dist/SHA256SUMS
