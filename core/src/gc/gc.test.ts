@@ -15,7 +15,7 @@ describe("GC service", () => {
     const db = new GcTestDb({ chunks: ["old"] });
     const s3Client = s3For(db);
 
-    startGc(db, s3Client, "bucket", intervalOpts());
+    startGc(db, s3Client, "bucket", undefined, intervalOpts());
     await vi.advanceTimersByTimeAsync(100);
 
     expect(db.events.indexOf("s3:chunks/old")).toBeLessThan(db.events.indexOf("db:chunk-delete:old"));
@@ -28,7 +28,7 @@ describe("GC service", () => {
     const db = new GcTestDb({ chunks: ["old"] });
     const s3Client = s3For(db, new Error("r2 unavailable"));
 
-    startGc(db, s3Client, "bucket", intervalOpts());
+    startGc(db, s3Client, "bucket", undefined, intervalOpts());
     await vi.advanceTimersByTimeAsync(100);
 
     expect(db.chunkDeletes).toEqual([]);
@@ -40,7 +40,7 @@ describe("GC service", () => {
     vi.setSystemTime(new Date("2026-06-27T00:00:00.000Z"));
     const db = new GcTestDb();
 
-    startGc(db, s3For(db), "bucket", {
+    startGc(db, s3For(db), "bucket", undefined, {
       ...intervalOpts(),
       tombstoneRetentionMs: 10_000,
       opLogRetentionMs: 20_000,
@@ -53,7 +53,7 @@ describe("GC service", () => {
 
   it("clears all timers when stopped", () => {
     vi.useFakeTimers();
-    const stopGc = startGc(new GcTestDb(), s3For(new GcTestDb()), "bucket", intervalOpts());
+    const stopGc = startGc(new GcTestDb(), s3For(new GcTestDb()), "bucket", undefined, intervalOpts());
 
     expect(vi.getTimerCount()).toBe(3);
     stopGc();
@@ -66,7 +66,7 @@ describe("GC service", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const db = new GcTestDb({ failChunkSelect: true });
 
-    startGc(db, s3For(db), "bucket", intervalOpts());
+    startGc(db, s3For(db), "bucket", undefined, intervalOpts());
     await vi.advanceTimersByTimeAsync(100);
 
     expect(consoleError).toHaveBeenCalledWith("Chunk GC pass failed", expect.any(Error));
@@ -121,11 +121,13 @@ class GcTestDb implements CoreDb {
 
 function s3For(db: GcTestDb, error?: Error) {
   return {
-    send: vi.fn(async (command: { input: { Key?: string } }) => {
-      db.events.push(`s3:${command.input.Key}`);
+    fetch: vi.fn(async (url: string) => {
+      const key = new URL(url).pathname.split("/").slice(-2).join("/");
+      db.events.push(`s3:${key}`);
       if (error) {
         throw error;
       }
+      return new Response(null, { status: 204 });
     }),
   } as any;
 }

@@ -16,7 +16,11 @@ export type UnauthenticatedPrincipal = { type: "unauthenticated" };
 
 export type AuthResult = Principal | UnauthenticatedPrincipal;
 
-export type CoreSchema = typeof pgSchema | typeof sqliteSchema;
+type CoreSchemaTable = keyof typeof pgSchema;
+
+export type CoreSchema = {
+  [Table in CoreSchemaTable]: (typeof pgSchema)[Table] | (typeof sqliteSchema)[Table];
+};
 
 export type CoreDb = {
   all?: any;

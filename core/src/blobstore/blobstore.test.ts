@@ -4,12 +4,6 @@ import type { CoreAuth, CoreDb, Principal } from "../auth/index.js";
 import { pgSchema } from "../db/schema.js";
 import { chunkKey, createBlobstoreRouter } from "./index.js";
 
-vi.mock("@aws-sdk/s3-request-presigner", () => ({
-  getSignedUrl: vi.fn(async (_client, command: { constructor: { name: string }; input: { Key?: string } }) => {
-    return `signed:${command.constructor.name}:${command.input.Key}`;
-  }),
-}));
-
 describe("blobstore batch coordination", () => {
   it("computes the OSS chunk key layout", () => {
     expect(chunkKey("abc123")).toBe("chunks/abc123");
@@ -189,5 +183,12 @@ function appFor(db: BlobTestDb, principal: Principal | null = { type: "user", us
       }),
     });
   }
-  return createBlobstoreRouter({ auth, s3Client: {} as any, bucketName: "bucket" });
+  const s3 = {
+    sign: vi.fn(async (url: string, init?: { method?: string }) => {
+      const key = new URL(url).pathname.split("/").slice(-2).join("/");
+      const command = init?.method === "PUT" ? "PutObjectCommand" : "GetObjectCommand";
+      return new Request(`signed:${command}:${key}`);
+    }),
+  } as any;
+  return createBlobstoreRouter({ auth, s3, bucketName: "bucket" });
 }
