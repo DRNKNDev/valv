@@ -2080,7 +2080,7 @@ dependencies = [
 
 [[package]]
 name = "valv-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2118,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "valvd"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",

@@ -56,7 +56,7 @@ use systemd::{install_daemon, uninstall_daemon};
 use tasks::{cancel_mount_tasks, spawn_mount_tasks};
 
 #[derive(Parser)]
-#[command(name = "valvd", about = "Valv sync daemon")]
+#[command(name = "valvd", about = "Valv sync daemon", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
