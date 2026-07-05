@@ -37,42 +37,6 @@ export type CommittedOp = {
   previousParentId?: string | null;
 };
 
-type OpNode = {
-  nodeId: string;
-  folderId: string;
-  parentId: string | null;
-  name: string;
-  type: "file" | "folder";
-  serverSeq: number;
-  currentVersionId?: string | null;
-  deletedAt?: Date | null;
-};
-
-type OpStoreDb = {
-  getNodeForOp: (nodeId: string) => Promise<OpNode | undefined>;
-  findLiveChildForOp: (opts: { folderId: string; parentId: string; name: string }) => Promise<OpNode | undefined>;
-  insertNodeForOp: (node: OpNode) => Promise<void>;
-  updateNodeForOp: (nodeId: string, patch: Partial<OpNode>) => Promise<void>;
-  insertVersionForOp: (version: {
-    versionId: string;
-    nodeId: string;
-    manifest: ChunkRef[];
-    contentHash: string;
-    sizeBytes: number;
-    authorDeviceId: string;
-    isConflictCopy: boolean;
-  }) => Promise<void>;
-  incrementChunksForOp: (chunkHashes: string[]) => Promise<void>;
-  insertOpForOp: (op: {
-    folderId: string;
-    nodeId: string;
-    opType: string;
-    opPayload: Record<string, unknown>;
-    basedOnSeq: number | null;
-    actorDeviceId: string;
-  }) => Promise<number>;
-};
-
 export function registerOpRoutes(
   router: Hono<{ Variables: MetadataVariables }>,
   auth: CoreAuth,
@@ -104,10 +68,6 @@ export async function submitOp(
 ): Promise<SubmitOpResponse> {
   if (principal.type !== "device") {
     throw new Response(JSON.stringify({ error: "device_required" }), { status: 403 });
-  }
-
-  if (hasOpStore(auth.db)) {
-    return submitOpWithStore(auth.db, hub, folderId, principal, op, onOpCommitted);
   }
 
   if (op.op_type === "create") {
@@ -206,139 +166,6 @@ export async function submitOp(
     await notifyCommitted(hub, committedOp, onOpCommitted);
   }
   return response;
-}
-
-async function submitOpWithStore(
-  db: CoreAuth["db"] & OpStoreDb,
-  hub: MetadataHub,
-  folderId: string,
-  principal: Extract<Principal, { type: "device" }>,
-  op: SubmitOpRequest,
-  onOpCommitted?: (op: CommittedOp) => Promise<void>,
-): Promise<SubmitOpResponse> {
-  if (op.op_type === "create") {
-    const grant = await checkGrant(db, op.payload.parent_id, principal, "write");
-    if (!grant.granted) {
-      throw new Response(JSON.stringify({ error: grant.reason }), { status: 403 });
-    }
-    const existing = await db.findLiveChildForOp({ folderId, parentId: op.payload.parent_id, name: op.payload.name });
-    if (existing) {
-      return { result: "superseded", current_seq: existing.serverSeq };
-    }
-    const nodeId = newId();
-    await db.insertNodeForOp({
-      nodeId,
-      folderId,
-      parentId: op.payload.parent_id,
-      name: op.payload.name,
-      type: op.payload.type,
-      serverSeq: 0,
-      currentVersionId: null,
-      deletedAt: null,
-    });
-    const serverSeq = await db.insertOpForOp({
-      folderId,
-      nodeId,
-      opType: op.op_type,
-      opPayload: op.payload,
-      basedOnSeq: null,
-      actorDeviceId: principal.deviceId,
-    });
-    await db.updateNodeForOp(nodeId, { serverSeq });
-    await notifyCommitted(hub, { folderId, serverSeq, nodeId, opType: op.op_type }, onOpCommitted);
-    return { result: "applied", server_seq: serverSeq, node_id: nodeId };
-  }
-
-  const grant = await checkGrant(db, op.node_id, principal, "write");
-  if (!grant.granted) {
-    throw new Response(JSON.stringify({ error: grant.reason }), { status: 403 });
-  }
-  const node = await db.getNodeForOp(op.node_id);
-  if (!node) {
-    throw new Response(JSON.stringify({ error: "node_not_found" }), { status: 404 });
-  }
-
-  if (node.serverSeq !== op.based_on_seq) {
-    if (op.op_type !== "new_version") {
-      return { result: "superseded", current_seq: node.serverSeq };
-    }
-    const conflictVersionId = newId();
-    await db.insertVersionForOp({
-      versionId: conflictVersionId,
-      nodeId: op.node_id,
-      manifest: op.payload.manifest,
-      contentHash: op.payload.content_hash,
-      sizeBytes: op.payload.size_bytes,
-      authorDeviceId: principal.deviceId,
-      isConflictCopy: true,
-    });
-    await db.incrementChunksForOp(op.payload.manifest.map((chunk) => chunk.chunk_hash));
-    const serverSeq = await db.insertOpForOp({
-      folderId,
-      nodeId: op.node_id,
-      opType: op.op_type,
-      opPayload: { ...op.payload, version_id: conflictVersionId, is_conflict_copy: true },
-      basedOnSeq: op.based_on_seq,
-      actorDeviceId: principal.deviceId,
-    });
-    await db.updateNodeForOp(op.node_id, { serverSeq });
-    await notifyCommitted(hub, { folderId, serverSeq, nodeId: op.node_id, opType: op.op_type }, onOpCommitted);
-    return { result: "conflict_copy", server_seq: serverSeq, node_id: op.node_id, conflict_version_id: conflictVersionId };
-  }
-
-  const nodePatch: Partial<OpNode> = {};
-  if (op.op_type === "rename") {
-    nodePatch.name = op.payload.new_name;
-  }
-  if (op.op_type === "move") {
-    const parent = await db.getNodeForOp(op.payload.new_parent_id);
-    if (!parent || parent.type !== "folder") {
-      throw new Response(JSON.stringify({ error: "parent_not_found" }), { status: 404 });
-    }
-    const existing = await db.findLiveChildForOp({ folderId, parentId: op.payload.new_parent_id, name: node.name });
-    if (existing && existing.nodeId !== op.node_id) {
-      throw new Response(JSON.stringify({ error: "name_collision" }), { status: 409 });
-    }
-    nodePatch.parentId = op.payload.new_parent_id;
-  }
-  if (op.op_type === "rename") {
-    const existing = await db.findLiveChildForOp({ folderId, parentId: node.parentId ?? "", name: op.payload.new_name });
-    if (existing && existing.nodeId !== op.node_id) {
-      throw new Response(JSON.stringify({ error: "name_collision" }), { status: 409 });
-    }
-  }
-  if (op.op_type === "delete") {
-    nodePatch.deletedAt = new Date();
-  }
-  if (op.op_type === "new_version") {
-    await db.insertVersionForOp({
-      versionId: op.payload.version_id,
-      nodeId: op.node_id,
-      manifest: op.payload.manifest,
-      contentHash: op.payload.content_hash,
-      sizeBytes: op.payload.size_bytes,
-      authorDeviceId: principal.deviceId,
-      isConflictCopy: false,
-    });
-    await db.incrementChunksForOp(op.payload.manifest.map((chunk) => chunk.chunk_hash));
-    nodePatch.currentVersionId = op.payload.version_id;
-  }
-  await db.updateNodeForOp(op.node_id, nodePatch);
-  const serverSeq = await db.insertOpForOp({
-    folderId,
-    nodeId: op.node_id,
-    opType: op.op_type,
-    opPayload: op.payload,
-    basedOnSeq: op.based_on_seq,
-    actorDeviceId: principal.deviceId,
-  });
-  await db.updateNodeForOp(op.node_id, { serverSeq });
-  await notifyCommitted(hub, { folderId, serverSeq, nodeId: op.node_id, opType: op.op_type, previousParentId: op.op_type === "move" ? node.parentId : undefined }, onOpCommitted);
-  return { result: "applied", server_seq: serverSeq, node_id: op.node_id };
-}
-
-function hasOpStore(db: CoreAuth["db"]): db is CoreAuth["db"] & OpStoreDb {
-  return "getNodeForOp" in db && "insertOpForOp" in db;
 }
 
 async function createNode(
