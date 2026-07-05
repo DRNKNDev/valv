@@ -824,10 +824,16 @@ mod tests {
         let path = dir.path().join("report.md");
         fs::write(&path, b"").unwrap();
         let db = seeded_db();
-        let (backend_url, server) = submit_op_server(vec![SubmitOpResponse::Applied {
-            node_id: "server-file".into(),
-            server_seq: 42,
-        }])
+        let (backend_url, server) = submit_op_server(vec![
+            SubmitOpResponse::Applied {
+                node_id: "server-file".into(),
+                server_seq: 42,
+            },
+            SubmitOpResponse::Applied {
+                node_id: "version-id".into(),
+                server_seq: 43,
+            },
+        ])
         .await;
 
         handle_create(
@@ -845,10 +851,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         let conn = db.lock().await;
         let node = get_node(&conn, "server-file").unwrap().unwrap();
-        assert_eq!(node.server_seq, 42);
+        assert_eq!(node.server_seq, 43);
         assert_eq!(node.parent_id.as_deref(), Some("root-node"));
         assert_eq!(node.name, "report.md");
         assert_eq!(node.node_type, "file");
@@ -892,6 +898,10 @@ mod tests {
                 node_id: "file-node".into(),
                 server_seq: 3,
             },
+            SubmitOpResponse::Applied {
+                node_id: "version-id".into(),
+                server_seq: 4,
+            },
         ])
         .await;
         let mount = watch_mount(dir.path());
@@ -908,13 +918,13 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         let conn = db.lock().await;
         let docs = get_node(&conn, "docs-node").unwrap().unwrap();
         let file = get_node(&conn, "file-node").unwrap().unwrap();
         assert_eq!(docs.parent_id.as_deref(), Some("root-node"));
         assert_eq!(file.parent_id.as_deref(), Some("docs-node"));
-        assert_eq!(file.server_seq, 3);
+        assert_eq!(file.server_seq, 4);
     }
 
     #[tokio::test]

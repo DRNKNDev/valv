@@ -1081,6 +1081,10 @@ mod tests {
                 node_id: "a-node".into(),
                 server_seq: 2,
             },
+            MockOp::Applied {
+                node_id: "a-version".into(),
+                server_seq: 3,
+            },
             MockOp::Error,
         ])
         .await;
@@ -1102,7 +1106,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert_eq!(summary.errors, 1);
         assert_eq!(summary.creates_submitted, 1);
     }
