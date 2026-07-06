@@ -7,7 +7,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use serde::Deserialize;
-use valv_sync::persistence::mounts;
+use valv_sync::{config::toml_escape, persistence::mounts};
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct DaemonConfig {
@@ -179,10 +179,6 @@ pub(crate) fn home_dir() -> Result<PathBuf> {
 
 pub(crate) fn default_device_name() -> String {
     env::var("HOSTNAME").unwrap_or_else(|_| "Valv Device".into())
-}
-
-fn toml_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 pub(crate) fn set_owner_only_permissions(path: &Path) -> Result<()> {

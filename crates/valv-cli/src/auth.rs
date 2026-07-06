@@ -11,6 +11,7 @@ use tokio::{
 };
 use url::form_urlencoded;
 use uuid::Uuid;
+use valv_sync::config::toml_escape;
 
 use crate::paths::config_path;
 
@@ -206,10 +207,6 @@ fn default_device_name() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "Valv Device".to_owned())
-}
-
-fn toml_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn set_owner_only_permissions(path: &Path) -> Result<()> {

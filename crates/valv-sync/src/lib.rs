@@ -1,6 +1,7 @@
 //! Valv sync engine library.
 
 pub mod chunking;
+pub mod config;
 pub mod persistence;
 pub mod protocol;
 pub mod storage;
