@@ -218,8 +218,12 @@ struct ManageFoldersWindow: View {
             panel.canChooseFiles = false
             panel.prompt = "Select"
             guard panel.runModal() == .OK, let url = panel.url else { return }
-            if let response = try? await store.mount(MountRequest(path: url.path)) {
+            do {
+                let response = try await store.mount(MountRequest(path: url.path))
                 selectedFolderId = response.folderId
+                loadError = nil
+            } catch {
+                loadError = error.localizedDescription
             }
             await domainManager.signalRootEnumerator()
         }
@@ -246,8 +250,12 @@ struct ManageFoldersWindow: View {
             let request = byId
                 ? MountRequest(path: url.path, folderId: value)
                 : MountRequest(path: url.path, grantToken: value)
-            if let response = try? await store.mount(request) {
+            do {
+                let response = try await store.mount(request)
                 selectedFolderId = response.folderId
+                loadError = nil
+            } catch {
+                loadError = error.localizedDescription
             }
             await domainManager.signalRootEnumerator()
         }
@@ -353,7 +361,7 @@ private struct AddDeviceSheet: View {
             do {
                 let token = try await backendClient.createDeviceGrant(
                     folderId: mount.folderId,
-                    scopeNodeId: mount.scopeNodeId ?? mount.folderId,
+                    scopeNodeId: mount.scopeNodeId,
                     name: name,
                     canWrite: canWrite
                 )

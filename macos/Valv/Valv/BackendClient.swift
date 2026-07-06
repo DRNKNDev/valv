@@ -27,6 +27,13 @@ struct GrantEntry: Decodable, Identifiable, Hashable {
     }
 }
 
+struct DeviceGrantRequestBody: Encodable {
+    let scope_node_id: String?
+    let name: String
+    let can_read: Bool
+    let can_write: Bool
+}
+
 enum BackendClientError: LocalizedError {
     case notConfigured
     case httpStatus(Int, String)
@@ -66,13 +73,12 @@ final class BackendClient {
         return response.invite_token
     }
 
-    func createDeviceGrant(folderId: String, scopeNodeId: String, name: String, canWrite: Bool) async throws -> String {
-        struct Body: Encodable { let scope_node_id: String; let name: String; let can_read: Bool; let can_write: Bool }
+    func createDeviceGrant(folderId: String, scopeNodeId: String?, name: String, canWrite: Bool) async throws -> String {
         struct Response: Decodable { let token: String }
         let response: Response = try await send(
             method: "POST",
             path: "/api/folders/\(folderId)/grants",
-            body: Body(scope_node_id: scopeNodeId, name: name, can_read: true, can_write: canWrite)
+            body: DeviceGrantRequestBody(scope_node_id: scopeNodeId, name: name, can_read: true, can_write: canWrite)
         )
         return response.token
     }
