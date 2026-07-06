@@ -35,6 +35,59 @@ describe("device auth routes", () => {
     expect(db.insertedDevices[0]).toMatchObject({ name: "Device" });
   });
 
+  it("fires onDeviceCreated with the created device and user", async () => {
+    const db = new DeviceTestDb();
+    const onDeviceCreated = vi.fn(async () => undefined);
+    const app = createDeviceAuthRouter(authFor(db, { userId: "user-1" }), { onDeviceCreated });
+
+    const response = await app.request("/device", { method: "POST" });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(onDeviceCreated).toHaveBeenCalledWith({ deviceId: body.device_id, userId: "user-1" });
+  });
+
+  it("does not fail registration when onDeviceCreated rejects", async () => {
+    const db = new DeviceTestDb();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const app = createDeviceAuthRouter(authFor(db, { userId: "user-1" }), {
+      onDeviceCreated: vi.fn(async () => {
+        throw new Error("link failed");
+      }),
+    });
+
+    const response = await app.request("/device", { method: "POST" });
+
+    expect(response.status).toBe(200);
+    expect(db.insertedDevices).toHaveLength(1);
+    expect(consoleError).toHaveBeenCalledWith("onDeviceCreated hook failed", expect.any(Error));
+    consoleError.mockRestore();
+  });
+
+  it("rejects inactive plans before creating a device", async () => {
+    const db = new DeviceTestDb();
+    const app = createDeviceAuthRouter(authFor(db, { userId: "user-1" }), {
+      checkPlan: vi.fn(async () => ({ allowed: false, status: "none" })),
+      onDeviceCreated: vi.fn(async () => undefined),
+    });
+
+    const response = await app.request("/device", { method: "POST" });
+
+    expect(response.status).toBe(402);
+    await expect(response.json()).resolves.toEqual({ error: "subscription_inactive", status: "none" });
+    expect(db.insertedDevices).toHaveLength(0);
+  });
+
+  it("keeps no-hook self-hosted registration behavior unchanged", async () => {
+    const db = new DeviceTestDb();
+    const app = createDeviceAuthRouter(authFor(db, { userId: "user-1" }));
+
+    const response = await app.request("/device", { method: "POST" });
+
+    expect(response.status).toBe(200);
+    expect(db.insertedDevices).toHaveLength(1);
+  });
+
   it("rejects device principals", async () => {
     const response = await createDeviceAuthRouter(authFor(new DeviceTestDb("device-1"), undefined)).request("/device", {
       method: "POST",

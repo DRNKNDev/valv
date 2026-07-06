@@ -245,7 +245,11 @@ export class LifecycleDb implements CoreDb {
 export function metadataAppFor(
   db: CoreDb,
   principal: Principal,
-  opts: { hub?: MetadataHub; sendInviteEmail?: SendInviteEmail } = {},
+  opts: {
+    hub?: MetadataHub;
+    sendInviteEmail?: SendInviteEmail;
+    onFolderCreated?: (info: { folderId: string; ownerUserId: string; grantId: string }) => Promise<void>;
+  } = {},
 ): Hono {
   if (principal.type === "device" && "setDevicePrincipal" in db && typeof db.setDevicePrincipal === "function") {
     db.setDevicePrincipal(principal.deviceId);
@@ -261,6 +265,7 @@ export function metadataAppFor(
     auth,
     hub: opts.hub ?? { notify: () => undefined },
     sendInviteEmail: opts.sendInviteEmail,
+    onFolderCreated: opts.onFolderCreated,
   }) as Hono;
 }
 

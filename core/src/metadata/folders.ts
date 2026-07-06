@@ -27,7 +27,13 @@ type FolderRouteStore = {
   getFolderForRoute?: (folderId: string) => Promise<{ name: string } | undefined>;
 };
 
-export function registerFolderRoutes(router: Hono<{ Variables: MetadataVariables }>, auth: CoreAuth): void {
+export type OnFolderCreated = (info: { folderId: string; ownerUserId: string; grantId: string }) => Promise<void>;
+
+export function registerFolderRoutes(
+  router: Hono<{ Variables: MetadataVariables }>,
+  auth: CoreAuth,
+  onFolderCreated?: OnFolderCreated,
+): void {
   router.post("/folders", async (ctx) => {
     const principal = requirePrincipal(ctx);
     const ownerUserId = await resolveEffectiveUserId(auth, principal);
@@ -45,30 +51,38 @@ export function registerFolderRoutes(router: Hono<{ Variables: MetadataVariables
       await auth.db.createFolderForRoute({ folderId, rootNodeId, grantId, name, ownerUserId });
     } else {
       await inTransaction(auth, async (tx) => {
-      await tx.insert(auth.schema.sharedFolders).values({
-        folderId,
-        name,
-        ownerUserId,
+        await tx.insert(auth.schema.sharedFolders).values({
+          folderId,
+          name,
+          ownerUserId,
+        });
+        await tx.insert(auth.schema.nodes).values({
+          nodeId: rootNodeId,
+          folderId,
+          parentId: null,
+          name: "",
+          type: "folder",
+          serverSeq: 0,
+        });
+        await tx.insert(auth.schema.folderGrants).values({
+          grantId,
+          folderId,
+          scopeNodeId: rootNodeId,
+          userId: ownerUserId,
+          deviceId: null,
+          role: "owner",
+          canRead: true,
+          canWrite: true,
+        });
       });
-      await tx.insert(auth.schema.nodes).values({
-        nodeId: rootNodeId,
-        folderId,
-        parentId: null,
-        name: "",
-        type: "folder",
-        serverSeq: 0,
-      });
-      await tx.insert(auth.schema.folderGrants).values({
-        grantId,
-        folderId,
-        scopeNodeId: rootNodeId,
-        userId: ownerUserId,
-        deviceId: null,
-        role: "owner",
-        canRead: true,
-        canWrite: true,
-      });
-      });
+    }
+
+    if (onFolderCreated) {
+      try {
+        await onFolderCreated({ folderId, ownerUserId, grantId });
+      } catch (error) {
+        console.error("onFolderCreated hook failed", error);
+      }
     }
 
     return ctx.json({ folder_id: folderId });

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { grant, LifecycleDb, metadataAppFor } from "../../tests/support.js";
 
@@ -34,6 +34,60 @@ describe("folder routes", () => {
 
     expect(response.status).toBe(200);
     expect(db.folderGrants[0]).toMatchObject({ userId: "user-1", deviceId: null, role: "owner" });
+  });
+
+  it("fires onFolderCreated with the new folder, owner, and grant", async () => {
+    const db = new LifecycleDb();
+    const onFolderCreated = vi.fn(async () => undefined);
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" }, { onFolderCreated });
+
+    const response = await app.request("/folders", {
+      method: "POST",
+      body: JSON.stringify({ name: "Projects" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(onFolderCreated).toHaveBeenCalledWith({
+      folderId: db.sharedFolders[0]?.folderId,
+      ownerUserId: "user-1",
+      grantId: db.folderGrants[0]?.grantId,
+    });
+  });
+
+  it("does not fail folder creation when onFolderCreated rejects", async () => {
+    const db = new LifecycleDb();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" }, {
+      onFolderCreated: vi.fn(async () => {
+        throw new Error("link failed");
+      }),
+    });
+
+    const response = await app.request("/folders", {
+      method: "POST",
+      body: JSON.stringify({ name: "Projects" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.sharedFolders).toHaveLength(1);
+    expect(db.folderGrants).toHaveLength(1);
+    expect(consoleError).toHaveBeenCalledWith("onFolderCreated hook failed", expect.any(Error));
+    consoleError.mockRestore();
+  });
+
+  it("keeps no-hook self-hosted folder creation behavior unchanged", async () => {
+    const db = new LifecycleDb();
+    const response = await metadataAppFor(db, { type: "user", userId: "user-1" }).request("/folders", {
+      method: "POST",
+      body: JSON.stringify({ name: "Projects" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.sharedFolders).toHaveLength(1);
+    expect(db.folderGrants).toHaveLength(1);
   });
 
   it("rejects agent devices when creating folders", async () => {

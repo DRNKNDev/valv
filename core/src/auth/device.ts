@@ -10,7 +10,12 @@ import {
   sha256Hex,
 } from "./index.js";
 
-export function createDeviceAuthRouter(auth: CoreAuth): Hono<{ Variables: AuthVariables }> {
+export type DeviceAuthRouterOptions = {
+  checkPlan?: (userId: string) => Promise<{ allowed: boolean; status?: string } | null>;
+  onDeviceCreated?: (info: { deviceId: string; userId: string }) => Promise<void>;
+};
+
+export function createDeviceAuthRouter(auth: CoreAuth, opts: DeviceAuthRouterOptions = {}): Hono<{ Variables: AuthVariables }> {
   const router = new Hono<{ Variables: AuthVariables }>();
   router.use("*", createAuthMiddleware(auth));
 
@@ -25,12 +30,25 @@ export function createDeviceAuthRouter(auth: CoreAuth): Hono<{ Variables: AuthVa
     const deviceId = randomUUID();
     const token = generateDeviceToken();
 
+    const plan = opts.checkPlan ? await opts.checkPlan(principal.userId) : null;
+    if (plan?.allowed === false) {
+      return ctx.json({ error: "subscription_inactive", status: plan.status }, 402);
+    }
+
     await auth.db.insert(auth.schema.devices).values({
       deviceId,
       userId: principal.userId,
       name,
       tokenHash: sha256Hex(token),
     });
+
+    if (opts.onDeviceCreated) {
+      try {
+        await opts.onDeviceCreated({ deviceId, userId: principal.userId });
+      } catch (error) {
+        console.error("onDeviceCreated hook failed", error);
+      }
+    }
 
     return ctx.json({ device_id: deviceId, token });
   });
