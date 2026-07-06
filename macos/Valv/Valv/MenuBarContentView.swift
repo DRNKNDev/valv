@@ -1,27 +1,34 @@
 import DaemonKit
 import SwiftUI
 
-/// Mimics a native `NSMenuItem`'s appearance for action rows in this custom
-/// `.menuBarExtraStyle(.window)` popover: full width, no button chrome, and a
-/// hover highlight in the real system menu-selection color - `NSColor
-/// .selectedMenuItemColor` is the actual AppKit color semantically meant for this
-/// ("the color to use for the face of selected menu items"), not a guessed value.
-/// Deliberately not `.menuBarExtraStyle(.menu)` (a real native `NSMenu`) - that style
-/// is documented to ignore custom shapes/views (the colored status `Circle()`s,
-/// `MountRow`'s two-line layout) and would force `ManageFoldersWindow`'s `.sheet()`
-/// to become a standalone window, none of which this pass is trying to change.
+/// Mimics a native `NSMenuItem` inside `.menuBarExtraStyle(.window)`: full-width,
+/// borderless rows with an inset menu-selection highlight.
 private struct MenuItemButtonStyle: ButtonStyle {
     @State private var isHovering = false
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 10)
             .padding(.vertical, 4)
-            .foregroundStyle(isHovering ? Color.white : Color.primary)
-            .background(isHovering ? Color(nsColor: .selectedMenuItemColor) : Color.clear)
+            .foregroundStyle(isHovering ? Color(nsColor: .selectedMenuItemTextColor) : Color.primary)
+            .background {
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(isHovering ? Color(nsColor: .selectedMenuItemColor) : Color.clear)
+            }
+            .padding(.horizontal, 4)
             .contentShape(Rectangle())
             .onHover { isHovering = $0 }
+    }
+}
+
+private struct StatusBadge: View {
+    let color: Color
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: 8, height: 8)
     }
 }
 
@@ -29,14 +36,8 @@ struct MenuBarContentView: View {
     @EnvironmentObject private var store: DaemonStore
     @EnvironmentObject private var daemonManager: DaemonManager
     @EnvironmentObject private var domainManager: FileProviderDomainManager
-    @State private var showManageFolders = false
-    // A real `Menu` doesn't propagate outer SwiftUI frame sizing to its actual
-    // clickable/hoverable region on macOS - `.menuStyle(.borderlessButton)` plus
-    // `.frame(maxWidth: .infinity)` still renders and hit-tests at the label's
-    // intrinsic content size, not full row width, unlike a plain `Button`. "Add
-    // Folder" is a `Button` that expands its three choices inline instead, so it
-    // gets the exact same `MenuItemButtonStyle` treatment as every other row.
-    @State private var showAddFolderOptions = false
+    @State private var isConfirmingSignOut = false
+    @State private var signOutError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -48,9 +49,13 @@ struct MenuBarContentView: View {
         }
         .padding(.vertical, 6)
         .frame(width: 320)
-        .sheet(isPresented: $showManageFolders) {
-            ManageFoldersWindow()
-                .environmentObject(store)
+        .alert("Sign out of Valv?", isPresented: $isConfirmingSignOut) {
+            Button("Sign Out", role: .destructive) {
+                Task { await signOut() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Syncing stops on this Mac. Files already synced here stay in place, and your other devices and collaborators are unaffected.")
         }
         .task {
             store.startPolling()
@@ -61,7 +66,7 @@ struct MenuBarContentView: View {
 
     private var notSignedInContent: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Button("Sign In…") {
+            Button("Sign In...") {
                 OnboardingWindowController.shared.present(
                     store: store,
                     daemonManager: daemonManager,
@@ -78,7 +83,7 @@ struct MenuBarContentView: View {
 
     private var signedInContent: some View {
         VStack(alignment: .leading, spacing: 4) {
-            summaryLine
+            summarySection
                 .padding(.horizontal, 14)
 
             if store.hasLapsedPlan {
@@ -89,17 +94,21 @@ struct MenuBarContentView: View {
 
             if let status = store.status, !status.mounts.isEmpty {
                 Divider()
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(status.mounts, id: \.folderId) { mount in
-                        MountRow(mount: mount)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(status.mounts, id: \.folderId) { mount in
+                            MountRow(mount: mount)
+                        }
                     }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 2)
                 }
-                .padding(.horizontal, 14)
+                .frame(maxHeight: 320)
             }
 
             Divider()
 
-            Button(store.status?.paused == true ? "Resume" : "Pause") {
+            Button(store.status?.paused == true ? "Resume Syncing" : "Pause Syncing") {
                 Task {
                     if store.status?.paused == true {
                         await store.resume()
@@ -115,56 +124,28 @@ struct MenuBarContentView: View {
             }
             .buttonStyle(MenuItemButtonStyle())
 
+            if store.isDisconnected {
+                Button("Retry") {
+                    Task { await store.refresh() }
+                }
+                .buttonStyle(MenuItemButtonStyle())
+            }
+
             Divider()
 
-            Button {
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    showAddFolderOptions.toggle()
-                }
-            } label: {
-                HStack {
-                    Text("Add Folder")
-                    Spacer()
-                    Image(systemName: showAddFolderOptions ? "chevron.down" : "chevron.right")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .buttonStyle(MenuItemButtonStyle())
-
-            if showAddFolderOptions {
-                Button("Create a New Synced Folder…") {
-                    showAddFolderOptions = false
-                    addNewFolder()
-                }
-                .buttonStyle(MenuItemButtonStyle())
-
-                Button("Mount Existing Folder by ID…") {
-                    showAddFolderOptions = false
-                    pickDirectoryThenPrompt(fieldLabel: "Folder ID") { path, folderId in
-                        MountRequest(path: path, folderId: folderId)
-                    }
-                }
-                .buttonStyle(MenuItemButtonStyle())
-
-                Button("Mount from Invite/Grant Token…") {
-                    showAddFolderOptions = false
-                    pickDirectoryThenPrompt(fieldLabel: "Grant Token") { path, token in
-                        MountRequest(path: path, grantToken: token)
-                    }
-                }
-                .buttonStyle(MenuItemButtonStyle())
-            }
-
-            Button("Manage Folders & Sharing…") {
-                showManageFolders = true
+            Button("Manage Folders & Sharing...") {
+                ManageFoldersWindowController.shared.present(
+                    store: store,
+                    domainManager: domainManager
+                )
             }
             .buttonStyle(MenuItemButtonStyle())
 
             Divider()
 
-            daemonOwnershipLine
-                .padding(.horizontal, 14)
+            accountSection
+
+            Divider()
 
             Button(daemonManager.cliInstallStatus.actionTitle) {
                 Task { await daemonManager.installCLI() }
@@ -172,31 +153,60 @@ struct MenuBarContentView: View {
             .buttonStyle(MenuItemButtonStyle())
             .disabled(!daemonManager.cliInstallStatus.isActionable)
 
+            daemonOwnershipLine
+                .padding(.horizontal, 14)
+
             Divider()
 
             quitSection
         }
     }
 
-    private var summaryLine: some View {
-        HStack {
-            Circle()
-                .fill(color(for: store.iconState))
-                .frame(width: 8, height: 8)
-            Text(summaryText)
-                .font(.subheadline)
+    private var summarySection: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                StatusBadge(color: color(for: store.iconState))
+                Text(summaryText)
+                    .font(.body.weight(.medium))
+            }
+            if let caption = summaryCaption {
+                Text(caption)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
     private var summaryText: String {
+        if store.isDisconnected {
+            return UserFacingError.connectionFailureMessage
+        }
+
         switch store.iconState {
         case .notSetUp: return "Not connected"
         case .error: return "Sync error"
         case .paused: return "Paused"
-        case .syncing: return "Syncing…"
+        case .syncing: return "Syncing..."
         case .synced: return "Up to date"
         }
     }
+
+    private var summaryCaption: String? {
+        if store.isDisconnected {
+            guard let lastSuccessAt = store.lastSuccessAt else {
+                return "No successful connection yet"
+            }
+            return "Last connected \(Self.relativeFormatter.localizedString(for: lastSuccessAt, relativeTo: Date()))"
+        }
+        guard let lastSuccessAt = store.lastSuccessAt else { return nil }
+        return "Last checked \(Self.relativeFormatter.localizedString(for: lastSuccessAt, relativeTo: Date()))"
+    }
+
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter
+    }()
 
     private func color(for state: IconState) -> Color {
         switch state {
@@ -234,6 +244,25 @@ struct MenuBarContentView: View {
         NSWorkspace.shared.open(url)
     }
 
+    private var accountSection: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(store.status?.account?.email ?? "Signed in")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 14)
+            Button("Sign Out...") {
+                isConfirmingSignOut = true
+            }
+            .buttonStyle(MenuItemButtonStyle())
+            if let signOutError {
+                Text(signOutError)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 14)
+            }
+        }
+    }
+
     private var daemonOwnershipLine: some View {
         Group {
             if let version = store.status?.version {
@@ -263,52 +292,14 @@ struct MenuBarContentView: View {
         }
     }
 
-    private func addNewFolder() {
-        Task {
-            guard let url = pickDirectory() else { return }
-            _ = try? await store.mount(MountRequest(path: url.path))
-            await domainManager.signalRootEnumerator()
+    private func signOut() async {
+        do {
+            try await store.signOut(domainManager: domainManager)
+            signOutError = nil
+        } catch {
+            NSLog("Sign out failed: %@", error.localizedDescription)
+            signOutError = UserFacingError(from: error).message
         }
-    }
-
-    /// Shared by the "mount existing folder by ID" and "mount from grant token" cases -
-    /// both need a local directory to mount at, exactly like `valv-cli mount <path>`
-    /// does, plus one text value (folder ID or grant token respectively).
-    private func pickDirectoryThenPrompt(fieldLabel: String, makeRequest: @escaping (String, String) -> MountRequest) {
-        Task {
-            guard let url = pickDirectory() else { return }
-            guard let value = promptForText(title: fieldLabel, message: "Enter the \(fieldLabel.lowercased()) to mount at \(url.path):") else {
-                return
-            }
-            _ = try? await store.mount(makeRequest(url.path, value))
-            await domainManager.signalRootEnumerator()
-        }
-    }
-
-    private func pickDirectory() -> URL? {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Select"
-        guard panel.runModal() == .OK else { return nil }
-        return panel.url
-    }
-
-    private func promptForText(title: String, message: String) -> String? {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.addButton(withTitle: "Mount")
-        alert.addButton(withTitle: "Cancel")
-
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        alert.accessoryView = field
-        alert.window.initialFirstResponder = field
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? nil : value
     }
 }
 
@@ -316,30 +307,59 @@ private struct MountRow: View {
     let mount: MountStatus
 
     var body: some View {
-        HStack {
-            Circle()
-                .fill(mount.error != nil ? Color.red : (mount.syncing ? Color.blue : Color.green))
-                .frame(width: 6, height: 6)
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 4) {
-                    Text(mount.name.isEmpty ? mount.path : mount.name)
-                        .font(.subheadline)
-                    if !mount.canWrite {
-                        Text("Read Only")
+        Button {
+            NSWorkspace.shared.open(URL(fileURLWithPath: mount.path))
+        } label: {
+            HStack(alignment: .top) {
+                StatusBadge(color: statusColor)
+                    .padding(.top, 5)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 4) {
+                        Text(displayName)
+                            .font(.subheadline)
+                            .lineLimit(1)
+                        if !mount.canWrite {
+                            Text("Read Only")
+                                .font(.caption2)
+                                .padding(.horizontal, 4)
+                                .background(Color.secondary.opacity(0.2))
+                                .clipShape(Capsule())
+                        }
+                    }
+                    Text(mount.path)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if let error = mount.error {
+                        Text(error)
                             .font(.caption2)
-                            .padding(.horizontal, 4)
-                            .background(Color.secondary.opacity(0.2))
-                            .clipShape(Capsule())
+                            .foregroundStyle(.red)
+                            .lineLimit(1)
                     }
                 }
-                Text(mount.path)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                Spacer(minLength: 0)
             }
-            Spacer()
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .accessibilityLabel(displayName)
+        .accessibilityValue("\(displayName), \(statusDescription)")
         .help(mount.error ?? "")
+    }
+
+    private var displayName: String {
+        mount.name.isEmpty ? mount.path : mount.name
+    }
+
+    private var statusColor: Color {
+        if mount.error != nil { return .red }
+        return mount.syncing ? .blue : .green
+    }
+
+    private var statusDescription: String {
+        if mount.error != nil { return "Sync error" }
+        if mount.syncing { return "Syncing" }
+        return "Up to date"
     }
 }
