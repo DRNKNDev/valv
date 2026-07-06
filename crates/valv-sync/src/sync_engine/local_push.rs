@@ -1,12 +1,12 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use anyhow::{anyhow, Result};
-use chrono::{Local, Utc};
+use chrono::Local;
 use rusqlite::{params, Connection};
 use sha2::Digest;
 use tokio::sync::Mutex;
@@ -57,6 +57,7 @@ pub async fn push_local(
 
     let mut summary = PushSummary::default();
     let mut queue = VecDeque::<(PathBuf, String)>::new();
+    let mut deferred_delete_node_ids = HashSet::<String>::new();
     queue.push_back((mount_root.to_path_buf(), seed_parent_id));
 
     while let Some((dir_path, parent_node_id)) = queue.pop_front() {
@@ -141,6 +142,7 @@ pub async fn push_local(
                     if process_moved_entry(
                         &mut summary,
                         &mut queue,
+                        &mut deferred_delete_node_ids,
                         MovedEntry {
                             mount_root,
                             scope_node_id,
@@ -198,6 +200,7 @@ pub async fn push_local(
                     if process_moved_entry(
                         &mut summary,
                         &mut queue,
+                        &mut deferred_delete_node_ids,
                         MovedEntry {
                             mount_root,
                             scope_node_id,
@@ -249,6 +252,7 @@ pub async fn push_local(
         mount_root,
         folder_id,
         scope_node_id,
+        &deferred_delete_node_ids,
         db,
         client,
         backend_url,
@@ -276,6 +280,7 @@ struct MovedEntry<'a> {
 async fn process_moved_entry(
     summary: &mut PushSummary,
     queue: &mut VecDeque<(PathBuf, String)>,
+    deferred_delete_node_ids: &mut HashSet<String>,
     entry: MovedEntry<'_>,
 ) -> Result<bool> {
     let local_node_type = node_type_str(&entry.node_type).to_owned();
@@ -297,7 +302,7 @@ async fn process_moved_entry(
     };
 
     if node.parent_id.as_deref() != Some(entry.parent_node_id) {
-        let response = submit_op(
+        let response = match submit_op(
             entry.client,
             entry.backend_url,
             entry.token,
@@ -310,7 +315,19 @@ async fn process_moved_entry(
                 },
             },
         )
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                eprintln!(
+                    "push_local: failed to submit move for {}: {error}",
+                    entry.abs_path.display()
+                );
+                summary.errors += 1;
+                deferred_delete_node_ids.insert(node.node_id);
+                return Ok(true);
+            }
+        };
         let SubmitOpResponse::Applied { server_seq, .. } = response else {
             summary.skipped += 1;
             return Ok(true);
@@ -320,7 +337,7 @@ async fn process_moved_entry(
     }
 
     if node.name != entry.name {
-        let response = submit_op(
+        let response = match submit_op(
             entry.client,
             entry.backend_url,
             entry.token,
@@ -333,7 +350,21 @@ async fn process_moved_entry(
                 },
             },
         )
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let conn = entry.db.lock().await;
+                nodes::upsert_node(&conn, &node)?;
+                eprintln!(
+                    "push_local: failed to submit rename for {}: {error}",
+                    entry.abs_path.display()
+                );
+                summary.errors += 1;
+                deferred_delete_node_ids.insert(node.node_id);
+                return Ok(true);
+            }
+        };
         let SubmitOpResponse::Applied { server_seq, .. } = response else {
             summary.skipped += 1;
             return Ok(true);
@@ -442,6 +473,7 @@ async fn submit_deletes_for_missing(
     mount_root: &Path,
     folder_id: &str,
     scope_node_id: Option<&str>,
+    deferred_delete_node_ids: &HashSet<String>,
     db: &Arc<Mutex<Connection>>,
     client: &reqwest::Client,
     backend_url: &str,
@@ -496,6 +528,9 @@ async fn submit_deletes_for_missing(
         };
         for idx in child_indices {
             let node = &nodes[idx];
+            if deferred_delete_node_ids.contains(&node.node_id) {
+                continue;
+            }
             let parent_path = paths[&parent_id].clone();
             let path = parent_path.join(&node.name);
             paths.insert(node.node_id.clone(), path.clone());
@@ -530,10 +565,7 @@ async fn submit_deletes_for_missing(
             match submit_op(client, backend_url, token, folder_id, &req).await {
                 Ok(SubmitOpResponse::Applied { server_seq, .. }) => {
                     let conn = db.lock().await;
-                    conn.execute(
-                        "UPDATE nodes SET deleted_at = ?1, server_seq = ?2 WHERE node_id = ?3",
-                        params![Utc::now().to_rfc3339(), server_seq, node.node_id],
-                    )?;
+                    nodes::mark_deleted(&conn, &node.node_id, server_seq)?;
                     summary.creates_submitted += 1;
                 }
                 Ok(SubmitOpResponse::Superseded { .. } | SubmitOpResponse::ConflictCopy { .. }) => {
@@ -1588,6 +1620,252 @@ mod tests {
         assert!(node(&db, "nested-file").await.deleted_at.is_some());
     }
 
+    #[tokio::test]
+    async fn push_local_move_500_continues_without_create_and_runs_delete_sweep() {
+        run_failed_move_submission(MockOp::Error).await;
+    }
+
+    #[tokio::test]
+    async fn push_local_move_transport_error_continues_without_create_and_runs_delete_sweep() {
+        run_failed_move_submission(MockOp::TransportError).await;
+    }
+
+    async fn run_failed_move_submission(failure: MockOp) {
+        let dir = tempfile::tempdir().unwrap();
+        let old_parent = dir.path().join("old-parent");
+        let new_parent = dir.path().join("new-parent");
+        fs::create_dir(&old_parent).unwrap();
+        fs::create_dir(&new_parent).unwrap();
+        fs::write(new_parent.join("moved.txt"), b"").unwrap();
+        fs::write(new_parent.join("other.txt"), b"").unwrap();
+
+        let db = seeded_db();
+        seed_folder(&db, "old-parent-node", "root-node", "old-parent", 2).await;
+        seed_folder(&db, "new-parent-node", "root-node", "new-parent", 3).await;
+        seed_file_with_version_under(
+            &db,
+            "moved-node",
+            "old-parent-node",
+            "moved.txt",
+            "moved-version",
+            0,
+            4,
+        )
+        .await;
+        seed_file_with_version_under(
+            &db,
+            "delete-node",
+            "root-node",
+            "delete-me.txt",
+            "delete-version",
+            0,
+            5,
+        )
+        .await;
+        let (backend_url, server) = local_push_server(vec![
+            failure,
+            MockOp::Applied {
+                node_id: "other-node".into(),
+                server_seq: 6,
+            },
+            MockOp::Applied {
+                node_id: "other-version".into(),
+                server_seq: 7,
+            },
+            MockOp::Applied {
+                node_id: "delete-node".into(),
+                server_seq: 8,
+            },
+        ])
+        .await;
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(summary.errors, 1);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["op_type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["move", "create", "new_version", "delete"]
+        );
+        assert!(
+            requests.iter().all(|request| {
+                request["op_type"] != "create" || request["payload"]["name"] != "moved.txt"
+            }),
+            "failed move entry must not fall through to Create"
+        );
+        assert_eq!(
+            node(&db, "moved-node").await.parent_id.as_deref(),
+            Some("old-parent-node")
+        );
+        assert!(node(&db, "moved-node").await.deleted_at.is_none());
+        assert!(node(&db, "delete-node").await.deleted_at.is_some());
+        assert_eq!(
+            node(&db, "other-node").await.parent_id.as_deref(),
+            Some("new-parent-node")
+        );
+    }
+
+    #[tokio::test]
+    async fn push_local_retries_failed_move_candidate_with_strict_name_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_parent = dir.path().join("old-parent");
+        let new_parent = dir.path().join("new-parent");
+        fs::create_dir(&old_parent).unwrap();
+        fs::create_dir(&new_parent).unwrap();
+        fs::write(new_parent.join("moved.txt"), b"").unwrap();
+
+        let db = seeded_db();
+        seed_folder(&db, "old-parent-node", "root-node", "old-parent", 2).await;
+        seed_folder(&db, "new-parent-node", "root-node", "new-parent", 3).await;
+        seed_file_with_version_under(
+            &db,
+            "moved-node",
+            "old-parent-node",
+            "moved.txt",
+            "moved-version",
+            0,
+            4,
+        )
+        .await;
+        let (backend_url, server) = local_push_server(vec![MockOp::Error]).await;
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        let first_requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let moved = node(&db, "moved-node").await;
+
+        assert_eq!(summary.errors, 1);
+        assert_eq!(first_requests.len(), 1);
+        assert_eq!(first_requests[0]["op_type"], "move");
+        assert_eq!(first_requests[0]["based_on_seq"], 4);
+        assert_eq!(moved.parent_id.as_deref(), Some("old-parent-node"));
+        assert_eq!(moved.name, "moved.txt");
+        assert_eq!(moved.server_seq, 4);
+        assert!(moved.deleted_at.is_none());
+
+        let (backend_url, server) = local_push_server(vec![MockOp::Applied {
+            node_id: "moved-node".into(),
+            server_seq: 11,
+        }])
+        .await;
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        let second_requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let moved = node(&db, "moved-node").await;
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(second_requests.len(), 1);
+        assert_eq!(second_requests[0]["op_type"], "move");
+        assert_eq!(second_requests[0]["based_on_seq"], 4);
+        assert_eq!(moved.parent_id.as_deref(), Some("new-parent-node"));
+        assert_eq!(moved.name, "moved.txt");
+        assert_eq!(moved.server_seq, 11);
+    }
+
+    #[tokio::test]
+    async fn push_local_unrelated_delete_and_create_do_not_false_detect_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_folder = dir.path().join("other-folder");
+        fs::create_dir(&other_folder).unwrap();
+        fs::write(other_folder.join("bar.txt"), b"").unwrap();
+
+        let db = seeded_db();
+        seed_folder(&db, "other-folder-node", "root-node", "other-folder", 2).await;
+        seed_file_with_version_under(&db, "foo-node", "root-node", "foo.txt", "foo-version", 0, 3)
+            .await;
+        let (backend_url, server) = local_push_server(vec![
+            MockOp::Applied {
+                node_id: "bar-node".into(),
+                server_seq: 4,
+            },
+            MockOp::Applied {
+                node_id: "bar-version".into(),
+                server_seq: 5,
+            },
+            MockOp::Applied {
+                node_id: "foo-node".into(),
+                server_seq: 6,
+            },
+        ])
+        .await;
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(summary.errors, 0);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["op_type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["create", "new_version", "delete"]
+        );
+        assert_eq!(requests[0]["payload"]["name"], "bar.txt");
+        assert_eq!(requests[0]["payload"]["parent_id"], "other-folder-node");
+        assert_eq!(requests[2]["node_id"], "foo-node");
+        assert!(node(&db, "foo-node").await.deleted_at.is_some());
+        let bar = node(&db, "bar-node").await;
+        assert_eq!(bar.parent_id.as_deref(), Some("other-folder-node"));
+        assert_eq!(bar.name, "bar.txt");
+    }
+
     fn seeded_db() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(schema_sql()).unwrap();
@@ -1750,6 +2028,7 @@ mod tests {
         Applied { node_id: String, server_seq: i64 },
         Superseded,
         Error,
+        TransportError,
     }
 
     async fn local_push_server(ops: Vec<MockOp>) -> (String, JoinHandle<Vec<serde_json::Value>>) {
@@ -1791,6 +2070,7 @@ mod tests {
                         MockOp::Error => {
                             write_response(&mut stream, "500 Internal Server Error", b"{}").await;
                         }
+                        MockOp::TransportError => {}
                     }
                 } else {
                     write_response(&mut stream, "404 Not Found", b"").await;
