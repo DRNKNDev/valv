@@ -10,9 +10,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::{
-    http::StatusCode,
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use clap::{Parser, Subcommand};
 use hyper_util::{
@@ -21,13 +20,13 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use rusqlite::Connection;
-use serde::Serialize;
 use tokio::{
     net::{TcpListener, UnixListener},
     signal,
     sync::{Mutex, Notify},
     task::JoinHandle,
 };
+use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 use valv_sync::{
     persistence::{mounts as mount_store, open_db},
     protocol::ipc::MountStatus,
@@ -35,6 +34,7 @@ use valv_sync::{
 
 mod config;
 mod control;
+mod error;
 mod fp;
 #[cfg(target_os = "macos")]
 mod launchd;
@@ -116,6 +116,7 @@ struct MountState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
     match Cli::parse().command {
         Command::Run => run().await,
         Command::Daemon { command } => match command {
@@ -125,8 +126,16 @@ async fn main() -> Result<()> {
     }
 }
 
+fn init_tracing() {
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
 async fn run() -> Result<()> {
-    let config = load_config(&config_path()?)?;
+    let config_file = config_path()?;
+    let config = load_config(&config_file)?;
     let db_path = data_dir()?.join("sync.db");
     let conn = open_db(&db_path)?;
     merge_config_mounts(&conn, &config.mounts)?;
@@ -147,7 +156,8 @@ async fn run() -> Result<()> {
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let mount_count = mount_states.len();
     let state = DaemonState {
         paused: Arc::new(AtomicBool::new(false)),
         fs_events_paused: Arc::new(AtomicBool::new(false)),
@@ -159,10 +169,15 @@ async fn run() -> Result<()> {
     };
     spawn_mount_tasks(&state).await;
 
-    serve_socket(state, &socket_path()?).await
+    serve_socket(state, &socket_path()?, &config_file, mount_count).await
 }
 
-async fn serve_socket(state: DaemonState, socket_path: &Path) -> Result<()> {
+async fn serve_socket(
+    state: DaemonState,
+    socket_path: &Path,
+    config_path: &Path,
+    mount_count: usize,
+) -> Result<()> {
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -175,7 +190,16 @@ async fn serve_socket(state: DaemonState, socket_path: &Path) -> Result<()> {
     let tcp_listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .context("bind daemon TCP loopback listener")?;
-    write_tcp_port_file(tcp_listener.local_addr()?.port())?;
+    let tcp_addr = tcp_listener.local_addr()?;
+    write_tcp_port_file(tcp_addr.port())?;
+
+    tracing::info!(
+        socket_path = %socket_path.display(),
+        tcp_bind_addr = %tcp_addr,
+        config_path = %config_path.display(),
+        mount_count,
+        "valvd startup summary"
+    );
 
     let app = build_router(state.clone());
 
@@ -202,7 +226,10 @@ fn build_router(state: DaemonState) -> Router {
     Router::new()
         .route("/status", get(control::get_status))
         .route("/mounts", get(control::get_mounts))
-        .route("/mount", post(mounts::post_mount).delete(mounts::delete_mount_route))
+        .route(
+            "/mount",
+            post(mounts::post_mount).delete(mounts::delete_mount_route),
+        )
         .route("/pause", post(control::post_pause))
         .route("/resume", post(control::post_resume))
         .route("/sync", post(tasks::post_sync))
@@ -229,12 +256,20 @@ fn write_tcp_port_file(port: u16) -> Result<()> {
     let path = tcp_port_file_path()?;
     if let Some(parent) = path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
-            eprintln!("warning: could not create {}: {err}", parent.display());
+            tracing::warn!(
+                path = %parent.display(),
+                error = %err,
+                "could not create TCP port file parent directory"
+            );
             return Ok(());
         }
     }
     if let Err(err) = fs::write(&path, port.to_string()) {
-        eprintln!("warning: could not write {}: {err}", path.display());
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "could not write TCP port file"
+        );
     }
     Ok(())
 }
@@ -249,8 +284,10 @@ async fn accept_loop_unix(listener: UnixListener, app: Router) -> Result<()> {
                 .serve_connection(io, service)
                 .await
             {
-                if !err.to_string().contains("shutting down") {
-                    eprintln!("daemon socket connection failed: {err}");
+                if err.to_string().contains("shutting down") {
+                    tracing::debug!(error = %err, "daemon socket connection shutting down");
+                } else {
+                    tracing::warn!(error = %err, "daemon socket connection failed");
                 }
             }
         });
@@ -267,8 +304,10 @@ async fn accept_loop_tcp(listener: TcpListener, app: Router) -> Result<()> {
                 .serve_connection(io, service)
                 .await
             {
-                if !err.to_string().contains("shutting down") {
-                    eprintln!("daemon TCP connection failed: {err}");
+                if err.to_string().contains("shutting down") {
+                    tracing::debug!(error = %err, "daemon TCP connection shutting down");
+                } else {
+                    tracing::warn!(error = %err, "daemon TCP connection failed");
                 }
             }
         });
@@ -310,26 +349,6 @@ impl MountState {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct ErrorResponse {
-    error: String,
-}
-
-impl ErrorResponse {
-    pub(crate) fn new(error: impl Into<String>) -> Self {
-        Self {
-            error: error.into(),
-        }
-    }
-}
-
-pub(crate) fn internal_error(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse::new(error.to_string())),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -338,10 +357,8 @@ mod tests {
 
     fn test_state() -> DaemonState {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!(
-            "../../valv-sync/src/persistence/schema.sql"
-        ))
-        .unwrap();
+        conn.execute_batch(include_str!("../../valv-sync/src/persistence/schema.sql"))
+            .unwrap();
         DaemonState {
             paused: Arc::new(AtomicBool::new(false)),
             fs_events_paused: Arc::new(AtomicBool::new(false)),
@@ -392,9 +409,7 @@ mod tests {
         tokio::spawn(accept_loop_unix(unix_listener, app.clone()));
         tokio::spawn(accept_loop_tcp(tcp_listener, app));
 
-        let mut unix_stream = tokio::net::UnixStream::connect(&socket_path)
-            .await
-            .unwrap();
+        let mut unix_stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
         let unix_status = get_status_line(&mut unix_stream).await;
 
         let mut tcp_stream = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
