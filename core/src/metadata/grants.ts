@@ -20,6 +20,7 @@ type GrantRouteStore = {
     canRead: boolean;
     canWrite: boolean;
   }) => Promise<void>;
+  getGrantForRoute?: (grantId: string) => Promise<{ scopeNodeId: string; deviceId: string | null } | undefined>;
   getGrantScopeForRoute?: (grantId: string) => Promise<string | undefined>;
   deleteGrantForRoute?: (grantId: string) => Promise<void>;
 };
@@ -81,20 +82,27 @@ export function registerGrantRoutes(router: Hono<{ Variables: MetadataVariables 
   router.delete("/folders/:id/grants/:grantId", async (ctx) => {
     const principal = requirePrincipal(ctx);
     const grantId = ctx.req.param("grantId");
-    const routeScope = hasGrantRouteStore(auth.db) && auth.db.getGrantScopeForRoute
-      ? await auth.db.getGrantScopeForRoute(grantId)
-      : undefined;
-    const grants = routeScope ? [{ scopeNodeId: routeScope, deviceId: undefined }] : await auth.db
-      .select({ scopeNodeId: auth.schema.folderGrants.scopeNodeId, deviceId: auth.schema.folderGrants.deviceId })
-      .from(auth.schema.folderGrants)
-      .where(eq(auth.schema.folderGrants.grantId, grantId))
-      .limit(1);
+    const routeGrantStore = hasGrantRouteStore(auth.db) ? auth.db : undefined;
+    const hasGrantLoader = routeGrantStore?.getGrantForRoute !== undefined;
+    const routeGrant = hasGrantLoader ? await routeGrantStore.getGrantForRoute?.(grantId) : undefined;
+    if (!hasGrantLoader && routeGrantStore?.getGrantScopeForRoute) {
+      return ctx.json({ error: "incomplete_grant_route_store" }, 500);
+    }
+    const grants = hasGrantLoader
+      ? routeGrant
+        ? [routeGrant]
+        : []
+      : await auth.db
+          .select({ scopeNodeId: auth.schema.folderGrants.scopeNodeId, deviceId: auth.schema.folderGrants.deviceId })
+          .from(auth.schema.folderGrants)
+          .where(eq(auth.schema.folderGrants.grantId, grantId))
+          .limit(1);
     const target = grants[0];
     if (!target) {
       return ctx.json({ error: "grant_not_found" }, 404);
     }
 
-    const grant = await checkGrant(auth.db, target.scopeNodeId, principal, "read", auth.schema);
+    const grant = await checkGrant(auth.db, target.scopeNodeId, principal, "write", auth.schema);
     if (!grant.granted) {
       return ctx.json({ error: grant.reason }, 403);
     }
@@ -103,17 +111,17 @@ export function registerGrantRoutes(router: Hono<{ Variables: MetadataVariables 
       await auth.db.deleteGrantForRoute(grantId);
     } else {
       await auth.db.delete(auth.schema.folderGrants).where(eq(auth.schema.folderGrants.grantId, grantId));
-      if (target.deviceId) {
-        await auth.db
-          .update(auth.schema.devices)
-          .set({ tokenHash: `revoked:${grantId}` })
-          .where(eq(auth.schema.devices.deviceId, target.deviceId));
-      }
+    }
+    if (target.deviceId) {
+      await auth.db
+        .update(auth.schema.devices)
+        .set({ tokenHash: `revoked:${grantId}` })
+        .where(eq(auth.schema.devices.deviceId, target.deviceId));
     }
     return ctx.body(null, 204);
   });
 }
 
 function hasGrantRouteStore(db: CoreAuth["db"]): db is CoreAuth["db"] & GrantRouteStore {
-  return "createAgentGrantForRoute" in db || "getGrantScopeForRoute" in db || "deleteGrantForRoute" in db;
+  return "createAgentGrantForRoute" in db || "getGrantForRoute" in db || "getGrantScopeForRoute" in db || "deleteGrantForRoute" in db;
 }

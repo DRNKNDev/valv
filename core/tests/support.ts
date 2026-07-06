@@ -29,8 +29,22 @@ export type FolderInvite = {
 
 export class LifecycleDb implements CoreDb {
   insert: CoreDb["insert"];
-  update: CoreDb["update"];
-  delete: CoreDb["delete"];
+  update: CoreDb["update"] = () => ({
+    set: (values: Partial<{ tokenHash: string }>) => ({
+      where: async () => {
+        if (values.tokenHash !== undefined) {
+          for (const device of this.devices) {
+            device.tokenHash = values.tokenHash;
+          }
+        }
+      },
+    }),
+  });
+  delete: CoreDb["delete"] = () => ({
+    where: async () => {
+      this.folderGrants = [];
+    },
+  });
   execute: CoreDb["execute"];
   sharedFolders: Array<{ folderId: string; name: string; ownerUserId: string }> = [];
   nodes: Array<{ nodeId: string; folderId: string; parentId: string | null; name: string; type: string }> = [
@@ -42,20 +56,43 @@ export class LifecycleDb implements CoreDb {
   devices: Array<{ deviceId: string; userId: string | null; name: string; tokenHash: string }> = [];
   users: Array<{ id: string; email: string }> = [];
   authorizedScopes = new Set<string>();
+  private authorizedScopeCapabilities = new Map<string, { canRead: boolean; canWrite: boolean }>();
   private devicePrincipalId?: string;
+
+  authorizeScope(scopeNodeId: string, opts: { canRead?: boolean; canWrite?: boolean } = {}): void {
+    this.authorizedScopes.add(scopeNodeId);
+    this.authorizedScopeCapabilities.set(scopeNodeId, {
+      canRead: opts.canRead ?? true,
+      canWrite: opts.canWrite ?? true,
+    });
+  }
 
   setDevicePrincipal(deviceId: string): void {
     this.devicePrincipalId = deviceId;
   }
 
-  select(): any {
+  select(selection?: Record<string, unknown>): any {
     return {
       from: () => ({
         where: () => ({
-          limit: async () => (this.devicePrincipalId ? [{ deviceId: this.devicePrincipalId }] : []),
+          limit: async () => this.selectRows(selection),
         }),
       }),
     };
+  }
+
+  private selectRows(selection?: Record<string, unknown>): unknown[] {
+    const keys = Object.keys(selection ?? {});
+    if (keys.includes("scopeNodeId")) {
+      return this.folderGrants.map((item) => ({ scopeNodeId: item.scopeNodeId, deviceId: item.deviceId }));
+    }
+    if (keys.includes("userId")) {
+      return this.devices.map((item) => ({ userId: item.userId }));
+    }
+    if (keys.includes("name")) {
+      return this.sharedFolders.map((item) => ({ name: item.name }));
+    }
+    return this.devicePrincipalId ? [{ deviceId: this.devicePrincipalId }] : [];
   }
 
   async getFolderRootForAuthz(folderId: string): Promise<string | undefined> {
@@ -73,7 +110,8 @@ export class LifecycleDb implements CoreDb {
     principal: Principal;
   }): Promise<{ grantId: string; scopeNodeId: string; canRead: boolean; canWrite: boolean } | undefined> {
     if (this.authorizedScopes.has(opts.scopeNodeId)) {
-      return { grantId: "grant-authz", scopeNodeId: opts.scopeNodeId, canRead: true, canWrite: true };
+      const capability = this.authorizedScopeCapabilities.get(opts.scopeNodeId) ?? { canRead: true, canWrite: true };
+      return { grantId: "grant-authz", scopeNodeId: opts.scopeNodeId, ...capability };
     }
     const deviceUserId = opts.principal.type === "device" ? await this.getDeviceUserIdForAuthz(opts.principal.deviceId) : undefined;
     return this.folderGrants.find((grant) => {
@@ -192,6 +230,11 @@ export class LifecycleDb implements CoreDb {
 
   async getGrantScopeForRoute(grantId: string): Promise<string | undefined> {
     return this.folderGrants.find((item) => item.grantId === grantId)?.scopeNodeId;
+  }
+
+  async getGrantForRoute(grantId: string): Promise<{ scopeNodeId: string; deviceId: string | null } | undefined> {
+    const grantRow = this.folderGrants.find((item) => item.grantId === grantId);
+    return grantRow ? { scopeNodeId: grantRow.scopeNodeId, deviceId: grantRow.deviceId } : undefined;
   }
 
   async deleteGrantForRoute(grantId: string): Promise<void> {
