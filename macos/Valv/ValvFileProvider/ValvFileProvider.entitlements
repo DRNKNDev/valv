@@ -5,20 +5,13 @@
 	<key>com.apple.application-identifier</key>
 	<string>$(AppIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
 	<key>com.apple.security.application-groups</key>
 	<array>
 		<string>group.dev.drnkn.valv</string>
 	</array>
-
-	<!-- UNVALIDATED (design.md D3 / task 1.4): exact key/path form for sandboxed
-	     access to ~/.local/share/valv/valvd.sock is unconfirmed against the
-	     current SDK. Build+run ValvFileProvider and confirm a real socket
-	     connection succeeds before relying on this. If it doesn't work, the
-	     documented fallback is a 127.0.0.1 TCP shim advertised via the app
-	     group container instead of a raw Unix domain socket path. -->
-	<key>com.apple.security.temporary-exception.files.absolute-path.read-write</key>
-	<array>
-		<string>~/.local/share/valv/valvd.sock</string>
-	</array>
+	<key>com.apple.security.network.client</key>
+	<true/>
 </dict>
 </plist>

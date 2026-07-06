@@ -10,14 +10,7 @@
 	<array>
 		<string>group.dev.drnkn.valv</string>
 	</array>
-
-	<!-- UNVALIDATED (design.md D3 / task 1.4): same unconfirmed UDS access as
-	     ValvFileProvider.entitlements - ValvFileProviderUI's "Share" action
-	     calls DaemonClient.fpShare(...) directly (design.md D6), so it needs
-	     its own socket access, not a proxy through the other extension. -->
-	<key>com.apple.security.temporary-exception.files.absolute-path.read-write</key>
-	<array>
-		<string>~/.local/share/valv/valvd.sock</string>
-	</array>
+	<key>com.apple.security.network.client</key>
+	<true/>
 </dict>
 </plist>
