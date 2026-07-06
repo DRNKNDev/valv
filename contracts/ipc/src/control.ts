@@ -14,11 +14,20 @@ export interface MountStatus {
   error?: string;
 }
 
+export interface AccountStatus {
+  plan: string | null;
+  status: string;
+  usage_bytes: number;
+  quota_bytes: number | null;
+  current_period_end: string | null;
+}
+
 export interface DaemonStatus {
   paused: boolean;
   backend_connected: boolean;
   version: string;
   mounts: MountStatus[];
+  account?: AccountStatus;
 }
 
 export interface NodePathResponse {

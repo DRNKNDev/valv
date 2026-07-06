@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use axum::{extract::State, Json};
+use axum::{extract::State, http::StatusCode, Json};
 use chrono::Utc;
 use serde::Deserialize;
 use tokio::{
@@ -20,7 +20,7 @@ use valv_sync::{
         versions::{self, upsert_version, LocalVersion},
     },
     protocol::{
-        ipc::{SyncRequest, SyncSummary},
+        ipc::{AccountStatus, SyncRequest, SyncSummary},
         sync::{ChunkRef, WsPushNotification},
     },
     storage::download_chunks,
@@ -32,7 +32,10 @@ use valv_sync::{
     watch::{fs_watch_task, WatchMount},
 };
 
-use crate::{error::DaemonError, DaemonState, MountState};
+use crate::{
+    error::{backend_response_or_error, DaemonError},
+    DaemonState, MountState,
+};
 
 pub(crate) async fn post_sync(
     State(state): State<DaemonState>,
@@ -69,6 +72,83 @@ pub(crate) async fn spawn_mount_tasks(state: &DaemonState) {
     let mounts = state.mounts.lock().await.clone();
     for mount in mounts {
         spawn_tasks_for_mount(state, mount).await;
+    }
+}
+
+pub(crate) fn spawn_account_status_task(state: &DaemonState) -> tokio::task::JoinHandle<()> {
+    let state = state.clone();
+    tokio::spawn(async move {
+        account_status_loop(state).await;
+    })
+}
+
+async fn account_status_loop(state: DaemonState) {
+    let normal_period = Duration::from_secs(5 * 60);
+    let not_found_period = Duration::from_secs(60 * 60);
+    let mut period = normal_period;
+
+    loop {
+        let mut ticker = interval_at(Instant::now() + period, period);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ticker.tick().await;
+
+        let outcome = poll_account_status_once(&state).await;
+        period = if matches!(outcome, AccountPollOutcome::NotFound) {
+            not_found_period
+        } else {
+            normal_period
+        };
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountPollOutcome {
+    Updated,
+    NotFound,
+    Unchanged,
+}
+
+async fn poll_account_status_once(state: &DaemonState) -> AccountPollOutcome {
+    if state.config.backend_url.is_empty() || state.config.device_token.is_empty() {
+        return AccountPollOutcome::Unchanged;
+    }
+
+    let response = state
+        .client
+        .get(format!(
+            "{}/account/usage",
+            valv_sync::api_base(&state.config.backend_url)
+        ))
+        .bearer_auth(&state.config.device_token)
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(error = %error, "account status poll failed");
+            return AccountPollOutcome::Unchanged;
+        }
+    };
+
+    match backend_response_or_error(response).await {
+        Ok(response) => match response.json::<AccountStatus>().await {
+            Ok(account) => {
+                *state.account.lock().await = Some(account);
+                AccountPollOutcome::Updated
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "account status response decode failed");
+                AccountPollOutcome::Unchanged
+            }
+        },
+        Err(DaemonError::Backend { status, .. }) if status == StatusCode::NOT_FOUND => {
+            *state.account.lock().await = None;
+            AccountPollOutcome::NotFound
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "account status poll returned an error");
+            AccountPollOutcome::Unchanged
+        }
     }
 }
 
@@ -945,8 +1025,12 @@ mod tests {
     };
 
     use rusqlite::Connection;
-    use tokio::sync::Mutex;
-    use valv_sync::protocol::ipc::SyncRequest;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::Mutex,
+    };
+    use valv_sync::protocol::ipc::{AccountStatus, SyncRequest};
 
     use crate::config::DaemonConfig;
 
@@ -961,6 +1045,7 @@ mod tests {
             fs_events_paused: Arc::new(AtomicBool::new(false)),
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            account: Arc::new(Mutex::new(None)),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: DaemonConfig {
@@ -971,6 +1056,25 @@ mod tests {
                 mounts: Vec::new(),
             },
         }
+    }
+
+    async fn account_usage_server(status_line: &str, body: &str) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_line = status_line.to_owned();
+        let body = body.to_owned();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 2048];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{addr}")
     }
 
     #[tokio::test]
@@ -994,5 +1098,63 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, DaemonError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn account_status_poll_200_populates_cache() {
+        let mut state = test_state();
+        state.config.backend_url = account_usage_server(
+            "200 OK",
+            r#"{"plan":"Pro","status":"active","usage_bytes":123,"quota_bytes":456,"current_period_end":"2026-07-15T00:00:00Z"}"#,
+        )
+        .await;
+
+        let outcome = poll_account_status_once(&state).await;
+        let account = state.account.lock().await.clone().unwrap();
+
+        assert_eq!(outcome, AccountPollOutcome::Updated);
+        assert_eq!(account.plan.as_deref(), Some("Pro"));
+        assert_eq!(account.status, "active");
+        assert_eq!(account.usage_bytes, 123);
+        assert_eq!(account.quota_bytes, Some(456));
+    }
+
+    #[tokio::test]
+    async fn account_status_poll_404_clears_cache() {
+        let mut state = test_state();
+        *state.account.lock().await = Some(AccountStatus {
+            plan: Some("Pro".to_owned()),
+            status: "active".to_owned(),
+            usage_bytes: 123,
+            quota_bytes: Some(456),
+            current_period_end: None,
+        });
+        state.config.backend_url =
+            account_usage_server("404 Not Found", r#"{"error":"not_found"}"#).await;
+
+        let outcome = poll_account_status_once(&state).await;
+
+        assert_eq!(outcome, AccountPollOutcome::NotFound);
+        assert!(state.account.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn account_status_poll_5xx_preserves_cache() {
+        let mut state = test_state();
+        let previous = AccountStatus {
+            plan: Some("Pro".to_owned()),
+            status: "past_due".to_owned(),
+            usage_bytes: 123,
+            quota_bytes: Some(456),
+            current_period_end: None,
+        };
+        *state.account.lock().await = Some(previous.clone());
+        state.config.backend_url =
+            account_usage_server("500 Internal Server Error", r#"{"error":"boom"}"#).await;
+
+        let outcome = poll_account_status_once(&state).await;
+
+        assert_eq!(outcome, AccountPollOutcome::Unchanged);
+        assert_eq!(*state.account.lock().await, Some(previous));
     }
 }

@@ -21,11 +21,22 @@ pub struct MountStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountStatus {
+    pub plan: Option<String>,
+    pub status: String,
+    pub usage_bytes: u64,
+    pub quota_bytes: Option<u64>,
+    pub current_period_end: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub paused: bool,
     pub backend_connected: bool,
     pub version: String,
     pub mounts: Vec<MountStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

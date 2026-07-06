@@ -29,7 +29,7 @@ use tokio::{
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 use valv_sync::{
     persistence::{mounts as mount_store, open_db},
-    protocol::ipc::MountStatus,
+    protocol::ipc::{AccountStatus, MountStatus},
 };
 
 mod config;
@@ -53,7 +53,7 @@ use config::{
 use launchd::{install_daemon, uninstall_daemon};
 #[cfg(target_os = "linux")]
 use systemd::{install_daemon, uninstall_daemon};
-use tasks::{cancel_mount_tasks, spawn_mount_tasks};
+use tasks::{cancel_mount_tasks, spawn_account_status_task, spawn_mount_tasks};
 
 #[derive(Parser)]
 #[command(name = "valvd", about = "Valv sync daemon", version)]
@@ -85,6 +85,7 @@ struct DaemonState {
     // Keyed by mount path so mounting/remounting one folder only cancels and
     // respawns that mount's own tasks instead of every persisted mount's.
     tasks: Arc<Mutex<HashMap<String, Vec<JoinHandle<()>>>>>,
+    account: Arc<Mutex<Option<AccountStatus>>>,
     db: Arc<Mutex<Connection>>,
     client: reqwest::Client,
     config: DaemonConfig,
@@ -163,11 +164,13 @@ async fn run() -> Result<()> {
         fs_events_paused: Arc::new(AtomicBool::new(false)),
         mounts: Arc::new(Mutex::new(mount_states)),
         tasks: Arc::new(Mutex::new(HashMap::new())),
+        account: Arc::new(Mutex::new(None)),
         db: Arc::new(Mutex::new(conn)),
         client: reqwest::Client::new(),
         config,
     };
     spawn_mount_tasks(&state).await;
+    let _account_status_task = spawn_account_status_task(&state);
 
     serve_socket(state, &socket_path()?, &config_file, mount_count).await
 }
@@ -364,6 +367,7 @@ mod tests {
             fs_events_paused: Arc::new(AtomicBool::new(false)),
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            account: Arc::new(Mutex::new(None)),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: DaemonConfig {

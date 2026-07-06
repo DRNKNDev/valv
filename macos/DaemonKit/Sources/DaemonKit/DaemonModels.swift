@@ -38,12 +38,30 @@ public struct DaemonStatus: Codable, Hashable, Sendable {
     public let backendConnected: Bool
     public let version: String
     public let mounts: [MountStatus]
+    public let account: AccountStatus?
 
     enum CodingKeys: String, CodingKey {
         case paused
         case backendConnected = "backend_connected"
         case version
         case mounts
+        case account
+    }
+}
+
+public struct AccountStatus: Codable, Hashable, Sendable {
+    public let plan: String?
+    public let status: String
+    public let usageBytes: Int
+    public let quotaBytes: Int?
+    public let currentPeriodEnd: String?
+
+    enum CodingKeys: String, CodingKey {
+        case plan
+        case status
+        case usageBytes = "usage_bytes"
+        case quotaBytes = "quota_bytes"
+        case currentPeriodEnd = "current_period_end"
     }
 }
 

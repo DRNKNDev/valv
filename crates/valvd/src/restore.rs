@@ -271,6 +271,7 @@ mod tests {
             fs_events_paused: Arc::new(AtomicBool::new(false)),
             mounts: Arc::new(Mutex::new(vec![mount])),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            account: Arc::new(Mutex::new(None)),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: DaemonConfig {

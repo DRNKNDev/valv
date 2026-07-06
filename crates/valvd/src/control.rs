@@ -20,11 +20,13 @@ pub(crate) async fn get_status(
         && !state.config.device_id.is_empty()
         && !state.config.device_token.is_empty()
         && !state.config.device_name.is_empty();
+    let account = state.account.lock().await.clone();
     Ok(Json(DaemonStatus {
         paused: state.paused.load(Ordering::Acquire),
         backend_connected,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         mounts,
+        account,
     }))
 }
 
@@ -79,6 +81,7 @@ mod tests {
             fs_events_paused: Arc::new(AtomicBool::new(false)),
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            account: Arc::new(Mutex::new(None)),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config,

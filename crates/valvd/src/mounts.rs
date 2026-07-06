@@ -420,6 +420,7 @@ mod tests {
             fs_events_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mounts: Arc::new(Mutex::new(mounts)),
             tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            account: Arc::new(Mutex::new(None)),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: crate::DaemonConfig {
