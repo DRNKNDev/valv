@@ -123,6 +123,7 @@ mod tests {
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            backend_health: Arc::new(crate::BackendHealth::default()),
             db: Arc::new(Mutex::new(memory_db())),
             client: reqwest::Client::new(),
             config: DaemonConfig {

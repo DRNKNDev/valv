@@ -272,6 +272,7 @@ mod tests {
             mounts: Arc::new(Mutex::new(vec![mount])),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            backend_health: Arc::new(crate::BackendHealth::default()),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: DaemonConfig {

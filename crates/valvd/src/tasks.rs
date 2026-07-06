@@ -165,6 +165,7 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
     let ws_backend_url = state.config.backend_url.clone();
     let ws_token = token.clone();
     let ws_folder_id = mount.folder_id.clone();
+    let ws_backend_health = state.backend_health.clone();
     let ws_handle = tokio::spawn(async move {
         if let Err(error) = ws_push_loop(
             &ws_backend_url,
@@ -174,6 +175,7 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
         )
         .await
         {
+            ws_backend_health.record_failure();
             tracing::error!(
                 folder_id = %ws_folder_id,
                 error = %error,
@@ -278,6 +280,7 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
     };
     let error = match result {
         Ok((_, pulled)) => {
+            state.backend_health.record_success();
             let was_paused = pause_watchers(state);
             let cleanup_error = cleanup_deleted_mount_paths(state, mount)
                 .await
@@ -290,7 +293,10 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
             resume_watchers_after_debounce(state, was_paused).await;
             apply_error.or(cleanup_error)
         }
-        Err(err) => Some(err.to_string()),
+        Err(err) => {
+            state.backend_health.record_failure();
+            Some(err.to_string())
+        }
     };
     let succeeded = error.is_none();
     end_mount_sync(state, &mount.folder_id, error).await;
@@ -349,6 +355,7 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
     };
     let error = match pull_result {
         Ok((pulled_ops, pulled)) => {
+            state.backend_health.record_success();
             summary.pulled_ops = pulled_ops;
             let was_paused = pause_watchers(state);
             if let Err(error) = apply_pulled_fs_changes(state, mount, pulled).await {
@@ -371,6 +378,7 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
             None
         }
         Err(error) => {
+            state.backend_health.record_failure();
             summary.errors += 1;
             Some(error.to_string())
         }
@@ -1030,7 +1038,13 @@ mod tests {
         net::TcpListener,
         sync::Mutex,
     };
-    use valv_sync::protocol::ipc::{AccountStatus, SyncRequest};
+    use valv_sync::{
+        persistence::{
+            mounts,
+            nodes::{self, LocalNode},
+        },
+        protocol::ipc::{AccountStatus, SyncRequest},
+    };
 
     use crate::config::DaemonConfig;
 
@@ -1046,6 +1060,7 @@ mod tests {
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            backend_health: Arc::new(crate::BackendHealth::default()),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: DaemonConfig {
@@ -1156,5 +1171,107 @@ mod tests {
 
         assert_eq!(outcome, AccountPollOutcome::Unchanged);
         assert_eq!(*state.account.lock().await, Some(previous));
+    }
+
+    #[tokio::test]
+    async fn backend_health_tracks_pull_outage_recovery_and_ignores_apply_failure() {
+        let dir = Path::new("/tmp").join(format!(
+            "valvd-health-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mount_path = dir.join("mount-file");
+        fs::write(&mount_path, b"not a directory").unwrap();
+        let mut state = test_state();
+        let mount = test_mount(mount_path.to_string_lossy().as_ref());
+        {
+            let conn = state.db.lock().await;
+            mounts::upsert_mount(&conn, &mount.path, &mount.folder_id, None, None, None, true)
+                .unwrap();
+            nodes::upsert_node(
+                &conn,
+                &LocalNode {
+                    node_id: "root-node".into(),
+                    folder_id: mount.folder_id.clone(),
+                    parent_id: None,
+                    name: "Mount".into(),
+                    node_type: "folder".into(),
+                    current_version_id: None,
+                    server_seq: 0,
+                    deleted_at: None,
+                },
+            )
+            .unwrap();
+        }
+        *state.mounts.lock().await = vec![mount.clone()];
+
+        pull_mount_once(&state, &mount).await;
+        assert!(
+            !crate::control::get_status(State(state.clone()))
+                .await
+                .unwrap()
+                .0
+                .backend_connected
+        );
+
+        state.config.backend_url = delta_server(vec![r#"{"ops":[],"up_to_seq":0}"#]).await;
+        pull_mount_once(&state, &mount).await;
+        assert!(
+            crate::control::get_status(State(state.clone()))
+                .await
+                .unwrap()
+                .0
+                .backend_connected
+        );
+
+        state.config.backend_url = delta_server(vec![
+            r#"{"ops":[{"server_seq":1,"node_id":"remote-folder","op_type":"create","op_payload":{"node_id":"remote-folder","parent_id":"root-node","name":"remote-folder","type":"folder"},"actor_device_id":"other-device","applied_at":"2026-07-06T00:00:00Z"}],"up_to_seq":0}"#,
+        ])
+        .await;
+        pull_mount_once(&state, &mount).await;
+        assert!(
+            crate::control::get_status(State(state))
+                .await
+                .unwrap()
+                .0
+                .backend_connected
+        );
+    }
+
+    fn test_mount(path: &str) -> MountState {
+        MountState {
+            path: path.to_owned(),
+            folder_id: "folder-1".to_owned(),
+            grant_id: None,
+            scope_node_id: None,
+            mount_token: None,
+            can_write: true,
+            name: "Mount".to_owned(),
+            active_syncs: 0,
+            pending_ops: 0,
+            last_synced_at: None,
+            error: None,
+            sync_lock: Arc::new(Mutex::new(())),
+            cursor_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    async fn delta_server(responses: Vec<&'static str>) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for body in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 2048];
+                let _ = stream.read(&mut buffer).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        format!("http://{addr}")
     }
 }

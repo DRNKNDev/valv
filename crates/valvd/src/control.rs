@@ -16,10 +16,7 @@ pub(crate) async fn get_status(
         .iter()
         .map(|mount| mount.status())
         .collect();
-    let backend_connected = !state.config.backend_url.is_empty()
-        && !state.config.device_id.is_empty()
-        && !state.config.device_token.is_empty()
-        && !state.config.device_name.is_empty();
+    let backend_connected = state.backend_health.is_connected();
     let account = state.account.lock().await.clone();
     Ok(Json(DaemonStatus {
         paused: state.paused.load(Ordering::Acquire),
@@ -82,6 +79,7 @@ mod tests {
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            backend_health: Arc::new(crate::BackendHealth::default()),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config,
@@ -99,7 +97,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_status_reports_connected_config() {
+    async fn get_status_defaults_connected_without_backend_signal() {
         let response = get_status(State(test_state(connected_config())))
             .await
             .unwrap();
@@ -109,11 +107,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_status_reports_disconnected_when_config_is_incomplete() {
-        let mut config = connected_config();
-        config.device_token.clear();
+    async fn get_status_reports_disconnected_after_backend_failure() {
+        let state = test_state(connected_config());
+        state.backend_health.record_failure();
 
-        let response = get_status(State(test_state(config))).await.unwrap();
+        let response = get_status(State(state)).await.unwrap();
 
         assert!(!response.0.backend_connected);
     }
