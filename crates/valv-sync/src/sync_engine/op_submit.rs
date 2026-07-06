@@ -113,7 +113,11 @@ pub fn apply_submitted_new_version(
     };
     let (version_id, server_seq, is_conflict_copy) = match response {
         SubmitOpResponse::Applied { server_seq, .. } => (&payload.version_id, *server_seq, false),
-        SubmitOpResponse::ConflictCopy { server_seq, conflict_version_id, .. } => (conflict_version_id, *server_seq, true),
+        SubmitOpResponse::ConflictCopy {
+            server_seq,
+            conflict_version_id,
+            ..
+        } => (conflict_version_id, *server_seq, true),
         SubmitOpResponse::Superseded { .. } => return Ok(()),
     };
 

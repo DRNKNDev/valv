@@ -430,15 +430,15 @@ async fn upload_file_new_version(
     }
 
     let req = SubmitOpRequest::NewVersion {
-            node_id: node_id.to_owned(),
-            based_on_seq,
-            payload: NewVersionPayload {
-                version_id: Uuid::new_v4().to_string(),
-                content_hash,
-                size_bytes,
-                manifest,
-            },
-        };
+        node_id: node_id.to_owned(),
+        based_on_seq,
+        payload: NewVersionPayload {
+            version_id: Uuid::new_v4().to_string(),
+            content_hash,
+            size_bytes,
+            manifest,
+        },
+    };
     let response = submit_op(client, backend_url, token, &mount.folder_id, &req).await?;
     {
         let conn = db.lock().await;
