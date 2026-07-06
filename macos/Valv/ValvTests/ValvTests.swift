@@ -28,6 +28,48 @@ struct ValvTests {
         #expect(freshStore.hasSignedIn == true)
     }
 
+    @Test func signOutClearsSignedInStateWhenConfigClearFails() async throws {
+        let suiteName = "dev.drnkn.valv.tests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let domainDefaultsKey = "dev.drnkn.valv.fileProviderDomainIdentifier"
+        let originalDomainIdentifier = UserDefaults.standard.string(forKey: domainDefaultsKey)
+        UserDefaults.standard.removeObject(forKey: domainDefaultsKey)
+        defer {
+            if let originalDomainIdentifier {
+                UserDefaults.standard.set(originalDomainIdentifier, forKey: domainDefaultsKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: domainDefaultsKey)
+            }
+        }
+
+        var didAttemptRestart = false
+        let store = DaemonStore(
+            userDefaults: defaults,
+            clearDeviceIdentity: {
+                throw NSError(
+                    domain: "ValvTests",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Injected config clear failure"]
+                )
+            },
+            restartDaemonOperation: {
+                didAttemptRestart = true
+            }
+        )
+        store.hasSignedIn = true
+
+        try await store.signOut(domainManager: FileProviderDomainManager())
+
+        #expect(didAttemptRestart)
+        #expect(store.hasSignedIn == false)
+        #expect(defaults.bool(forKey: "dev.drnkn.valv.hasSignedIn") == false)
+    }
+
     @Test func deviceGrantBodyOmitsNilScopeAndPreservesSubfolderScope() throws {
         let encoder = JSONEncoder()
 
