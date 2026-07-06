@@ -78,8 +78,11 @@ describe("submitOp", () => {
       payload: {
         version_id: "version-1",
         content_hash: "hash-1",
-        size_bytes: 10,
-        manifest: [{ chunk_hash: "chunk-1", offset: 0, length: 10 }],
+        size_bytes: 22,
+        manifest: [
+          { chunk_hash: "chunk-1", offset: 0, length: 10 },
+          { chunk_hash: "chunk-2", offset: 10, length: 12 },
+        ],
       },
     });
 
@@ -89,6 +92,11 @@ describe("submitOp", () => {
     ]);
     expect(db.nodes.get("doc")?.currentVersionId).toBe("version-1");
     expect(db.chunkRefcounts.get("chunk-1")).toBe(1);
+    expect(db.chunkRefcounts.get("chunk-2")).toBe(1);
+    expect(db.versionChunks).toEqual([
+      { versionId: "version-1", nodeId: "doc", chunkHash: "chunk-1" },
+      { versionId: "version-1", nodeId: "doc", chunkHash: "chunk-2" },
+    ]);
     expect(hub.notifications).toEqual([{ folderId: "folder-1", serverSeq: 2 }]);
   });
 
@@ -150,6 +158,9 @@ describe("submitOp", () => {
     expect(db.versions[0]?.isConflictCopy).toBe(true);
     expect(db.versions[0]?.versionId).not.toBe("client-version");
     expect(db.chunkRefcounts.get("chunk-1")).toBe(1);
+    expect(db.versionChunks).toEqual([
+      { versionId: db.versions[0]?.versionId, nodeId: "doc", chunkHash: "chunk-1" },
+    ]);
     expect(db.nodes.get("doc")?.currentVersionId).toBeNull();
     expect(db.nodes.get("doc")?.serverSeq).toBe(response.server_seq);
     expect(hub.notifications).toEqual([{ folderId: "folder-1", serverSeq: 2 }]);
@@ -191,6 +202,12 @@ type TestVersion = {
   sizeBytes: number;
   authorDeviceId: string;
   isConflictCopy: boolean;
+};
+
+type TestVersionChunk = {
+  versionId: string;
+  nodeId: string;
+  chunkHash: string;
 };
 
 class OpTestDb implements CoreDb {
@@ -237,6 +254,7 @@ class OpTestDb implements CoreDb {
     ],
   ]);
   versions: TestVersion[] = [];
+  versionChunks: TestVersionChunk[] = [];
   ops: Array<{ serverSeq: number; folderId: string; nodeId: string; opType: string; opPayload: unknown }> = [];
   chunkRefcounts = new Map<string, number>();
   private lastInsertedVersionManifest: TestVersion["manifest"] = [];
@@ -270,6 +288,9 @@ class OpTestDb implements CoreDb {
           this.versions.push(version);
           this.lastInsertedVersionManifest = version.manifest;
           this.chunkUpdatePhase = "increment";
+        }
+        if (table === pgSchema.versionChunks) {
+          this.versionChunks.push(...(Array.isArray(value) ? value : [value]));
         }
         if (table === pgSchema.opLog) {
           const serverSeq = this.nextServerSeq();

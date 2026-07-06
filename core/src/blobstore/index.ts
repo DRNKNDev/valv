@@ -1,5 +1,5 @@
 import type { AwsClient } from "aws4fetch";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { Hono } from "hono";
 
 import {
@@ -43,6 +43,9 @@ export type CreateBlobstoreRouterOptions = {
   getQuota?: (principal: QuotaPrincipal) => Promise<QuotaInfo | null>;
   pastDueGraceDays?: number;
 };
+
+export const CHUNK_AUTH_SCAN_WARN_ROWS = 1_000;
+export const CHUNK_AUTH_SCAN_WARN_MS = 100;
 
 export function chunkKey(hash: string): string {
   return `chunks/${hash}`;
@@ -215,22 +218,86 @@ export function objectUrl(opts: { bucketEndpoint?: string; bucketName: string },
   return url.toString();
 }
 
+export async function canDownloadChunkUnscopedForParity(auth: CoreAuth, principal: Principal, oid: string): Promise<boolean> {
+  const nodeIds = await unscopedChunkCandidateNodeIds(auth, oid);
+  return canDownloadFromCandidateNodes(auth, principal, nodeIds);
+}
+
+export async function canDownloadChunkScopedForParity(auth: CoreAuth, principal: Principal, oid: string): Promise<boolean> {
+  const nodeIds = await scopedChunkCandidateNodeIds(auth, oid);
+  return canDownloadFromCandidateNodes(auth, principal, nodeIds);
+}
+
 async function canDownloadChunk(auth: CoreAuth, principal: Principal, oid: string): Promise<boolean> {
+  return canDownloadChunkScopedForParity(auth, principal, oid);
+}
+
+async function unscopedChunkCandidateNodeIds(auth: CoreAuth, oid: string): Promise<string[]> {
+  const scanStartedAt = Date.now();
   const rows = await auth.db
     .select({ nodeId: auth.schema.nodes.nodeId, manifest: auth.schema.versions.manifest })
     .from(auth.schema.nodes)
     .innerJoin(auth.schema.versions, eq(auth.schema.nodes.nodeId, auth.schema.versions.nodeId));
+  const durationMs = Date.now() - scanStartedAt;
+  warnOnOversizedChunkAuthScan(oid, rows.length, durationMs);
 
+  const nodeIds: string[] = [];
   for (const row of rows) {
     const manifest = Array.isArray(row.manifest) ? row.manifest : [];
     const referencesChunk = manifest.some((chunk: { chunk_hash?: string }) => chunk.chunk_hash === oid);
     if (!referencesChunk) {
       continue;
     }
-    const grant = await checkGrant(auth.db, row.nodeId, principal, "read", auth.schema);
+    nodeIds.push(row.nodeId);
+  }
+  return nodeIds;
+}
+
+async function scopedChunkCandidateNodeIds(auth: CoreAuth, oid: string): Promise<string[]> {
+  const scanStartedAt = Date.now();
+  const rows = await executeRows(auth.db, sql`
+    SELECT DISTINCT node_id FROM version_chunks WHERE chunk_hash = ${oid}
+  `);
+  const durationMs = Date.now() - scanStartedAt;
+  warnOnOversizedChunkAuthScan(oid, rows.length, durationMs);
+
+  return rows.map((row) => String(row.node_id ?? row.nodeId));
+}
+
+async function canDownloadFromCandidateNodes(
+  auth: CoreAuth,
+  principal: Principal,
+  nodeIds: string[],
+): Promise<boolean> {
+  for (const nodeId of nodeIds) {
+    const grant = await checkGrant(auth.db, nodeId, principal, "read", auth.schema);
     if (grant.granted) {
       return true;
     }
   }
   return false;
+}
+
+async function executeRows(db: CoreAuth["db"], query: unknown): Promise<any[]> {
+  if (typeof db.all === "function") {
+    return db.all(query);
+  }
+  if (typeof db.execute !== "function") {
+    return [];
+  }
+  const result = await db.execute(query);
+  if (Array.isArray(result)) {
+    return result;
+  }
+  if (Array.isArray(result.rows)) {
+    return result.rows;
+  }
+  return [];
+}
+
+function warnOnOversizedChunkAuthScan(oid: string, rowCount: number, durationMs: number): void {
+  if (rowCount <= CHUNK_AUTH_SCAN_WARN_ROWS && durationMs <= CHUNK_AUTH_SCAN_WARN_MS) {
+    return;
+  }
+  console.warn("canDownloadChunk scanned an oversized candidate set", { oid, rowCount, durationMs });
 }
