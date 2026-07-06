@@ -1,5 +1,5 @@
 export { createAuth, authenticateRequest, createAuthMiddleware, generateDeviceToken, sha256Hex } from "./auth/index.js";
-export type { AuthResult, CoreAuth, CoreDb, CoreSchema, Principal } from "./auth/index.js";
+export type { AuthEmailHook, AuthEmailHookData, AuthResult, CoreAuth, CoreDb, CoreSchema, Principal } from "./auth/index.js";
 export { createDeviceAuthRouter } from "./auth/device.js";
 export { createBlobstoreRouter, chunkKey, withinGracePeriod } from "./blobstore/index.js";
 export { pgSchema, sqliteSchema } from "./db/schema.js";

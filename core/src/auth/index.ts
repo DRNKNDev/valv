@@ -37,11 +37,24 @@ export type CoreAuth = Auth<any> & {
   schema: CoreSchema;
 };
 
+export type AuthEmailHookData = {
+  user: {
+    email: string;
+    name?: string;
+  };
+  url: string;
+  token: string;
+};
+
+export type AuthEmailHook = (data: AuthEmailHookData, request?: Request) => Promise<void>;
+
 export type CreateAuthOptions = {
   secret: string;
   baseURL?: string;
   provider?: "pg" | "sqlite";
   schema?: CoreSchema;
+  sendResetPassword?: AuthEmailHook;
+  sendVerificationEmail?: AuthEmailHook;
   betterAuthConfig?: Partial<BetterAuthOptions>;
 };
 
@@ -69,7 +82,16 @@ export function createAuth(db: CoreDb, opts: CreateAuthOptions): CoreAuth {
     }),
     emailAndPassword: {
       enabled: true,
+      ...(opts.sendResetPassword ? { sendResetPassword: opts.sendResetPassword } : {}),
     },
+    ...(opts.sendVerificationEmail
+      ? {
+          emailVerification: {
+            sendVerificationEmail: opts.sendVerificationEmail,
+            sendOnSignUp: true,
+          },
+        }
+      : {}),
   } satisfies BetterAuthOptions;
   const auth = betterAuth({ ...coreConfig, ...opts.betterAuthConfig });
 
