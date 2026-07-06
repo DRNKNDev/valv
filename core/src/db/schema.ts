@@ -8,6 +8,7 @@ import {
   nodes,
   opLog,
   sharedFolders,
+  versionChunks,
   versions,
 } from "./schema.pg.js";
 
@@ -20,5 +21,6 @@ export type FolderGrant = InferSelectModel<typeof folderGrants>;
 export type FolderInvite = InferSelectModel<typeof folderInvites>;
 export type Node = InferSelectModel<typeof nodes>;
 export type Version = InferSelectModel<typeof versions>;
+export type VersionChunk = InferSelectModel<typeof versionChunks>;
 export type Chunk = InferSelectModel<typeof chunks>;
 export type OpLogRow = InferSelectModel<typeof opLog>;
