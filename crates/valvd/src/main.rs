@@ -155,10 +155,17 @@ async fn main() -> Result<()> {
     init_tracing();
     match Cli::parse().command {
         Command::Run => run().await,
-        Command::Daemon { command } => match command {
-            DaemonCommand::Install => install_daemon(),
-            DaemonCommand::Uninstall => uninstall_daemon(),
-        },
+        Command::Daemon { command } => {
+            let result = match command {
+                DaemonCommand::Install => install_daemon(),
+                DaemonCommand::Uninstall => uninstall_daemon(),
+            };
+            if let Err(error) = result {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            Ok(())
+        }
     }
 }
 

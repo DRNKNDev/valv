@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use valv_sync::api_base;
 
@@ -6,6 +6,7 @@ use crate::{
     app::GrantCreateArgs,
     config::{load_config, CliConfig},
     paths::{first_mount_folder_id, resolve_target_path},
+    table::print_table,
 };
 
 async fn backend_response_or_error(response: reqwest::Response) -> Result<reqwest::Response> {
@@ -47,8 +48,9 @@ fn readable_backend_error(text: &str) -> String {
 }
 
 pub(crate) async fn cmd_grant_create(args: GrantCreateArgs) -> Result<()> {
-    let config = load_config()?;
-    let target = resolve_target_path(&args.node_path)?;
+    let config = load_config().context("failed to load CLI config for grant creation")?;
+    let target = resolve_target_path(&args.node_path)
+        .with_context(|| format!("failed to resolve grant scope {}", args.node_path))?;
     let client = reqwest::Client::new();
     let can_write = !args.read_only;
     if let Some(email) = args.to {
@@ -65,9 +67,13 @@ pub(crate) async fn cmd_grant_create(args: GrantCreateArgs) -> Result<()> {
                 can_write,
             })
             .send()
-            .await?;
+            .await
+            .context("failed to send invite creation request")?;
         let response = backend_response_or_error(response).await?;
-        let invite = response.json::<InviteCreateResponse>().await?;
+        let invite = response
+            .json::<InviteCreateResponse>()
+            .await
+            .context("failed to parse invite creation response")?;
         println!(
             "Invite URL: {}/invites/{}/accept",
             api_base(&config.backend_url),
@@ -88,45 +94,70 @@ pub(crate) async fn cmd_grant_create(args: GrantCreateArgs) -> Result<()> {
                 can_write,
             })
             .send()
-            .await?;
+            .await
+            .context("failed to send device grant creation request")?;
         let response = backend_response_or_error(response).await?;
-        let grant = response.json::<GrantCreateResponse>().await?;
-        println!("Device token: {}", grant.token);
-        println!("Grant ID: {}", grant.grant_id);
-        println!("Device ID: {}", grant.device_id);
+        let grant = response
+            .json::<GrantCreateResponse>()
+            .await
+            .context("failed to parse device grant creation response")?;
+        println!(
+            "Created device grant {}: device {} can mount this scope",
+            grant.grant_id, grant.device_id
+        );
+        println!("One-time token: {}", grant.token);
         println!("Store this token now; it cannot be retrieved again.");
     }
     Ok(())
 }
 
 pub(crate) async fn cmd_grants(folder_path: Option<String>) -> Result<()> {
-    let config = load_config()?;
+    let config = load_config().context("failed to load CLI config for grant listing")?;
     let folder_id = match folder_path {
-        Some(path) => resolve_target_path(&path)?.folder_id,
-        None => first_mount_folder_id()?,
+        Some(path) => {
+            resolve_target_path(&path)
+                .with_context(|| format!("failed to resolve grants path {path}"))?
+                .folder_id
+        }
+        None => first_mount_folder_id().context("failed to choose mounted folder for grants")?,
     };
-    let grants = fetch_grants(&config).await?;
-    println!("grant_id\tscope\tgrantee\trole\tcan_read\tcan_write");
-    for grant in grants
+    let grants = fetch_grants(&config)
+        .await
+        .context("failed to fetch grants for listing")?;
+    let rows = grants
         .into_iter()
         .filter(|grant| grant.folder_id == folder_id)
-    {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            grant.grant_id,
-            grant.scope_node_id,
-            grant.grantee(),
-            grant.role.unwrap_or_else(|| "-".into()),
-            grant.can_read.unwrap_or(false),
-            grant.can_write.unwrap_or(false)
-        );
-    }
+        .map(|grant| {
+            let grantee = grant.grantee();
+            vec![
+                grant.grant_id,
+                grant.scope_node_id,
+                grantee,
+                grant.role.unwrap_or_else(|| "-".into()),
+                grant.can_read.unwrap_or(false).to_string(),
+                grant.can_write.unwrap_or(false).to_string(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(
+        &[
+            "grant_id",
+            "scope",
+            "grantee",
+            "role",
+            "can_read",
+            "can_write",
+        ],
+        &rows,
+    );
     Ok(())
 }
 
 pub(crate) async fn cmd_grant_revoke(grant_id: String) -> Result<()> {
-    let config = load_config()?;
-    let grants = fetch_grants(&config).await?;
+    let config = load_config().context("failed to load CLI config for grant revocation")?;
+    let grants = fetch_grants(&config)
+        .await
+        .context("failed to fetch grants for revocation")?;
     let folder_id = grants
         .iter()
         .find(|grant| grant.grant_id == grant_id)
@@ -141,9 +172,10 @@ pub(crate) async fn cmd_grant_revoke(grant_id: String) -> Result<()> {
         ))
         .bearer_auth(&config.device_token)
         .send()
-        .await?;
+        .await
+        .with_context(|| format!("failed to send revoke request for grant {grant_id}"))?;
     backend_response_or_error(response).await?;
-    println!("Grant {grant_id} revoked");
+    println!("Revoked grant {grant_id}: access removed");
     Ok(())
 }
 
@@ -152,11 +184,13 @@ async fn fetch_grants(config: &CliConfig) -> Result<Vec<GrantListEntry>> {
         .get(format!("{}/grants", api_base(&config.backend_url)))
         .bearer_auth(&config.device_token)
         .send()
-        .await?;
+        .await
+        .context("failed to send grants list request")?;
     Ok(backend_response_or_error(response)
         .await?
         .json::<Vec<GrantListEntry>>()
-        .await?)
+        .await
+        .context("failed to parse grants list response")?)
 }
 
 #[derive(Debug, Serialize)]

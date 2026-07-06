@@ -10,14 +10,14 @@ pub(crate) struct CliConfig {
 }
 
 pub(crate) fn load_config() -> Result<CliConfig> {
-    let path = config_path()?;
+    let path = config_path().context("failed to determine config path")?;
     let text = std::fs::read_to_string(&path).with_context(|| {
         format!(
             "Config not found. Run: valv daemon install ({})",
             path.display()
         )
     })?;
-    let config = toml::from_str::<CliConfig>(&text)?;
+    let config = toml::from_str::<CliConfig>(&text).context("failed to parse config.toml")?;
     if config.backend_url.trim().is_empty() {
         return Err(anyhow!("Missing backend_url in config.toml"));
     }
