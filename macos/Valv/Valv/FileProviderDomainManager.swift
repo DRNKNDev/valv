@@ -44,6 +44,16 @@ final class FileProviderDomainManager: ObservableObject {
         }
     }
 
+    func removeDomainIfRegistered() async throws {
+        guard let domain else {
+            UserDefaults.standard.removeObject(forKey: Self.domainIdentifierDefaultsKey)
+            return
+        }
+        try await NSFileProviderManager.remove(domain)
+        self.domain = nil
+        UserDefaults.standard.removeObject(forKey: Self.domainIdentifierDefaultsKey)
+    }
+
     /// Called after a successful `POST /mount` or an unmount, so the synthetic root's
     /// enumeration (one item per `GET /mounts` entry) picks up the change without
     /// waiting for the background watch loop's next cycle.

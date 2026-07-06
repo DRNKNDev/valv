@@ -45,6 +45,23 @@ enum ConfigWriter {
         FileManager.default.fileExists(atPath: configPath.path)
     }
 
+    static func clearDeviceIdentity(configDirectory: URL = Self.configDirectory) throws {
+        let path = configPath(in: configDirectory)
+        guard FileManager.default.fileExists(atPath: path.path) else { return }
+        let contents = try String(contentsOf: path, encoding: .utf8)
+        let filtered = contents
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { line in
+                let key = line.split(separator: "=", maxSplits: 1).first?
+                    .trimmingCharacters(in: .whitespaces)
+                return key != "device_id" && key != "device_token"
+            }
+            .joined(separator: "\n")
+        let output = filtered.hasSuffix("\n") ? filtered : "\(filtered)\n"
+        try output.write(to: path, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+    }
+
     private static func escape(_ value: String) -> String {
         value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
     }

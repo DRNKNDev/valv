@@ -24,6 +24,7 @@ final class DaemonStore: ObservableObject {
 
     @Published private(set) var status: DaemonStatus?
     @Published private(set) var lastError: Error?
+    @Published private(set) var lastSuccessAt: Date?
     /// Set once first-run sign-in (section 7's onboarding flow) succeeds. Tracked
     /// locally rather than by reading `valvd`'s config.toml directly (this app is
     /// sandboxed - see design.md D2/D3 - and the daemon's own connectivity, not a
@@ -36,11 +37,20 @@ final class DaemonStore: ObservableObject {
 
     private let client: DaemonClient
     private let userDefaults: UserDefaults
+    private let clearDeviceIdentity: () throws -> Void
+    private let restartDaemonOperation: (() -> Void)?
     private var pollTask: Task<Void, Never>?
 
-    init(client: DaemonClient = DaemonClient(), userDefaults: UserDefaults = .standard) {
+    init(
+        client: DaemonClient = DaemonClient(),
+        userDefaults: UserDefaults = .standard,
+        clearDeviceIdentity: @escaping () throws -> Void = { try ConfigWriter.clearDeviceIdentity() },
+        restartDaemonOperation: (() -> Void)? = nil
+    ) {
         self.client = client
         self.userDefaults = userDefaults
+        self.clearDeviceIdentity = clearDeviceIdentity
+        self.restartDaemonOperation = restartDaemonOperation
         self.hasSignedIn = userDefaults.bool(forKey: Self.signedInDefaultsKey)
     }
 
@@ -58,6 +68,10 @@ final class DaemonStore: ObservableObject {
             return .syncing
         }
         return .synced
+    }
+
+    var isDisconnected: Bool {
+        hasSignedIn && status == nil && lastError != nil
     }
 
     var hasLapsedPlan: Bool {
@@ -86,6 +100,7 @@ final class DaemonStore: ObservableObject {
         do {
             status = try await client.status()
             lastError = nil
+            lastSuccessAt = Date()
         } catch {
             status = nil
             lastError = error
@@ -127,5 +142,35 @@ final class DaemonStore: ObservableObject {
     /// deliberately go straight to the backend.
     func nodePath(nodeId: String) async throws -> String {
         try await client.nodePath(nodeId: nodeId).path
+    }
+
+    func signOut(domainManager: FileProviderDomainManager) async throws {
+        try await domainManager.removeDomainIfRegistered()
+        do {
+            try clearDeviceIdentity()
+        } catch {
+            NSLog("DaemonStore: failed to clear device identity during sign out: %@", error.localizedDescription)
+        }
+        if let restartDaemonOperation {
+            restartDaemonOperation()
+        } else {
+            restartDaemon()
+        }
+        hasSignedIn = false
+        status = nil
+        lastError = nil
+        lastSuccessAt = nil
+    }
+
+    private func restartDaemon() {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["kickstart", "-k", "gui/\(getuid())/dev.drnkn.valvd"]
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            NSLog("DaemonStore: failed to restart daemon after sign out: %@", error.localizedDescription)
+        }
     }
 }
