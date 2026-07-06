@@ -6,7 +6,7 @@ import {
   type CoreAuth,
 } from "../auth/index.js";
 import { checkGrant } from "./authz.js";
-import { eq, inTransaction, newId, requirePrincipal, type MetadataVariables } from "./common.js";
+import { eq, getFolderRoot, inTransaction, newId, requirePrincipal, type MetadataVariables } from "./common.js";
 
 type GrantRouteStore = {
   createAgentGrantForRoute?: (opts: {
@@ -30,9 +30,12 @@ export function registerGrantRoutes(router: Hono<{ Variables: MetadataVariables 
     const principal = requirePrincipal(ctx);
     const folderId = ctx.req.param("id");
     const body = await ctx.req.json().catch(() => ({}));
-    const scopeNodeId = body.scope_node_id;
-    if (typeof scopeNodeId !== "string") {
+    if (body.scope_node_id !== undefined && typeof body.scope_node_id !== "string") {
       return ctx.json({ error: "invalid_scope_node_id" }, 400);
+    }
+    const scopeNodeId = typeof body.scope_node_id === "string" ? body.scope_node_id : await getFolderRoot(auth, folderId);
+    if (!scopeNodeId) {
+      return ctx.json({ error: "folder_not_found" }, 404);
     }
 
     const grant = await checkGrant(auth.db, scopeNodeId, principal, "write", auth.schema);

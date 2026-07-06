@@ -40,15 +40,49 @@ describe("grant routes", () => {
     expect(db.folderGrants[0]?.grantId).toBe("grant-target");
   });
 
-  it("returns 400 when agent grant scope_node_id is missing", async () => {
+  it("returns 400 when agent grant scope_node_id is present but non-string", async () => {
     const response = await metadataAppFor(new LifecycleDb(), { type: "user", userId: "user-1" }).request("/folders/folder-1/grants", {
       method: "POST",
-      body: JSON.stringify({ name: "Agent" }),
+      body: JSON.stringify({ scope_node_id: null, name: "Agent" }),
       headers: { "content-type": "application/json" },
     });
 
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({ error: "invalid_scope_node_id" });
+  });
+
+  it("defaults an omitted agent grant scope_node_id to the folder root", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("root");
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" });
+
+    const response = await app.request("/folders/folder-1/grants", {
+      method: "POST",
+      body: JSON.stringify({ name: "Agent", can_read: true, can_write: false }),
+      headers: { "content-type": "application/json" },
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ grant_id: expect.any(String), device_id: expect.any(String), token: expect.any(String) });
+    expect(db.folderGrants[0]).toMatchObject({ folderId: "folder-1", scopeNodeId: "root", deviceId: body.device_id });
+  });
+
+  it("returns 404 when omitted scope_node_id cannot resolve a folder root", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("root");
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" });
+
+    const response = await app.request("/folders/missing-folder/grants", {
+      method: "POST",
+      body: JSON.stringify({ name: "Agent" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toEqual({ error: "folder_not_found" });
+    expect(db.devices).toHaveLength(0);
+    expect(db.folderGrants).toHaveLength(0);
   });
 
   it("rejects agent grant provisioning from a read-only grant holder", async () => {
