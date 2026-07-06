@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +87,14 @@ pub fn upsert_node(conn: &Connection, node: &LocalNode) -> Result<()> {
             node.server_seq,
             node.deleted_at,
         ],
+    )?;
+    Ok(())
+}
+
+pub fn mark_deleted(conn: &Connection, node_id: &str, server_seq: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE nodes SET deleted_at = ?1, server_seq = ?2 WHERE node_id = ?3",
+        params![Utc::now().to_rfc3339(), server_seq, node_id],
     )?;
     Ok(())
 }
