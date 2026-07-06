@@ -1,8 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { CoreAuth, CoreDb, Principal } from "../auth/index.js";
 import { pgSchema } from "../db/schema.js";
-import { chunkKey, createBlobstoreRouter } from "./index.js";
+import { CHUNK_AUTH_SCAN_WARN_ROWS, chunkKey, createBlobstoreRouter } from "./index.js";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("blobstore batch coordination", () => {
   it("computes the OSS chunk key layout", () => {
@@ -187,6 +191,48 @@ describe("blobstore batch coordination", () => {
     ]);
   });
 
+  it("logs oversized download authorization scans without changing the response", async () => {
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const downloadRows = Array.from({ length: CHUNK_AUTH_SCAN_WARN_ROWS + 1 }, (_value, index) => ({
+      nodeId: `doc-${index}`,
+      manifest: [{ chunk_hash: "oid-1" }],
+    }));
+    const db = new BlobTestDb({ authorized: true, downloadRows });
+    const app = appFor(db, { type: "device", deviceId: "device-1" });
+
+    const response = await app.request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({ operation: "download", objects: [{ oid: "oid-1", size: 10 }] }),
+      headers: { "content-type": "application/json", authorization: "Bearer token" },
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.objects).toEqual([
+      { oid: "oid-1", size: 10, actions: { download: { href: "signed:GetObjectCommand:chunks/oid-1", expires_in: 900 } } },
+    ]);
+    expect(consoleWarn).toHaveBeenCalledWith("canDownloadChunk scanned an oversized candidate set", {
+      oid: "oid-1",
+      rowCount: CHUNK_AUTH_SCAN_WARN_ROWS + 1,
+      durationMs: expect.any(Number),
+    });
+  });
+
+  it("does not log normal-sized download authorization scans", async () => {
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const db = new BlobTestDb({ authorized: true, downloadRows: [{ nodeId: "doc", manifest: [{ chunk_hash: "oid-1" }] }] });
+    const app = appFor(db, { type: "device", deviceId: "device-1" });
+
+    const response = await app.request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({ operation: "download", objects: [{ oid: "oid-1", size: 10 }] }),
+      headers: { "content-type": "application/json", authorization: "Bearer token" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(consoleWarn).not.toHaveBeenCalled();
+  });
+
   it("returns per-object 403 when no grant covers a referencing node", async () => {
     const db = new BlobTestDb({ authorized: false, downloadRows: [{ nodeId: "doc", manifest: [{ chunk_hash: "oid-1" }] }] });
     const app = appFor(db, { type: "device", deviceId: "device-1" });
@@ -267,6 +313,16 @@ class BlobTestDb implements CoreDb {
         };
       },
     };
+  }
+
+  async execute(query: any): Promise<Array<{ node_id: string }>> {
+    const chunkHash = query.queryChunks?.find((chunk: unknown) => typeof chunk === "string");
+    const nodeIds = new Set(
+      this.downloadRows
+        .filter((row) => row.manifest.some((chunk) => chunk.chunk_hash === chunkHash))
+        .map((row) => row.nodeId),
+    );
+    return [...nodeIds].map((nodeId) => ({ node_id: nodeId }));
   }
 
   async getNodeForAuthz(nodeId: string): Promise<{ nodeId: string; folderId: string; parentId: string | null } | undefined> {

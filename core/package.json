@@ -5,6 +5,7 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
+    "backfill:version-chunks": "tsx src/db/version-chunks-backfill.ts",
     "db:migrate:sqlite": "drizzle-kit migrate --config drizzle.sqlite.config.ts",
     "dev": "tsx watch src/server.ts",
     "test": "vitest run",

@@ -288,8 +288,15 @@ async function insertVersionAndOp(
       authorDeviceId: actorDeviceId,
       isConflictCopy,
     });
-    const chunkHashes = op.payload.manifest.map((chunk: ChunkRef) => chunk.chunk_hash);
+    const chunkHashes = [...new Set(op.payload.manifest.map((chunk: ChunkRef) => chunk.chunk_hash))];
     if (chunkHashes.length > 0) {
+      await tx.insert(auth.schema.versionChunks).values(
+        chunkHashes.map((chunkHash) => ({
+          versionId,
+          nodeId,
+          chunkHash,
+        })),
+      );
       await tx
         .update(auth.schema.chunks)
         .set({ refcount: sql`${auth.schema.chunks.refcount} + 1` })

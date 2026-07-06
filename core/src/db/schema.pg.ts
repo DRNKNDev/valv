@@ -9,6 +9,7 @@ import {
   integer,
   jsonb,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -130,6 +131,25 @@ export const versions = pgTable(
   (table) => [index("versions_node_created_idx").on(table.nodeId, table.createdAt)],
 );
 
+export const versionChunks = pgTable(
+  "version_chunks",
+  {
+    versionId: uuid("version_id")
+      .notNull()
+      .references(() => versions.versionId, { onDelete: "cascade" }),
+    nodeId: uuid("node_id")
+      .notNull()
+      .references(() => nodes.nodeId),
+    chunkHash: text("chunk_hash")
+      .notNull()
+      .references(() => chunks.chunkHash),
+  },
+  (table) => [
+    primaryKey({ columns: [table.versionId, table.chunkHash] }),
+    index("version_chunks_chunk_hash_idx").on(table.chunkHash),
+  ],
+);
+
 export const folderGrants = pgTable(
   "folder_grants",
   {
@@ -214,5 +234,6 @@ export const pgSchema = {
   nodes,
   versions,
   chunks,
+  versionChunks,
   opLog,
 };

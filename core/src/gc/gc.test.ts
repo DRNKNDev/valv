@@ -71,6 +71,19 @@ describe("GC service", () => {
 
     expect(consoleError).toHaveBeenCalledWith("Chunk GC pass failed", expect.any(Error));
   });
+
+  it("finds and deletes eligible chunks on a SQLite-shaped db without execute", async () => {
+    vi.useFakeTimers();
+    const db = new GcSqliteTestDb({ chunks: ["old"] });
+    const s3Client = s3For(db);
+
+    startGc(db, s3Client, "bucket", undefined, intervalOpts());
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(db.events).toContain("db:chunk-select");
+    expect(db.events.indexOf("s3:chunks/old")).toBeLessThan(db.events.indexOf("db:chunk-delete:old"));
+    expect(db.chunkDeletes).toEqual(["old"]);
+  });
 });
 
 class GcTestDb implements CoreDb {
@@ -119,7 +132,48 @@ class GcTestDb implements CoreDb {
   }
 }
 
-function s3For(db: GcTestDb, error?: Error) {
+class GcSqliteTestDb implements CoreDb {
+  select: CoreDb["select"];
+  insert: CoreDb["insert"];
+  update: CoreDb["update"];
+  delete: CoreDb["delete"];
+  get: CoreDb["all"];
+  events: string[] = [];
+  chunkDeletes: string[] = [];
+  private chunks: string[];
+
+  constructor(opts: { chunks?: string[] } = {}) {
+    this.chunks = opts.chunks ?? [];
+  }
+
+  async all(query: any): Promise<Array<{ chunk_hash: string }>> {
+    const text = query.queryChunks?.[0]?.value?.[0] as string | undefined;
+    if (text?.includes("SELECT chunk_hash")) {
+      this.events.push("db:chunk-select");
+      return this.chunks.map((chunkHash) => ({ chunk_hash: chunkHash }));
+    }
+    return [];
+  }
+
+  async run(query: any): Promise<void> {
+    const text = query.queryChunks?.[0]?.value?.[0] as string | undefined;
+    if (text?.includes("DELETE FROM chunks")) {
+      const chunkHash = String(query.queryChunks[1]);
+      this.events.push(`db:chunk-delete:${chunkHash}`);
+      this.chunkDeletes.push(chunkHash);
+      return;
+    }
+    if (text?.includes("DELETE FROM nodes")) {
+      this.events.push("db:tombstone-delete");
+      return;
+    }
+    if (text?.includes("DELETE FROM op_log")) {
+      this.events.push("db:oplog-delete");
+    }
+  }
+}
+
+function s3For(db: { events: string[] }, error?: Error) {
   return {
     fetch: vi.fn(async (url: string) => {
       const key = new URL(url).pathname.split("/").slice(-2).join("/");

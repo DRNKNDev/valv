@@ -21,6 +21,16 @@ pnpm db:migrate:sqlite
 
 After copying `.env.example`, fill in credentials for your S3-compatible bucket. Leave the SMTP vars commented out to run with invite emails disabled.
 
+## Migration Runbook
+
+After applying the migration that creates `version_chunks`, run the one-time reverse-index backfill before deploying or enabling any build that authorizes downloads from `version_chunks`:
+
+```bash
+pnpm backfill:version-chunks
+```
+
+The command reads `VALV_DATABASE_URL` or `DATABASE_URL`, pages through existing `versions` rows, and is safe to rerun. Do not cut over chunk-download authorization to the scoped `version_chunks` query in an environment until this backfill has completed there.
+
 ## Running The Server
 
 ```bash

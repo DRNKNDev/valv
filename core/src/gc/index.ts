@@ -99,6 +99,10 @@ function cutoffForDb(db: CoreDb, retentionMs: number): Date | number {
 }
 
 async function executeRows(db: CoreDb, query: unknown): Promise<any[]> {
+  const maybeAll = (db as CoreDb & { all?: (query: unknown) => Promise<any[]> | any[] }).all;
+  if (typeof maybeAll === "function") {
+    return maybeAll.call(db, query);
+  }
   if (typeof db.execute !== "function") {
     return [];
   }
