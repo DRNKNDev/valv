@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod grants;
 mod paths;
+mod table;
 
 use std::process::ExitCode;
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
