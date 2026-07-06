@@ -9,6 +9,7 @@ use valv_sync::protocol::ipc::{
 };
 
 use crate::{
+    auth::{cmd_auth_login, default_auth_login_args},
     daemon::{daemon_client, expect_status, map_daemon_error, parse_daemon_json},
     grants::{cmd_grant_create, cmd_grant_revoke, cmd_grants},
     paths::resolve_valvd_path,
@@ -23,6 +24,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     Mount {
         path: String,
         #[arg(long)]
@@ -64,6 +69,20 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum AuthCommand {
+    Login {
+        #[arg(long)]
+        web_base_url: Option<String>,
+        #[arg(long)]
+        backend_url: Option<String>,
+        #[arg(long)]
+        device_name: Option<String>,
+        #[arg(long)]
+        no_open: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum GrantCommand {
     Create(GrantCreateArgs),
     Revoke { grant_id: String },
@@ -92,6 +111,26 @@ enum DaemonCommand {
 
 pub(crate) async fn run() -> Result<()> {
     match Cli::parse().command {
+        Command::Auth { command } => match command {
+            AuthCommand::Login {
+                web_base_url,
+                backend_url,
+                device_name,
+                no_open,
+            } => {
+                let mut args = default_auth_login_args(!no_open);
+                if let Some(web_base_url) = web_base_url {
+                    args.web_base_url = web_base_url;
+                }
+                if let Some(backend_url) = backend_url {
+                    args.backend_url = backend_url;
+                }
+                if let Some(device_name) = device_name {
+                    args.device_name = device_name;
+                }
+                cmd_auth_login(args).await
+            }
+        },
         Command::Mount {
             path,
             folder,
