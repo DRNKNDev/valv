@@ -19,7 +19,7 @@ final class ActionViewController: FPUIActionExtensionViewController {
     private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
 
     override func loadView() {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 190))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 220))
 
         let titleLabel = NSTextField(labelWithString: "Share this item")
         titleLabel.font = .boldSystemFont(ofSize: 14)
@@ -38,6 +38,11 @@ final class ActionViewController: FPUIActionExtensionViewController {
 
         inviteLinkField.isEditable = false
         inviteLinkField.isSelectable = true
+        inviteLinkField.isBordered = false
+        inviteLinkField.isBezeled = false
+        inviteLinkField.drawsBackground = false
+        inviteLinkField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        inviteLinkField.lineBreakMode = .byTruncatingMiddle
         inviteLinkField.isHidden = true
 
         copyButton.target = self
@@ -79,6 +84,7 @@ final class ActionViewController: FPUIActionExtensionViewController {
             statusLabel.topAnchor.constraint(equalTo: inviteLinkField.bottomAnchor, constant: 8),
             statusLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
             statusLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            statusLabel.bottomAnchor.constraint(lessThanOrEqualTo: shareButton.topAnchor, constant: -12),
 
             cancelButton.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16),
             cancelButton.trailingAnchor.constraint(equalTo: shareButton.leadingAnchor, constant: -8),
@@ -88,6 +94,7 @@ final class ActionViewController: FPUIActionExtensionViewController {
         ])
 
         self.view = container
+        updatePreferredContentSize()
     }
 
     override func prepare(forAction actionIdentifier: String, itemIdentifiers: [NSFileProviderItemIdentifier]) {
@@ -112,7 +119,8 @@ final class ActionViewController: FPUIActionExtensionViewController {
                 let response = try await client.fpShare(nodeId: nodeId, invitedEmail: email, canWrite: canWrite)
                 showInviteLink(response.inviteUrl)
             } catch {
-                showStatus(error.localizedDescription, isError: true)
+                NSLog("Share action failed: %@", error.localizedDescription)
+                showStatus(UserFacingError(from: error).message, isError: true)
             }
             setSubmitting(false)
         }
@@ -140,6 +148,7 @@ final class ActionViewController: FPUIActionExtensionViewController {
     private func showStatus(_ message: String, isError: Bool) {
         statusLabel.stringValue = message
         statusLabel.textColor = isError ? .systemRed : .secondaryLabelColor
+        updatePreferredContentSize()
     }
 
     private func showInviteLink(_ url: String) {
@@ -147,5 +156,11 @@ final class ActionViewController: FPUIActionExtensionViewController {
         inviteLinkField.isHidden = false
         copyButton.isHidden = false
         showStatus("Invite created.", isError: false)
+    }
+
+    private func updatePreferredContentSize() {
+        view.layoutSubtreeIfNeeded()
+        let fitting = view.fittingSize
+        preferredContentSize = NSSize(width: 360, height: max(220, fitting.height + 32))
     }
 }

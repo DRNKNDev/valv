@@ -1,4 +1,5 @@
 import Foundation
+import DaemonKit
 
 struct GrantEntry: Decodable, Identifiable, Hashable {
     var id: String { grantId }
@@ -45,6 +46,15 @@ enum BackendClientError: LocalizedError {
         case .httpStatus(let status, let body):
             return "Backend returned HTTP \(status): \(body)"
         }
+    }
+}
+
+extension BackendClientError: HTTPBodyCarrying {
+    var httpStatusAndBody: (Int, String)? {
+        if case .httpStatus(let status, let body) = self {
+            return (status, body)
+        }
+        return nil
     }
 }
 
