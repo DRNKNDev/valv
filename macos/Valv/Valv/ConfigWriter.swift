@@ -6,10 +6,9 @@ import Foundation
 enum ConfigWriter {
     // TODO: no hosted web login page exists yet to redirect back via valv://auth-callback
     // (design.md's own open question - this touches private/apps/web, out of this
-    // change's oss/ scope). Placeholder default matching the api.valv.dev convention
-    // already used elsewhere (oss/crates/valvd/src/config.rs's own prompt default).
-    static let defaultBackendURL = "https://api.valv.dev"
-    static let loginURL = URL(string: "https://api.valv.dev/login")!
+    // change's oss/ scope).
+    static let defaultBackendURL = "https://api.valvsync.com"
+    static let loginURL = URL(string: "https://valvsync.com/login")!
 
     struct Values {
         let backendURL: String

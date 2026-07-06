@@ -73,7 +73,7 @@ pub(crate) fn ensure_config_template() -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let backend_url = prompt_value("Backend URL", "https://api.valv.dev")?;
+    let backend_url = prompt_value("Backend URL", "https://api.valvsync.com")?;
     let device_name = prompt_value("Device name", &default_device_name())?;
     let contents = format!(
         r#"backend_url = "{}"

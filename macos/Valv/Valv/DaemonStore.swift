@@ -63,6 +63,13 @@ final class DaemonStore: ObservableObject {
         return .synced
     }
 
+    var hasLapsedPlan: Bool {
+        guard let accountStatus = status?.account?.status else {
+            return false
+        }
+        return ["past_due", "canceled", "revoked"].contains(accountStatus)
+    }
+
     func startPolling(interval: TimeInterval = 5) {
         stopPolling()
         pollTask = Task { [weak self] in

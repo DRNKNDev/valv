@@ -8,6 +8,19 @@ enum ConfigReader {
     struct Values {
         let backendURL: String
         let deviceToken: String
+
+        var webAccountURL: URL? {
+            guard var components = URLComponents(string: backendURL) else {
+                return URL(string: "https://valvsync.com/account")
+            }
+            if let host = components.host, host.hasPrefix("api.") {
+                components.host = String(host.dropFirst(4))
+            }
+            components.path = "/account"
+            components.query = nil
+            components.fragment = nil
+            return components.url
+        }
     }
 
     static func read() -> Values? {

@@ -81,6 +81,12 @@ struct MenuBarContentView: View {
             summaryLine
                 .padding(.horizontal, 14)
 
+            if store.hasLapsedPlan {
+                lapsedPlanBanner
+                    .padding(.horizontal, 14)
+                    .padding(.top, 4)
+            }
+
             if let status = store.status, !status.mounts.isEmpty {
                 Divider()
                 VStack(alignment: .leading, spacing: 6) {
@@ -200,6 +206,32 @@ struct MenuBarContentView: View {
         case .syncing: return .blue
         case .synced: return .green
         }
+    }
+
+    private var lapsedPlanBanner: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Billing attention needed")
+                .font(.caption)
+                .fontWeight(.semibold)
+            Text("Sync may be limited until billing is updated.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Button("Manage Billing") {
+                openBilling()
+            }
+            .font(.caption)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.yellow.opacity(0.16))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func openBilling() {
+        guard let url = ConfigReader.read()?.webAccountURL ?? URL(string: "https://valvsync.com/account") else {
+            return
+        }
+        NSWorkspace.shared.open(url)
     }
 
     private var daemonOwnershipLine: some View {
