@@ -10,6 +10,143 @@ import Testing
 @testable import Valv
 
 struct ValvTests {
+    @Test func signedInFlagRoundTripsThroughUserDefaults() throws {
+        let suiteName = "dev.drnkn.valv.tests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let store = DaemonStore(userDefaults: defaults)
+        #expect(store.hasSignedIn == false)
+        #expect(store.iconState == .notSetUp)
+
+        store.hasSignedIn = true
+
+        let freshStore = DaemonStore(userDefaults: defaults)
+        #expect(freshStore.hasSignedIn == true)
+    }
+
+    @Test func deviceGrantBodyOmitsNilScopeAndPreservesSubfolderScope() throws {
+        let encoder = JSONEncoder()
+
+        let wholeFolderData = try encoder.encode(DeviceGrantRequestBody(
+            scope_node_id: nil,
+            name: "Laptop",
+            can_read: true,
+            can_write: false
+        ))
+        let wholeFolderObject = try #require(JSONSerialization.jsonObject(with: wholeFolderData) as? [String: Any])
+        #expect(wholeFolderObject["scope_node_id"] == nil)
+        #expect(wholeFolderObject["name"] as? String == "Laptop")
+        #expect(wholeFolderObject["can_read"] as? Bool == true)
+        #expect(wholeFolderObject["can_write"] as? Bool == false)
+
+        let subfolderData = try encoder.encode(DeviceGrantRequestBody(
+            scope_node_id: "node-subfolder",
+            name: "Laptop",
+            can_read: true,
+            can_write: true
+        ))
+        let subfolderObject = try #require(JSONSerialization.jsonObject(with: subfolderData) as? [String: Any])
+        #expect(subfolderObject["scope_node_id"] as? String == "node-subfolder")
+    }
+
+    @Test func daemonVersionComparatorUsesNumericSemverOrder() {
+        #expect(DaemonManager.isVersion("0.10.0", atLeast: "0.9.0"))
+        #expect(!DaemonManager.isVersion("0.8.9", atLeast: "0.9.0"))
+        #expect(!DaemonManager.isVersion("not-a-version", atLeast: "0.9.0"))
+    }
+
+    @Test func cleanInstallFailureSetsInstallErrorAndReconcileStillSettles() async {
+        let homeDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ValvDaemonManagerTests-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: homeDirectory)
+        }
+
+        let manager = DaemonManager(
+            homeDirectory: homeDirectory,
+            startOnLaunch: false,
+            cleanInstallOperation: { _ in
+                throw NSError(
+                    domain: "ValvTests",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Injected install failure"]
+                )
+            }
+        )
+
+        await manager.reconcileOnLaunch()
+
+        #expect(manager.installError == "Injected install failure")
+        #expect(manager.hasReconciled)
+        #expect(!manager.isManagedByValv)
+    }
+
+    @MainActor
+    @Test func onboardingRetryAdvancesOnlyAfterRetriedInstallSucceeds() async {
+        let homeDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ValvDaemonRetryTests-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: homeDirectory)
+        }
+
+        var installAttempts = 0
+        var successfulRetryContinuation: CheckedContinuation<Void, Never>?
+        let manager = DaemonManager(
+            homeDirectory: homeDirectory,
+            startOnLaunch: false,
+            cleanInstallOperation: { _ in
+                installAttempts += 1
+                switch installAttempts {
+                case 1:
+                    throw NSError(
+                        domain: "ValvTests",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Initial install failure"]
+                    )
+                case 2:
+                    throw NSError(
+                        domain: "ValvTests",
+                        code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "Retry install failure"]
+                    )
+                default:
+                    await withCheckedContinuation { continuation in
+                        successfulRetryContinuation = continuation
+                    }
+                }
+            }
+        )
+        let coordinator = OnboardingCoordinator()
+        coordinator.currentPage = .daemonSetup
+
+        await manager.reconcileOnLaunch()
+        #expect(manager.hasReconciled)
+        #expect(manager.installError == "Initial install failure")
+
+        await OnboardingDaemonInstallRetry.perform(daemonManager: manager, coordinator: coordinator)
+        #expect(coordinator.currentPage == .daemonSetup)
+        #expect(manager.installError == "Retry install failure")
+
+        let retryTask = Task {
+            await OnboardingDaemonInstallRetry.perform(daemonManager: manager, coordinator: coordinator)
+        }
+        while successfulRetryContinuation == nil {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        #expect(coordinator.currentPage == .daemonSetup)
+        #expect(manager.installError == nil)
+
+        successfulRetryContinuation?.resume()
+        await retryTask.value
+
+        #expect(coordinator.currentPage == .signIn)
+        #expect(manager.installError == nil)
+        #expect(installAttempts == 3)
+    }
 
     @Test func signInURLIncludesPairingContext() throws {
         let url = SignInDevicePairing.loginURL(

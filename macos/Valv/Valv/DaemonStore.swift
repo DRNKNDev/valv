@@ -29,22 +29,19 @@ final class DaemonStore: ObservableObject {
     /// sandboxed - see design.md D2/D3 - and the daemon's own connectivity, not a
     /// config file read, is the actual signal `DaemonClient` can act on anyway).
     @Published var hasSignedIn: Bool {
-        didSet { UserDefaults.standard.set(hasSignedIn, forKey: Self.signedInDefaultsKey) }
+        didSet { userDefaults.set(hasSignedIn, forKey: Self.signedInDefaultsKey) }
     }
 
     private static let signedInDefaultsKey = "dev.drnkn.valv.hasSignedIn"
 
     private let client: DaemonClient
+    private let userDefaults: UserDefaults
     private var pollTask: Task<Void, Never>?
 
-    init(client: DaemonClient = DaemonClient()) {
+    init(client: DaemonClient = DaemonClient(), userDefaults: UserDefaults = .standard) {
         self.client = client
-        // TEMP-TESTING: force signed-in for local testing - this debug run's UserDefaults.standard
-        // wasn't reading back the persisted `dev.drnkn.valv.hasSignedIn` value (confirmed false in-process
-        // via lldb despite `defaults read dev.drnkn.valv` showing 1 on disk). Revert to the line below
-        // once that's root-caused, or before shipping.
-        self.hasSignedIn = true
-        // self.hasSignedIn = UserDefaults.standard.bool(forKey: Self.signedInDefaultsKey)
+        self.userDefaults = userDefaults
+        self.hasSignedIn = userDefaults.bool(forKey: Self.signedInDefaultsKey)
     }
 
     var iconState: IconState {
