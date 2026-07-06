@@ -8,6 +8,44 @@ use crate::{
     paths::{first_mount_folder_id, resolve_target_path},
 };
 
+async fn backend_response_or_error(response: reqwest::Response) -> Result<reqwest::Response> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    let message = readable_backend_error(&text);
+    if message.trim().is_empty() {
+        Err(anyhow!("backend returned {status}"))
+    } else {
+        Err(anyhow!("{message}"))
+    }
+}
+
+fn readable_backend_error(text: &str) -> String {
+    let trimmed = text.trim();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return trimmed.to_owned();
+    };
+    let Some(error) = value.get("error").and_then(|error| error.as_str()) else {
+        return trimmed.to_owned();
+    };
+    let mut parts = vec![error.to_owned()];
+    if let Some(object) = value.as_object() {
+        for (key, value) in object {
+            if key == "error" {
+                continue;
+            }
+            let value = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            parts.push(format!("{key}: {value}"));
+        }
+    }
+    parts.join(", ")
+}
+
 pub(crate) async fn cmd_grant_create(args: GrantCreateArgs) -> Result<()> {
     let config = load_config()?;
     let target = resolve_target_path(&args.node_path)?;
@@ -27,8 +65,8 @@ pub(crate) async fn cmd_grant_create(args: GrantCreateArgs) -> Result<()> {
                 can_write,
             })
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let response = backend_response_or_error(response).await?;
         let invite = response.json::<InviteCreateResponse>().await?;
         println!(
             "Invite URL: {}/invites/{}/accept",
@@ -50,8 +88,8 @@ pub(crate) async fn cmd_grant_create(args: GrantCreateArgs) -> Result<()> {
                 can_write,
             })
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        let response = backend_response_or_error(response).await?;
         let grant = response.json::<GrantCreateResponse>().await?;
         println!("Device token: {}", grant.token);
         println!("Grant ID: {}", grant.grant_id);
@@ -94,7 +132,7 @@ pub(crate) async fn cmd_grant_revoke(grant_id: String) -> Result<()> {
         .find(|grant| grant.grant_id == grant_id)
         .map(|grant| grant.folder_id.clone())
         .ok_or_else(|| anyhow!("grant not found: {grant_id}"))?;
-    reqwest::Client::new()
+    let response = reqwest::Client::new()
         .delete(format!(
             "{}/folders/{}/grants/{}",
             api_base(&config.backend_url),
@@ -103,19 +141,20 @@ pub(crate) async fn cmd_grant_revoke(grant_id: String) -> Result<()> {
         ))
         .bearer_auth(&config.device_token)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    backend_response_or_error(response).await?;
     println!("Grant {grant_id} revoked");
     Ok(())
 }
 
 async fn fetch_grants(config: &CliConfig) -> Result<Vec<GrantListEntry>> {
-    Ok(reqwest::Client::new()
+    let response = reqwest::Client::new()
         .get(format!("{}/grants", api_base(&config.backend_url)))
         .bearer_auth(&config.device_token)
         .send()
+        .await?;
+    Ok(backend_response_or_error(response)
         .await?
-        .error_for_status()?
         .json::<Vec<GrantListEntry>>()
         .await?)
 }
@@ -170,6 +209,11 @@ impl GrantListEntry {
 
 #[cfg(test)]
 mod tests {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
     use super::*;
 
     #[test]
@@ -205,5 +249,33 @@ mod tests {
 
         assert_eq!(writable["can_write"], true);
         assert_eq!(read_only["can_write"], false);
+    }
+
+    #[tokio::test]
+    async fn structured_backend_error_body_renders_readably() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 1024];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            let body = r#"{"error":"subscription_inactive","status":"none"}"#;
+            let response = format!(
+                "HTTP/1.1 402 Payment Required\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let response = reqwest::get(format!("http://{addr}/fail")).await.unwrap();
+        let message = backend_response_or_error(response)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(message.contains("subscription_inactive"));
+        assert!(message.contains("none"));
+        assert!(!message.contains("HTTP status client error"));
     }
 }
