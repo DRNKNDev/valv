@@ -93,9 +93,10 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
                 return readOnly
             }
             var writable: NSFileProviderItemCapabilities = [
-                .allowsReading, .allowsWriting, .allowsRenaming, .allowsReparenting,
-                .allowsTrashing, .allowsDeleting,
+                .allowsReading, .allowsWriting, .allowsTrashing, .allowsDeleting,
             ]
+            // Stopgap: `fp-rename-move` restores .allowsRenaming and
+            // .allowsReparenting together once the real /fp/rename daemon route lands.
             if item.type == .folder {
                 writable.insert(.allowsAddingSubItems)
             }

@@ -199,14 +199,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 
         let task = Task {
             do {
-                if changedFields.contains(.parentItemIdentifier) {
-                    // Task 4.11: reject cross-mount reparenting before any daemon call.
-                    let currentItem = try await client.fpItem(nodeId: nodeId)
-                    let destinationFolderId = try await self.folderId(for: item.parentItemIdentifier)
-                    guard currentItem.folderId == destinationFolderId else {
-                        completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError))
-                        return
-                    }
+                if changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier) {
+                    // Defense in depth for the fp-rename-move stopgap: Finder should
+                    // not offer rename/reparent without the capabilities, but reject
+                    // both here too until the daemon has a real /fp/rename route.
+                    completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError))
+                    return
                 }
 
                 if changedFields.contains(.contents), let newContents {
