@@ -15,7 +15,7 @@ use crate::{
 };
 
 #[derive(Parser)]
-#[command(name = "valv", about = "Valv sync CLI")]
+#[command(name = "valv", about = "Valv sync CLI", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
