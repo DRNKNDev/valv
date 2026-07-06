@@ -50,6 +50,7 @@ public struct DaemonStatus: Codable, Hashable, Sendable {
 }
 
 public struct AccountStatus: Codable, Hashable, Sendable {
+    public let email: String?
     public let plan: String?
     public let status: String
     public let usageBytes: Int
@@ -57,6 +58,7 @@ public struct AccountStatus: Codable, Hashable, Sendable {
     public let currentPeriodEnd: String?
 
     enum CodingKeys: String, CodingKey {
+        case email
         case plan
         case status
         case usageBytes = "usage_bytes"

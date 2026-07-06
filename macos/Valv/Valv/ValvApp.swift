@@ -44,9 +44,9 @@ struct ValvApp: App {
         switch state {
         case .notSetUp: return "externaldrive.badge.questionmark"
         case .error: return "externaldrive.badge.exclamationmark"
-        case .paused: return "pause.circle"
-        case .syncing: return "arrow.triangle.2.circlepath"
-        case .synced: return "checkmark.circle"
+        case .paused: return "externaldrive.badge.minus"
+        case .syncing: return "externaldrive.badge.icloud"
+        case .synced: return "externaldrive"
         }
     }
 }
