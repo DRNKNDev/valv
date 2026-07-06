@@ -26,13 +26,22 @@ type BatchResponseObject = {
   error?: { code: number; message: string };
 };
 
+export type QuotaPrincipal = { type: "device"; id: string } | { type: "user"; id: string };
+export type QuotaInfo = {
+  quota_bytes: number;
+  usage_bytes: number;
+  subscription_status: string;
+  current_period_end: string | Date | null;
+};
+
 export type CreateBlobstoreRouterOptions = {
   db?: CoreAuth["db"];
   auth: CoreAuth;
   s3: AwsClient;
   bucketEndpoint?: string;
   bucketName: string;
-  getQuota?: (deviceId: string) => Promise<{ quota_bytes: number; usage_bytes: number; subscription_status: string } | null>;
+  getQuota?: (principal: QuotaPrincipal) => Promise<QuotaInfo | null>;
+  pastDueGraceDays?: number;
 };
 
 export function chunkKey(hash: string): string {
@@ -53,10 +62,10 @@ export function createBlobstoreRouter(opts: CreateBlobstoreRouterOptions): Hono<
       const uploadPlans = await Promise.all(
         body.objects.map(async (object) => ({ object, existing: await getExistingChunk(opts, object.oid) })),
       );
-      if (opts.getQuota && principal.type === "device") {
-        const quota = await opts.getQuota(principal.deviceId);
+      if (opts.getQuota) {
+        const quota = await opts.getQuota(quotaPrincipal(principal));
         if (quota) {
-          if (quota.subscription_status === "canceled" || quota.subscription_status === "revoked") {
+          if (isBlockedSubscription(quota, opts.pastDueGraceDays ?? 5)) {
             return ctx.json({ error: "subscription_inactive", status: quota.subscription_status }, 402);
           }
           const newBytes = uploadPlans
@@ -95,7 +104,10 @@ async function handleUploadObject(
   }
 
   if (!existing) {
-    await opts.auth.db.insert(opts.auth.schema.chunks).values({ chunkHash: oid, sizeBytes: size, refcount: 0 });
+    const inserted = await insertChunkIfAbsent(opts, oid, size);
+    if (!inserted) {
+      return { oid, size, already_exists: true };
+    }
   }
   const href = await presignS3(opts, chunkKey(oid), "PUT", { "Content-Type": "application/octet-stream" });
 
@@ -111,6 +123,48 @@ async function handleUploadObject(
       },
     },
   };
+}
+
+function quotaPrincipal(principal: Principal): QuotaPrincipal {
+  return principal.type === "device"
+    ? { type: "device", id: principal.deviceId }
+    : { type: "user", id: principal.userId };
+}
+
+export function withinGracePeriod(currentPeriodEnd: string | Date | null, graceDays: number, now = new Date()): boolean {
+  if (!currentPeriodEnd) {
+    return false;
+  }
+  const periodEnd = currentPeriodEnd instanceof Date ? currentPeriodEnd : new Date(currentPeriodEnd);
+  if (Number.isNaN(periodEnd.getTime())) {
+    return false;
+  }
+  const graceMs = Math.max(0, graceDays) * 24 * 60 * 60 * 1000;
+  return now.getTime() <= periodEnd.getTime() + graceMs;
+}
+
+function isBlockedSubscription(quota: QuotaInfo, graceDays: number): boolean {
+  const blockedStatuses = new Set(["none", "incomplete", "canceled", "revoked"]);
+  return blockedStatuses.has(quota.subscription_status)
+    || (quota.subscription_status === "past_due" && !withinGracePeriod(quota.current_period_end, graceDays));
+}
+
+async function insertChunkIfAbsent(opts: CreateBlobstoreRouterOptions, oid: string, size: number): Promise<boolean> {
+  const insert = opts.auth.db
+    .insert(opts.auth.schema.chunks)
+    .values({ chunkHash: oid, sizeBytes: size, refcount: 0 }) as any;
+  if (typeof insert.onConflictDoNothing !== "function") {
+    await insert;
+    return true;
+  }
+
+  const onConflict = insert.onConflictDoNothing({ target: opts.auth.schema.chunks.chunkHash });
+  if (typeof onConflict.returning === "function") {
+    const rows = await onConflict.returning({ chunkHash: opts.auth.schema.chunks.chunkHash });
+    return rows.length > 0;
+  }
+  await onConflict;
+  return true;
 }
 
 async function handleDownloadObject(

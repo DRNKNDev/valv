@@ -73,6 +73,103 @@ describe("blobstore batch coordination", () => {
     expect(db.insertedChunks).toEqual([]);
   });
 
+  it.each(["none", "incomplete"])("rejects %s subscriptions before issuing upload URLs", async (status) => {
+    const getQuota = vi.fn(async () => ({
+      quota_bytes: 100,
+      usage_bytes: 0,
+      subscription_status: status,
+      current_period_end: null,
+    }));
+    const response = await appFor(new BlobTestDb(), { type: "device", deviceId: "device-1" }, { getQuota }).request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({ operation: "upload", objects: [{ oid: "new", size: 2 }] }),
+      headers: { "content-type": "application/json", authorization: "Bearer token" },
+    });
+
+    expect(response.status).toBe(402);
+    await expect(response.json()).resolves.toEqual({ error: "subscription_inactive", status });
+  });
+
+  it("allows past_due subscriptions within the grace period", async () => {
+    const currentPeriodEnd = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    const response = await appFor(new BlobTestDb(), { type: "device", deviceId: "device-1" }, {
+      getQuota: async () => ({
+        quota_bytes: 100,
+        usage_bytes: 0,
+        subscription_status: "past_due",
+        current_period_end: currentPeriodEnd,
+      }),
+      pastDueGraceDays: 5,
+    }).request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({ operation: "upload", objects: [{ oid: "new", size: 2 }] }),
+      headers: { "content-type": "application/json", authorization: "Bearer token" },
+    });
+
+    expect(response.status).toBe(200);
+  });
+
+  it("rejects past_due subscriptions after the grace period", async () => {
+    const currentPeriodEnd = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const response = await appFor(new BlobTestDb(), { type: "device", deviceId: "device-1" }, {
+      getQuota: async () => ({
+        quota_bytes: 100,
+        usage_bytes: 0,
+        subscription_status: "past_due",
+        current_period_end: currentPeriodEnd,
+      }),
+      pastDueGraceDays: 5,
+    }).request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({ operation: "upload", objects: [{ oid: "new", size: 2 }] }),
+      headers: { "content-type": "application/json", authorization: "Bearer token" },
+    });
+
+    expect(response.status).toBe(402);
+    await expect(response.json()).resolves.toEqual({ error: "subscription_inactive", status: "past_due" });
+  });
+
+  it("applies quota checks to user principals", async () => {
+    const getQuota = vi.fn(async () => ({
+      quota_bytes: 10,
+      usage_bytes: 10,
+      subscription_status: "active",
+      current_period_end: null,
+    }));
+    const response = await appFor(new BlobTestDb(), { type: "user", userId: "user-1" }, { getQuota }).request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({ operation: "upload", objects: [{ oid: "new", size: 1 }] }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(402);
+    await expect(response.json()).resolves.toEqual({ error: "over_quota", usage_bytes: 10, quota_bytes: 10 });
+    expect(getQuota).toHaveBeenCalledWith({ type: "user", id: "user-1" });
+  });
+
+  it("treats duplicate first-time chunk inserts in one batch as deduped", async () => {
+    const db = new BlobTestDb({ atomicConflicts: true });
+    const response = await appFor(db).request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({
+        operation: "upload",
+        objects: [
+          { oid: "new", size: 2 },
+          { oid: "new", size: 2 },
+        ],
+      }),
+      headers: { "content-type": "application/json" },
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(db.insertedChunks).toEqual([{ chunkHash: "new", sizeBytes: 2, refcount: 0 }]);
+    expect(body.objects).toEqual([
+      expect.objectContaining({ oid: "new", already_exists: false }),
+      { oid: "new", size: 2, already_exists: true },
+    ]);
+  });
+
   it("issues download URLs only when a grant covers a referencing node", async () => {
     const db = new BlobTestDb({ authorized: true, downloadRows: [{ nodeId: "doc", manifest: [{ chunk_hash: "oid-1" }] }] });
     const app = appFor(db, { type: "device", deviceId: "device-1" });
@@ -123,12 +220,14 @@ class BlobTestDb implements CoreDb {
   private existingChunks: Array<{ chunkHash: string; refcount: number }>;
   private downloadRows: Array<{ nodeId: string; manifest: Array<{ chunk_hash: string }> }>;
   private authorized: boolean;
+  private atomicConflicts: boolean;
   private selectCalls = 0;
 
-  constructor(opts: { existingChunks?: Array<{ chunkHash: string; refcount: number }>; downloadRows?: Array<{ nodeId: string; manifest: Array<{ chunk_hash: string }> }>; authorized?: boolean } = {}) {
+  constructor(opts: { existingChunks?: Array<{ chunkHash: string; refcount: number }>; downloadRows?: Array<{ nodeId: string; manifest: Array<{ chunk_hash: string }> }>; authorized?: boolean; atomicConflicts?: boolean } = {}) {
     this.existingChunks = opts.existingChunks ?? [];
     this.downloadRows = opts.downloadRows ?? [];
     this.authorized = opts.authorized ?? true;
+    this.atomicConflicts = opts.atomicConflicts ?? false;
   }
 
   select(): any {
@@ -146,9 +245,26 @@ class BlobTestDb implements CoreDb {
 
   insert(): any {
     return {
-      values: async (value: { chunkHash: string; sizeBytes: number; refcount: number }) => {
-        this.insertedChunks.push(value);
-        this.existingChunks.push({ chunkHash: value.chunkHash, refcount: value.refcount });
+      values: (value: { chunkHash: string; sizeBytes: number; refcount: number }) => {
+        const insert = async () => {
+          this.insertedChunks.push(value);
+          this.existingChunks.push({ chunkHash: value.chunkHash, refcount: value.refcount });
+          return [{ chunkHash: value.chunkHash }];
+        };
+        if (!this.atomicConflicts) {
+          return insert();
+        }
+        return {
+          onConflictDoNothing: () => ({
+            returning: async () => {
+              if (this.existingChunks.some((chunk) => chunk.chunkHash === value.chunkHash)) {
+                return [];
+              }
+              return insert();
+            },
+          }),
+          then: (resolve: (value: unknown) => unknown, reject: (reason: unknown) => unknown) => insert().then(resolve, reject),
+        };
       },
     };
   }
@@ -167,7 +283,19 @@ class BlobTestDb implements CoreDb {
   }
 }
 
-function appFor(db: BlobTestDb, principal: Principal | null = { type: "user", userId: "user-1" }) {
+function appFor(
+  db: BlobTestDb,
+  principal: Principal | null = { type: "user", userId: "user-1" },
+  opts: {
+    getQuota?: (principal: { type: "device" | "user"; id: string }) => Promise<{
+      quota_bytes: number;
+      usage_bytes: number;
+      subscription_status: string;
+      current_period_end: string | null;
+    } | null>;
+    pastDueGraceDays?: number;
+  } = {},
+) {
   const auth = {
     db,
     schema: pgSchema,
@@ -190,5 +318,5 @@ function appFor(db: BlobTestDb, principal: Principal | null = { type: "user", us
       return new Request(`signed:${command}:${key}`);
     }),
   } as any;
-  return createBlobstoreRouter({ auth, s3, bucketName: "bucket" });
+  return createBlobstoreRouter({ auth, s3, bucketName: "bucket", getQuota: opts.getQuota, pastDueGraceDays: opts.pastDueGraceDays });
 }
