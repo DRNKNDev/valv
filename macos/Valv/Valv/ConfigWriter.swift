@@ -4,10 +4,8 @@ import Foundation
 /// expects (`oss/crates/valvd/src/config.rs`). Only reachable now that `Valv` runs
 /// unsandboxed (design.md D3-2) - the real config path, not a sandbox-container-redirected one.
 enum ConfigWriter {
-    // TODO: no hosted web login page exists yet to redirect back via valv://auth-callback
-    // (design.md's own open question - this touches private/apps/web, out of this
-    // change's oss/ scope).
     static let defaultBackendURL = "https://api.valvsync.com"
+    // Base web login URL; onboarding adds device-pairing query parameters per sign-in attempt.
     static let loginURL = URL(string: "https://valvsync.com/login")!
 
     struct Values {
@@ -22,11 +20,16 @@ enum ConfigWriter {
     }
 
     static var configPath: URL {
+        configPath(in: configDirectory)
+    }
+
+    static func configPath(in configDirectory: URL) -> URL {
         configDirectory.appendingPathComponent("config.toml")
     }
 
-    static func write(_ values: Values) throws {
+    static func write(_ values: Values, configDirectory: URL = Self.configDirectory) throws {
         try FileManager.default.createDirectory(at: configDirectory, withIntermediateDirectories: true)
+        let configPath = configPath(in: configDirectory)
         let contents = """
         backend_url = "\(escape(values.backendURL))"
         device_id = "\(escape(values.deviceId))"

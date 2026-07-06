@@ -168,8 +168,14 @@ private struct SignInOnboardingPage: View {
                         .foregroundStyle(.white.opacity(0.85))
                 } else {
                     OnboardingPrimaryButton(title: "Continue in Browser") {
+                        let state = UUID().uuidString
+                        let deviceName = Host.current().localizedName ?? "Valv Device"
+                        callbackCenter.beginSignIn(expectedState: state)
                         isWaiting = true
-                        NSWorkspace.shared.open(ConfigWriter.loginURL)
+                        NSWorkspace.shared.open(SignInDevicePairing.loginURL(
+                            deviceName: deviceName,
+                            state: state
+                        ))
                     }
                 }
             }
@@ -180,32 +186,30 @@ private struct SignInOnboardingPage: View {
     }
 
     private func handleCallback(_ url: URL) {
-        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let deviceId = components.queryItems?.first(where: { $0.name == "device_id" })?.value,
-              let deviceToken = components.queryItems?.first(where: { $0.name == "device_token" })?.value,
-              !deviceId.isEmpty, !deviceToken.isEmpty
-        else {
-            coordinator.signInError = "Sign-in link was missing required information."
-            isWaiting = false
-            return
-        }
+        let deviceName = Host.current().localizedName ?? "Valv Device"
 
         do {
-            try ConfigWriter.write(ConfigWriter.Values(
-                backendURL: ConfigWriter.defaultBackendURL,
-                deviceId: deviceId,
-                deviceToken: deviceToken,
-                deviceName: Host.current().localizedName ?? "Valv Device"
-            ))
+            let credentials = try SignInDevicePairing.writeConfig(
+                from: url,
+                expectedState: callbackCenter.expectedState,
+                deviceName: deviceName
+            )
+            callbackCenter.clearExpectedState()
             store.hasSignedIn = true
             Task {
                 await restartDaemon()
                 await store.refresh()
                 // Exactly one NSFileProviderDomain for the whole account (design.md
                 // D11) - registered once, here, on first successful sign-in.
-                await domainManager.registerDomainIfNeeded(accountId: deviceId)
+                await domainManager.registerDomainIfNeeded(accountId: credentials.deviceId)
                 coordinator.advance()
             }
+        } catch SignInDevicePairing.CallbackError.missingOrMismatchedState {
+            coordinator.signInError = "Sign-in link did not match this device. Please try again."
+            isWaiting = false
+        } catch SignInDevicePairing.CallbackError.missingCredentials {
+            coordinator.signInError = "Sign-in link was missing required information."
+            isWaiting = false
         } catch {
             coordinator.signInError = "Couldn't save sign-in details: \(error.localizedDescription)"
             isWaiting = false

@@ -11,15 +11,24 @@ enum OnboardingPage: Int, CaseIterable {
 }
 
 /// Delivers the `valv://auth-callback` URL from `ValvApp`'s `.onOpenURL` to whichever
-/// onboarding page is listening, without threading the URL through every view in
-/// between.
+/// onboarding page is listening, and retains the expected state nonce for the
+/// current browser sign-in attempt.
 final class AuthCallbackCenter: ObservableObject {
     static let shared = AuthCallbackCenter()
 
     @Published var lastCallback: URL?
+    @Published private(set) var expectedState: String?
 
     func handle(_ url: URL) {
         lastCallback = url
+    }
+
+    func beginSignIn(expectedState: String) {
+        self.expectedState = expectedState
+    }
+
+    func clearExpectedState() {
+        expectedState = nil
     }
 }
 
