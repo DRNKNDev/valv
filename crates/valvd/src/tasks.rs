@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, Json};
 use chrono::Utc;
 use serde::Deserialize;
 use tokio::{
@@ -32,12 +32,17 @@ use valv_sync::{
     watch::{fs_watch_task, WatchMount},
 };
 
-use crate::{internal_error, DaemonState, ErrorResponse, MountState};
+use crate::{error::DaemonError, DaemonState, MountState};
 
 pub(crate) async fn post_sync(
     State(state): State<DaemonState>,
     Json(req): Json<SyncRequest>,
-) -> Result<Json<SyncSummary>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<SyncSummary>, DaemonError> {
+    if req.folder_id.as_deref().is_some_and(str::is_empty) {
+        return Err(DaemonError::BadRequest(
+            "folder_id cannot be empty".to_owned(),
+        ));
+    }
     let targets = {
         let mounts = state.mounts.lock().await;
         mounts
@@ -53,9 +58,7 @@ pub(crate) async fn post_sync(
 
     let mut summary = SyncSummary::default();
     for mount in targets {
-        let mount_summary = run_full_sync_mount(state.clone(), mount)
-            .await
-            .map_err(internal_error)?;
+        let mount_summary = run_full_sync_mount(state.clone(), mount).await?;
         merge_sync_summary(&mut summary, mount_summary);
     }
 
@@ -83,10 +86,19 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
     let ws_token = token.clone();
     let ws_folder_id = mount.folder_id.clone();
     let ws_handle = tokio::spawn(async move {
-        if let Err(error) =
-            ws_push_loop(&ws_backend_url, &ws_token, vec![ws_folder_id], notify_tx).await
+        if let Err(error) = ws_push_loop(
+            &ws_backend_url,
+            &ws_token,
+            vec![ws_folder_id.clone()],
+            notify_tx,
+        )
+        .await
         {
-            eprintln!("websocket task failed: {error}");
+            tracing::error!(
+                folder_id = %ws_folder_id,
+                error = %error,
+                "websocket task failed"
+            );
         }
     });
 
@@ -97,6 +109,7 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
         let client = state.client.clone();
         let backend_url = state.config.backend_url.clone();
         let device_name = state.config.device_name.clone();
+        let fs_folder_id = mount.folder_id.clone();
         let watch_mount = WatchMount {
             path: PathBuf::from(&mount.path),
             folder_id: mount.folder_id.clone(),
@@ -114,7 +127,11 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
             )
             .await
             {
-                eprintln!("filesystem watch task failed: {error}");
+                tracing::error!(
+                    folder_id = %fs_folder_id,
+                    error = %error,
+                    "filesystem watch task failed"
+                );
             }
         }
     });
@@ -229,7 +246,11 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
             .await;
         }
         Err(error) => {
-            eprintln!("push_local failed for {}: {error}", mount.folder_id);
+            tracing::error!(
+                folder_id = %mount.folder_id,
+                error = %error,
+                "push_local failed"
+            );
             summary.errors += 1;
         }
     }
@@ -251,14 +272,19 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
             summary.pulled_ops = pulled_ops;
             let was_paused = pause_watchers(state);
             if let Err(error) = apply_pulled_fs_changes(state, mount, pulled).await {
-                eprintln!(
-                    "apply pulled filesystem changes failed for {}: {error}",
-                    mount.folder_id
+                tracing::error!(
+                    folder_id = %mount.folder_id,
+                    error = %error,
+                    "apply pulled filesystem changes failed"
                 );
                 summary.errors += 1;
             }
             if let Err(error) = materialize_mount_files(state, mount).await {
-                eprintln!("materialize files failed for {}: {error}", mount.folder_id);
+                tracing::error!(
+                    folder_id = %mount.folder_id,
+                    error = %error,
+                    "materialize files failed"
+                );
                 summary.errors += 1;
             }
             resume_watchers_after_debounce(state, was_paused).await;
@@ -347,9 +373,12 @@ async fn apply_pulled_fs_changes(
         if let Err(error) =
             apply_pulled_fs_change(state, mount, &nodes_by_id, &mount_root, &pulled_node).await
         {
-            eprintln!(
-                "apply_pulled_fs_changes: failed to apply {} for {}: {error}",
-                pulled_node.op_type, pulled_node.node_id
+            tracing::error!(
+                folder_id = %mount.folder_id,
+                node_id = %pulled_node.node_id,
+                op_type = %pulled_node.op_type,
+                error = %error,
+                "failed to apply pulled filesystem change"
             );
         }
     }
@@ -877,7 +906,7 @@ async fn begin_mount_sync(state: &DaemonState, folder_id: &str) {
     }
 }
 
-async fn end_mount_sync(state: &DaemonState, folder_id: &str, error: Option<String>) {
+pub(crate) async fn end_mount_sync(state: &DaemonState, folder_id: &str, error: Option<String>) {
     let mut mounts = state.mounts.lock().await;
     if let Some(mount) = mounts.iter_mut().find(|mount| mount.folder_id == folder_id) {
         mount.active_syncs = mount.active_syncs.saturating_sub(1);
@@ -906,4 +935,64 @@ fn merge_sync_summary(summary: &mut SyncSummary, mount_summary: SyncSummary) {
     summary.versions_submitted += mount_summary.versions_submitted;
     summary.pulled_ops += mount_summary.pulled_ops;
     summary.errors += mount_summary.errors;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{atomic::AtomicBool, Arc},
+    };
+
+    use rusqlite::Connection;
+    use tokio::sync::Mutex;
+    use valv_sync::protocol::ipc::SyncRequest;
+
+    use crate::config::DaemonConfig;
+
+    use super::*;
+
+    fn test_state() -> DaemonState {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../valv-sync/src/persistence/schema.sql"))
+            .unwrap();
+        DaemonState {
+            paused: Arc::new(AtomicBool::new(false)),
+            fs_events_paused: Arc::new(AtomicBool::new(false)),
+            mounts: Arc::new(Mutex::new(Vec::new())),
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            db: Arc::new(Mutex::new(conn)),
+            client: reqwest::Client::new(),
+            config: DaemonConfig {
+                backend_url: "http://127.0.0.1:1".to_owned(),
+                device_id: "device-1".to_owned(),
+                device_token: "token".to_owned(),
+                device_name: "Test Device".to_owned(),
+                mounts: Vec::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn post_sync_with_no_mounts_returns_empty_summary() {
+        let response = post_sync(State(test_state()), Json(SyncRequest { folder_id: None }))
+            .await
+            .unwrap();
+
+        assert_eq!(response.0, SyncSummary::default());
+    }
+
+    #[tokio::test]
+    async fn post_sync_rejects_empty_folder_id() {
+        let error = post_sync(
+            State(test_state()),
+            Json(SyncRequest {
+                folder_id: Some(String::new()),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, DaemonError::BadRequest(_)));
+    }
 }

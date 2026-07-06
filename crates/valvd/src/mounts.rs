@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use axum::{extract::State, http::StatusCode, Json};
 use rusqlite::Connection;
 use serde::Deserialize;
@@ -12,25 +12,35 @@ use valv_sync::{
 };
 
 use crate::{
-    internal_error,
+    error::{backend_response_or_error, DaemonError},
     tasks::{cancel_tasks_for_mount, materialize_mount_files, spawn_tasks_for_mount},
-    DaemonState, ErrorResponse, MountState,
+    DaemonState, MountState,
 };
 
 pub(crate) async fn post_mount(
     State(state): State<DaemonState>,
     Json(req): Json<MountRequest>,
-) -> Result<Json<MountResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<MountResponse>, DaemonError> {
+    if req.path.trim().is_empty() {
+        return Err(DaemonError::BadRequest("path is required".to_owned()));
+    }
+    if req.folder_id.as_deref().is_some_and(str::is_empty) {
+        return Err(DaemonError::BadRequest(
+            "folder_id cannot be empty".to_owned(),
+        ));
+    }
+    if req.grant_token.as_deref().is_some_and(str::is_empty) {
+        return Err(DaemonError::BadRequest(
+            "grant_token cannot be empty".to_owned(),
+        ));
+    }
     if req.folder_id.is_some() && req.grant_token.is_some() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "folder_id_and_grant_token_are_mutually_exclusive",
-            )),
+        return Err(DaemonError::BadRequest(
+            "folder_id_and_grant_token_are_mutually_exclusive".to_owned(),
         ));
     }
 
-    let resolved = resolve_mount(&state, &req).await.map_err(internal_error)?;
+    let resolved = resolve_mount(&state, &req).await?;
     let token = resolved
         .mount_token
         .as_deref()
@@ -46,8 +56,7 @@ pub(crate) async fn post_mount(
             resolved.scope_node_id.as_deref(),
             resolved.mount_token.as_deref(),
             resolved.can_write,
-        )
-        .map_err(internal_error)?;
+        )?;
         if let Err(err) = tree_resync(
             &state.client,
             &state.config.backend_url,
@@ -58,20 +67,18 @@ pub(crate) async fn post_mount(
         .await
         {
             let _ = mount_store::delete_mount(&conn, &req.path);
-            return Err(internal_error(err));
+            return Err(DaemonError::Internal(err.to_string()));
         }
 
-        local_mount_name(&conn, &resolved).map_err(internal_error)?
+        local_mount_name(&conn, &resolved)?
     };
     let name = match local_name {
         Some(name) => name,
-        None => fetch_folder_name(&state, &resolved.folder_id, &token)
-            .await
-            .map_err(internal_error)?,
+        None => fetch_folder_name(&state, &resolved.folder_id, &token).await?,
     };
     {
         let conn = state.db.lock().await;
-        mount_store::set_mount_name(&conn, &req.path, &name).map_err(internal_error)?;
+        mount_store::set_mount_name(&conn, &req.path, &name)?;
     }
     let mount = MountState {
         path: req.path.clone(),
@@ -91,7 +98,7 @@ pub(crate) async fn post_mount(
     if let Err(err) = materialize_mount_files(&state, &mount).await {
         let conn = state.db.lock().await;
         let _ = mount_store::delete_mount(&conn, &req.path);
-        return Err(internal_error(err));
+        return Err(DaemonError::Internal(err.to_string()));
     }
     {
         let mut mounts = state.mounts.lock().await;
@@ -124,7 +131,10 @@ pub(crate) async fn post_mount(
 pub(crate) async fn delete_mount_route(
     State(state): State<DaemonState>,
     Json(req): Json<UnmountRequest>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<StatusCode, DaemonError> {
+    if req.folder_id.trim().is_empty() {
+        return Err(DaemonError::BadRequest("folder_id is required".to_owned()));
+    }
     let mount = {
         let mounts = state.mounts.lock().await;
         mounts
@@ -133,16 +143,13 @@ pub(crate) async fn delete_mount_route(
             .cloned()
     };
     let Some(mount) = mount else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse::new("mount_not_found")),
-        ));
+        return Err(DaemonError::NotFound("mount_not_found".to_owned()));
     };
 
     cancel_tasks_for_mount(&state, &mount.path).await;
     {
         let conn = state.db.lock().await;
-        mount_store::delete_mount(&conn, &mount.path).map_err(internal_error)?;
+        mount_store::delete_mount(&conn, &mount.path)?;
     }
     {
         let mut mounts = state.mounts.lock().await;
@@ -179,7 +186,10 @@ struct FolderResponse {
     name: String,
 }
 
-async fn resolve_mount(state: &DaemonState, req: &MountRequest) -> Result<ResolvedMount> {
+async fn resolve_mount(
+    state: &DaemonState,
+    req: &MountRequest,
+) -> Result<ResolvedMount, DaemonError> {
     if let Some(grant_token) = &req.grant_token {
         let grants = state
             .client
@@ -189,14 +199,14 @@ async fn resolve_mount(state: &DaemonState, req: &MountRequest) -> Result<Resolv
             ))
             .bearer_auth(grant_token)
             .send()
+            .await?;
+        let grants = backend_response_or_error(grants)
             .await?
-            .error_for_status()?
             .json::<Vec<GrantListEntry>>()
             .await?;
-        let grant = grants
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("grant token has no accessible grants"))?;
+        let grant = grants.into_iter().next().ok_or_else(|| {
+            DaemonError::NotFound("grant token has no accessible grants".to_owned())
+        })?;
         return Ok(ResolvedMount {
             folder_id: grant.folder_id,
             grant_id: Some(grant.grant_id),
@@ -230,8 +240,9 @@ async fn resolve_mount(state: &DaemonState, req: &MountRequest) -> Result<Resolv
         .bearer_auth(&state.config.device_token)
         .json(&serde_json::json!({ "name": name }))
         .send()
+        .await?;
+    let created = backend_response_or_error(created)
         .await?
-        .error_for_status()?
         .json::<CreateFolderResponse>()
         .await?;
     Ok(ResolvedMount {
@@ -255,7 +266,11 @@ fn local_mount_name(conn: &Connection, resolved: &ResolvedMount) -> Result<Optio
     Ok(effective_scope_node.and_then(|node| (!node.name.is_empty()).then_some(node.name)))
 }
 
-async fn fetch_folder_name(state: &DaemonState, folder_id: &str, token: &str) -> Result<String> {
+async fn fetch_folder_name(
+    state: &DaemonState,
+    folder_id: &str,
+    token: &str,
+) -> Result<String, DaemonError> {
     let folder = state
         .client
         .get(format!(
@@ -265,8 +280,9 @@ async fn fetch_folder_name(state: &DaemonState, folder_id: &str, token: &str) ->
         ))
         .bearer_auth(token)
         .send()
+        .await?;
+    let folder = backend_response_or_error(folder)
         .await?
-        .error_for_status()?
         .json::<FolderResponse>()
         .await?;
     Ok(folder.name)
@@ -280,10 +296,8 @@ mod tests {
 
     fn memory_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!(
-            "../../valv-sync/src/persistence/schema.sql"
-        ))
-        .unwrap();
+        conn.execute_batch(include_str!("../../valv-sync/src/persistence/schema.sql"))
+            .unwrap();
         conn
     }
 
@@ -460,7 +474,6 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        let (status, _) = result.unwrap_err();
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(matches!(result.unwrap_err(), DaemonError::NotFound(_)));
     }
 }

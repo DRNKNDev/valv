@@ -1,23 +1,19 @@
 use axum::{
     extract::{Path as AxumPath, State},
-    http::StatusCode,
     Json,
 };
 use rusqlite::Connection;
 use valv_sync::{persistence::nodes as node_store, protocol::ipc::NodePathResponse};
 
-use crate::{internal_error, DaemonState, ErrorResponse};
+use crate::{error::DaemonError, DaemonState};
 
 pub(crate) async fn get_node_path(
     State(state): State<DaemonState>,
     AxumPath(node_id): AxumPath<String>,
-) -> Result<Json<NodePathResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<NodePathResponse>, DaemonError> {
     let conn = state.db.lock().await;
-    let Some(node) = node_store::get_node(&conn, &node_id).map_err(internal_error)? else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse::new("node_not_found")),
-        ));
+    let Some(node) = node_store::get_node(&conn, &node_id)? else {
+        return Err(DaemonError::NotFound("node_not_found".to_owned()));
     };
 
     let scope_node_id = state
@@ -28,7 +24,7 @@ pub(crate) async fn get_node_path(
         .find(|mount| mount.folder_id == node.folder_id)
         .and_then(|mount| mount.scope_node_id.clone());
 
-    let path = resolve_node_path(&conn, &node_id, scope_node_id.as_deref()).map_err(internal_error)?;
+    let path = resolve_node_path(&conn, &node_id, scope_node_id.as_deref())?;
     Ok(Json(NodePathResponse { path }))
 }
 
@@ -70,10 +66,8 @@ mod tests {
 
     fn memory_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!(
-            "../../valv-sync/src/persistence/schema.sql"
-        ))
-        .unwrap();
+        conn.execute_batch(include_str!("../../valv-sync/src/persistence/schema.sql"))
+            .unwrap();
         conn
     }
 
@@ -139,11 +133,11 @@ mod tests {
             },
         };
 
-        let (status, _) = get_node_path(State(state), AxumPath("unknown".to_owned()))
+        let error = get_node_path(State(state), AxumPath("unknown".to_owned()))
             .await
             .unwrap_err();
 
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(matches!(error, DaemonError::NotFound(_)));
     }
 
     #[test]

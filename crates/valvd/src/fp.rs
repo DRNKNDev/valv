@@ -10,9 +10,11 @@ use chrono::Utc;
 use reqwest::header::{HeaderName, HeaderValue};
 use rusqlite::Connection;
 use serde::Deserialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use valv_sync::{
+    api_base,
     chunking::{chunk_file, Chunk},
     persistence::{chunks as chunk_store, mounts, nodes, versions, LocalNode},
     protocol::{
@@ -27,31 +29,32 @@ use valv_sync::{
             SubmitOpResponse,
         },
     },
-    sync_engine::op_submit::submit_op,
 };
 
-use crate::{internal_error, DaemonState, ErrorResponse, MountState};
+use crate::{
+    error::{backend_response_or_error, DaemonError},
+    DaemonState, MountState,
+};
 
 pub(crate) async fn fp_items(
     State(state): State<DaemonState>,
     Query(query): Query<FpItemsQuery>,
-) -> Result<Json<FpEnumerateResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mount = resolve_mount_for_query(&state, query.folder_id.as_deref())
-        .await
-        .map_err(internal_error)?;
+) -> Result<Json<FpEnumerateResponse>, DaemonError> {
+    if query.parent.trim().is_empty() {
+        return Err(DaemonError::BadRequest("parent is required".to_owned()));
+    }
+    let mount = resolve_mount_for_query(&state, query.folder_id.as_deref()).await?;
     let limit = query.limit.unwrap_or(200).min(200);
     let offset = query.offset.unwrap_or(0);
     let conn = state.db.lock().await;
-    let parent = resolve_parent_id(&conn, &mount, &query.parent).map_err(internal_error)?;
+    let parent = resolve_parent_id(&conn, &mount, &query.parent)?;
     let (nodes, total) =
-        nodes::list_children(&conn, parent.as_deref(), &mount.folder_id, offset, limit)
-            .map_err(internal_error)?;
+        nodes::list_children(&conn, parent.as_deref(), &mount.folder_id, offset, limit)?;
     let items = nodes
         .iter()
         .map(|node| fp_item_from_node(&conn, node))
-        .collect::<Result<Vec<_>>>()
-        .map_err(internal_error)?;
-    let synced_to_seq = mounts::get_cursor(&conn, &mount.folder_id).map_err(internal_error)?;
+        .collect::<Result<Vec<_>>>()?;
+    let synced_to_seq = mounts::get_cursor(&conn, &mount.folder_id)?;
     Ok(Json(FpEnumerateResponse {
         items,
         total,
@@ -63,29 +66,22 @@ pub(crate) async fn fp_items(
 pub(crate) async fn fp_item(
     State(state): State<DaemonState>,
     AxumPath(node_id): AxumPath<String>,
-) -> Result<Json<FpItem>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<FpItem>, DaemonError> {
     let conn = state.db.lock().await;
-    let Some(node) = nodes::get_node(&conn, &node_id).map_err(internal_error)? else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse::new("node_not_found")),
-        ));
+    let Some(node) = nodes::get_node(&conn, &node_id)? else {
+        return Err(DaemonError::NotFound("node_not_found".to_owned()));
     };
-    Ok(Json(
-        fp_item_from_node(&conn, &node).map_err(internal_error)?,
-    ))
+    Ok(Json(fp_item_from_node(&conn, &node)?))
 }
 
 pub(crate) async fn fp_anchor(
     State(state): State<DaemonState>,
     Query(query): Query<FpFolderQuery>,
-) -> Result<Json<FpAnchorResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mount = resolve_mount_for_query(&state, query.folder_id.as_deref())
-        .await
-        .map_err(internal_error)?;
+) -> Result<Json<FpAnchorResponse>, DaemonError> {
+    let mount = resolve_mount_for_query(&state, query.folder_id.as_deref()).await?;
     let conn = state.db.lock().await;
     Ok(Json(FpAnchorResponse {
-        server_seq: mounts::get_cursor(&conn, &mount.folder_id).map_err(internal_error)?,
+        server_seq: mounts::get_cursor(&conn, &mount.folder_id)?,
         can_write: mount.can_write,
     }))
 }
@@ -95,7 +91,7 @@ const FP_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25)
 pub(crate) async fn fp_watch(
     State(state): State<DaemonState>,
     Query(query): Query<FpWatchQuery>,
-) -> Result<Json<FpAnchorResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<FpAnchorResponse>, DaemonError> {
     fp_watch_inner(state, query, FP_WATCH_TIMEOUT).await
 }
 
@@ -103,13 +99,8 @@ async fn fp_watch_inner(
     state: DaemonState,
     query: FpWatchQuery,
     timeout: std::time::Duration,
-) -> Result<Json<FpAnchorResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let Ok(mount) = resolve_mount_for_query(&state, query.folder_id.as_deref()).await else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse::new("mount_not_found")),
-        ));
-    };
+) -> Result<Json<FpAnchorResponse>, DaemonError> {
+    let mount = resolve_mount_for_query(&state, query.folder_id.as_deref()).await?;
     // Register as a waiter before checking the cursor: `Notify::notified()`'s
     // future, once created, captures any `notify_waiters()` call that happens
     // after this point even if we haven't started awaiting it yet - checking
@@ -118,7 +109,7 @@ async fn fp_watch_inner(
     let notified = mount.cursor_notify.notified();
     let current_seq = {
         let conn = state.db.lock().await;
-        mounts::get_cursor(&conn, &mount.folder_id).map_err(internal_error)?
+        mounts::get_cursor(&conn, &mount.folder_id)?
     };
     if current_seq <= query.since_seq {
         tokio::select! {
@@ -128,7 +119,7 @@ async fn fp_watch_inner(
     }
     let server_seq = {
         let conn = state.db.lock().await;
-        mounts::get_cursor(&conn, &mount.folder_id).map_err(internal_error)?
+        mounts::get_cursor(&conn, &mount.folder_id)?
     };
     Ok(Json(FpAnchorResponse {
         server_seq,
@@ -139,19 +130,15 @@ async fn fp_watch_inner(
 pub(crate) async fn fp_changes(
     State(state): State<DaemonState>,
     Query(query): Query<FpChangesQuery>,
-) -> Result<Json<FpChangesResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mount = resolve_mount_for_query(&state, query.folder_id.as_deref())
-        .await
-        .map_err(internal_error)?;
+) -> Result<Json<FpChangesResponse>, DaemonError> {
+    let mount = resolve_mount_for_query(&state, query.folder_id.as_deref()).await?;
     let conn = state.db.lock().await;
-    let nodes = nodes::list_changed_since(&conn, &mount.folder_id, query.since_seq.unwrap_or(0))
-        .map_err(internal_error)?;
+    let nodes = nodes::list_changed_since(&conn, &mount.folder_id, query.since_seq.unwrap_or(0))?;
     let items = nodes
         .iter()
         .map(|node| fp_item_from_node(&conn, node))
-        .collect::<Result<Vec<_>>>()
-        .map_err(internal_error)?;
-    let current_seq = mounts::get_cursor(&conn, &mount.folder_id).map_err(internal_error)?;
+        .collect::<Result<Vec<_>>>()?;
+    let current_seq = mounts::get_cursor(&conn, &mount.folder_id)?;
     Ok(Json(FpChangesResponse {
         items,
         current_seq,
@@ -162,35 +149,22 @@ pub(crate) async fn fp_changes(
 pub(crate) async fn fp_content(
     State(state): State<DaemonState>,
     AxumPath(node_id): AxumPath<String>,
-) -> Result<Json<FpContentResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<FpContentResponse>, DaemonError> {
     let (mount, version) = {
         let conn = state.db.lock().await;
-        let Some(node) = nodes::get_node(&conn, &node_id).map_err(internal_error)? else {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new("node_not_found")),
-            ));
+        let Some(node) = nodes::get_node(&conn, &node_id)? else {
+            return Err(DaemonError::NotFound("node_not_found".to_owned()));
         };
         let Some(version_id) = node.current_version_id.as_deref() else {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new("version_not_found")),
-            ));
+            return Err(DaemonError::NotFound("version_not_found".to_owned()));
         };
-        let Some(version) = versions::get_version(&conn, version_id).map_err(internal_error)?
-        else {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new("version_not_found")),
-            ));
+        let Some(version) = versions::get_version(&conn, version_id)? else {
+            return Err(DaemonError::NotFound("version_not_found".to_owned()));
         };
-        let mount = resolve_mount_for_folder_id(&state, &node.folder_id)
-            .await
-            .map_err(internal_error)?;
+        let mount = resolve_mount_for_folder_id(&state, &node.folder_id).await?;
         (mount, version)
     };
-    let manifest =
-        serde_json::from_str::<Vec<ChunkRef>>(&version.manifest_json).map_err(internal_error)?;
+    let manifest = serde_json::from_str::<Vec<ChunkRef>>(&version.manifest_json)?;
     let objects = manifest
         .iter()
         .map(|chunk| BatchRequestObject {
@@ -208,13 +182,11 @@ pub(crate) async fn fp_content(
         .bearer_auth(token)
         .json(&BatchRequest::new(BatchOperation::Download, objects))
         .send()
-        .await
-        .map_err(internal_error)?
-        .error_for_status()
-        .map_err(internal_error)?
+        .await?;
+    let batch = backend_response_or_error(batch)
+        .await?
         .json::<BatchResponse>()
-        .await
-        .map_err(internal_error)?;
+        .await?;
     let chunks = manifest
         .iter()
         .map(|chunk| {
@@ -236,8 +208,7 @@ pub(crate) async fn fp_content(
                 expires_in: action.expires_in.unwrap_or(0),
             })
         })
-        .collect::<Result<Vec<_>>>()
-        .map_err(internal_error)?;
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(Json(FpContentResponse {
         version_id: version.version_id,
@@ -249,7 +220,8 @@ pub(crate) async fn fp_content(
 pub(crate) async fn fp_upload(
     State(state): State<DaemonState>,
     Json(req): Json<FpUploadRequest>,
-) -> Result<(StatusCode, Json<FpUploadQueued>), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(StatusCode, Json<FpUploadQueued>), DaemonError> {
+    validate_upload_request(&req)?;
     let node_id = req
         .node_id
         .clone()
@@ -267,24 +239,22 @@ pub(crate) async fn fp_upload(
 pub(crate) async fn fp_delete(
     State(state): State<DaemonState>,
     Json(req): Json<FpDeleteRequest>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<StatusCode, DaemonError> {
+    if req.node_id.trim().is_empty() {
+        return Err(DaemonError::BadRequest("node_id is required".to_owned()));
+    }
     let (folder_id, token) = {
         let conn = state.db.lock().await;
-        let Some(node) = nodes::get_node(&conn, &req.node_id).map_err(internal_error)? else {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new("node_not_found")),
-            ));
+        let Some(node) = nodes::get_node(&conn, &req.node_id)? else {
+            return Err(DaemonError::NotFound("node_not_found".to_owned()));
         };
-        let mount = resolve_mount_for_folder_id(&state, &node.folder_id)
-            .await
-            .map_err(internal_error)?;
+        let mount = resolve_mount_for_folder_id(&state, &node.folder_id).await?;
         (
             node.folder_id,
             mount.effective_token(&state.config).to_owned(),
         )
     };
-    let response = submit_op(
+    let response = submit_op_daemon(
         &state.client,
         &state.config.backend_url,
         &token,
@@ -295,30 +265,38 @@ pub(crate) async fn fp_delete(
             payload: DeletePayload {},
         },
     )
-    .await
-    .map_err(internal_error)?;
-    Ok(match response {
-        SubmitOpResponse::Applied { .. } => StatusCode::NO_CONTENT,
-        SubmitOpResponse::Superseded { .. } => StatusCode::CONFLICT,
-        SubmitOpResponse::ConflictCopy { .. } => StatusCode::CONFLICT,
-    })
+    .await?;
+    match response {
+        SubmitOpResponse::Applied { .. } => Ok(StatusCode::NO_CONTENT),
+        SubmitOpResponse::Superseded { .. } => Err(DaemonError::Conflict(json!({
+            "error": "superseded",
+            "message": "delete was superseded; re-sync before retrying"
+        }))),
+        SubmitOpResponse::ConflictCopy { .. } => Err(DaemonError::Conflict(json!({
+            "error": "conflict_copy",
+            "message": "delete conflicted with a concurrent write; re-sync before retrying"
+        }))),
+    }
 }
 
 pub(crate) async fn fp_share(
     State(state): State<DaemonState>,
     Json(req): Json<FpShareRequest>,
-) -> Result<Json<FpShareResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<FpShareResponse>, DaemonError> {
+    if req.node_id.trim().is_empty() {
+        return Err(DaemonError::BadRequest("node_id is required".to_owned()));
+    }
+    if req.invited_email.trim().is_empty() {
+        return Err(DaemonError::BadRequest(
+            "invited_email is required".to_owned(),
+        ));
+    }
     let (folder_id, token) = {
         let conn = state.db.lock().await;
-        let Some(node) = nodes::get_node(&conn, &req.node_id).map_err(internal_error)? else {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new("node_not_found")),
-            ));
+        let Some(node) = nodes::get_node(&conn, &req.node_id)? else {
+            return Err(DaemonError::NotFound("node_not_found".to_owned()));
         };
-        let mount = resolve_mount_for_folder_id(&state, &node.folder_id)
-            .await
-            .map_err(internal_error)?;
+        let mount = resolve_mount_for_folder_id(&state, &node.folder_id).await?;
         (
             node.folder_id,
             mount.effective_token(&state.config).to_owned(),
@@ -338,13 +316,11 @@ pub(crate) async fn fp_share(
             can_write: req.can_write,
         })
         .send()
-        .await
-        .map_err(internal_error)?
-        .error_for_status()
-        .map_err(internal_error)?
+        .await?;
+    let invite = backend_response_or_error(invite)
+        .await?
         .json::<InviteCreateResponse>()
-        .await
-        .map_err(internal_error)?;
+        .await?;
     Ok(Json(FpShareResponse {
         invite_url: format!(
             "{}/invites/{}/accept",
@@ -364,6 +340,24 @@ struct InviteCreateRequest {
 #[derive(Debug, Deserialize)]
 struct InviteCreateResponse {
     invite_token: String,
+}
+
+fn validate_upload_request(req: &FpUploadRequest) -> Result<(), DaemonError> {
+    if req.node_id.as_deref().is_some_and(str::is_empty) {
+        return Err(DaemonError::BadRequest(
+            "node_id cannot be empty".to_owned(),
+        ));
+    }
+    if req.parent_id.trim().is_empty() {
+        return Err(DaemonError::BadRequest("parent_id is required".to_owned()));
+    }
+    if req.name.trim().is_empty() {
+        return Err(DaemonError::BadRequest("name is required".to_owned()));
+    }
+    if req.file_path.trim().is_empty() {
+        return Err(DaemonError::BadRequest("file_path is required".to_owned()));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -409,26 +403,34 @@ fn resolve_parent_id(
 async fn resolve_mount_for_query(
     state: &DaemonState,
     folder_id: Option<&str>,
-) -> Result<MountState> {
+) -> Result<MountState, DaemonError> {
     let mounts = state.mounts.lock().await;
     if let Some(folder_id) = folder_id {
+        if folder_id.is_empty() {
+            return Err(DaemonError::BadRequest(
+                "folder_id cannot be empty".to_owned(),
+            ));
+        }
         mounts
             .iter()
             .find(|mount| mount.folder_id == folder_id)
             .cloned()
-            .ok_or_else(|| anyhow!("mount not found for folder {folder_id}"))
+            .ok_or_else(|| DaemonError::NotFound("mount_not_found".to_owned()))
     } else {
         match mounts.as_slice() {
             [mount] => Ok(mount.clone()),
-            [] => Err(anyhow!("no mounted folders")),
-            _ => Err(anyhow!(
-                "folder_id is required when multiple folders are mounted"
+            [] => Err(DaemonError::NotFound("mount_not_found".to_owned())),
+            _ => Err(DaemonError::BadRequest(
+                "folder_id is required when multiple folders are mounted".to_owned(),
             )),
         }
     }
 }
 
-async fn resolve_mount_for_folder_id(state: &DaemonState, folder_id: &str) -> Result<MountState> {
+async fn resolve_mount_for_folder_id(
+    state: &DaemonState,
+    folder_id: &str,
+) -> Result<MountState, DaemonError> {
     state
         .mounts
         .lock()
@@ -436,7 +438,7 @@ async fn resolve_mount_for_folder_id(state: &DaemonState, folder_id: &str) -> Re
         .iter()
         .find(|mount| mount.folder_id == folder_id)
         .cloned()
-        .ok_or_else(|| anyhow!("mount not found for folder {folder_id}"))
+        .ok_or_else(|| DaemonError::NotFound("mount_not_found".to_owned()))
 }
 
 fn fp_item_from_node(conn: &Connection, node: &LocalNode) -> Result<FpItem> {
@@ -462,63 +464,103 @@ fn fp_item_from_node(conn: &Connection, node: &LocalNode) -> Result<FpItem> {
 }
 
 async fn upload_job(state: DaemonState, req: FpUploadRequest, node_id: String) {
-    if let Err(error) = upload_job_inner(&state, req, node_id).await {
-        eprintln!("file provider upload failed: {error}");
+    let context = match resolve_upload_context(&state, &req, &node_id).await {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::error!(
+                node_id = %node_id,
+                error = %error,
+                "file provider upload failed before resolving mount"
+            );
+            return;
+        }
+    };
+    let folder_id = context.folder_id.clone();
+    if let Err(error) = upload_job_inner(&state, req, node_id.clone(), &context).await {
+        let message = upload_failure_message(&error);
+        set_upload_mount_error(&state, &context, Some(message.clone())).await;
+        tracing::error!(
+            folder_id = %folder_id,
+            node_id = %node_id,
+            error = %error,
+            status_error = %message,
+            "file provider upload failed"
+        );
     }
+}
+
+struct UploadContext {
+    folder_id: String,
+    token: String,
+    create_first: bool,
+    based_on_seq: i64,
+    parent_id: String,
+    initial_error: Option<String>,
+    sync_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    cursor_notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+async fn resolve_upload_context(
+    state: &DaemonState,
+    req: &FpUploadRequest,
+    node_id: &str,
+) -> Result<UploadContext, DaemonError> {
+    let conn = state.db.lock().await;
+    let (mount, parent_id, parent) = if req.parent_id == "root" {
+        let mount = resolve_mount_for_query(state, None).await?;
+        let parent_id = resolve_parent_id(&conn, &mount, &req.parent_id)?.ok_or_else(|| {
+            DaemonError::NotFound(format!("parent node not found: {}", req.parent_id))
+        })?;
+        let parent = nodes::get_node(&conn, &parent_id)?
+            .ok_or_else(|| DaemonError::NotFound(format!("parent node not found: {parent_id}")))?;
+        (mount, parent_id, parent)
+    } else {
+        let parent = nodes::get_node(&conn, &req.parent_id)?.ok_or_else(|| {
+            DaemonError::NotFound(format!("parent node not found: {}", req.parent_id))
+        })?;
+        let mount = resolve_mount_for_folder_id(state, &parent.folder_id).await?;
+        (mount, req.parent_id.clone(), parent)
+    };
+    let existing = nodes::get_node(&conn, node_id)?.or(nodes::get_node_by_parent_and_name(
+        &conn,
+        &parent.folder_id,
+        Some(&parent_id),
+        &req.name,
+    )?);
+    let create_first = existing.is_none();
+    let based_on_seq = existing
+        .as_ref()
+        .map(|node| node.server_seq)
+        .or(req.based_on_seq)
+        .unwrap_or(parent.server_seq);
+    Ok(UploadContext {
+        folder_id: parent.folder_id,
+        token: mount.effective_token(&state.config).to_owned(),
+        create_first,
+        based_on_seq,
+        parent_id,
+        initial_error: mount.error.clone(),
+        sync_lock: mount.sync_lock.clone(),
+        cursor_notify: mount.cursor_notify.clone(),
+    })
 }
 
 async fn upload_job_inner(
     state: &DaemonState,
     req: FpUploadRequest,
     node_id: String,
-) -> Result<()> {
-    let (folder_id, token, create_first, based_on_seq, parent_id, cursor_notify) = {
-        let conn = state.db.lock().await;
-        let (mount, parent_id, parent) = if req.parent_id == "root" {
-            let mount = resolve_mount_for_query(state, None).await?;
-            let parent_id = resolve_parent_id(&conn, &mount, &req.parent_id)?
-                .ok_or_else(|| anyhow!("parent node not found: {}", req.parent_id))?;
-            let parent = nodes::get_node(&conn, &parent_id)?
-                .ok_or_else(|| anyhow!("parent node not found: {parent_id}"))?;
-            (mount, parent_id, parent)
-        } else {
-            let parent = nodes::get_node(&conn, &req.parent_id)?
-                .ok_or_else(|| anyhow!("parent node not found: {}", req.parent_id))?;
-            let mount = resolve_mount_for_folder_id(state, &parent.folder_id).await?;
-            (mount, req.parent_id.clone(), parent)
-        };
-        let existing = nodes::get_node(&conn, &node_id)?.or(nodes::get_node_by_parent_and_name(
-            &conn,
-            &parent.folder_id,
-            Some(&parent_id),
-            &req.name,
-        )?);
-        let create_first = existing.is_none();
-        let based_on_seq = existing
-            .as_ref()
-            .map(|node| node.server_seq)
-            .or(req.based_on_seq)
-            .unwrap_or(parent.server_seq);
-        (
-            parent.folder_id,
-            mount.effective_token(&state.config).to_owned(),
-            create_first,
-            based_on_seq,
-            parent_id,
-            mount.cursor_notify.clone(),
-        )
-    };
-
-    let based_on_seq = if create_first {
-        match submit_op(
+    context: &UploadContext,
+) -> Result<(), DaemonError> {
+    let based_on_seq = if context.create_first {
+        match submit_op_daemon(
             &state.client,
             &state.config.backend_url,
-            &token,
-            &folder_id,
+            &context.token,
+            &context.folder_id,
             &SubmitOpRequest::Create {
                 payload: CreatePayload {
                     node_id: node_id.clone(),
-                    parent_id: parent_id.clone(),
+                    parent_id: context.parent_id.clone(),
                     name: req.name.clone(),
                     node_type: NodeType::File,
                 },
@@ -528,12 +570,15 @@ async fn upload_job_inner(
         {
             SubmitOpResponse::Applied { server_seq, .. } => server_seq,
             SubmitOpResponse::Superseded { .. } => {
-                return Err(anyhow!("create op was superseded for {node_id}"));
+                return Err(DaemonError::Conflict(json!({
+                    "error": "superseded",
+                    "message": format!("create op was superseded for {node_id}")
+                })));
             }
-            SubmitOpResponse::ConflictCopy { .. } => based_on_seq,
+            SubmitOpResponse::ConflictCopy { .. } => context.based_on_seq,
         }
     } else {
-        based_on_seq
+        context.based_on_seq
     };
 
     let path = Path::new(&req.file_path);
@@ -549,7 +594,13 @@ async fn upload_job_inner(
             })
             .collect::<Result<Vec<_>>>()?
     };
-    upload_pending_chunks(&state.client, &state.config.backend_url, &token, &pending).await?;
+    upload_pending_chunks(
+        &state.client,
+        &state.config.backend_url,
+        &context.token,
+        &pending,
+    )
+    .await?;
     {
         let conn = state.db.lock().await;
         for chunk in &pending {
@@ -565,11 +616,11 @@ async fn upload_job_inner(
             length: chunk.length,
         })
         .collect::<Vec<_>>();
-    let response = submit_op(
+    let response = submit_op_daemon(
         &state.client,
         &state.config.backend_url,
-        &token,
-        &folder_id,
+        &context.token,
+        &context.folder_id,
         &SubmitOpRequest::NewVersion {
             node_id,
             based_on_seq,
@@ -585,8 +636,28 @@ async fn upload_job_inner(
     if matches!(response, SubmitOpResponse::ConflictCopy { .. }) {
         materialize_conflict_copy_name(path, &state.config.device_name)?;
     }
-    cursor_notify.notify_waiters();
+    set_upload_mount_error(state, &context, None).await;
+    context.cursor_notify.notify_waiters();
     Ok(())
+}
+
+async fn set_upload_mount_error(
+    state: &DaemonState,
+    context: &UploadContext,
+    error: Option<String>,
+) {
+    let _sync_guard = context.sync_lock.lock().await;
+    let mut mounts = state.mounts.lock().await;
+    if let Some(mount) = mounts
+        .iter_mut()
+        .find(|mount| mount.folder_id == context.folder_id)
+    {
+        match error {
+            Some(error) => mount.error = Some(error),
+            None if mount.error == context.initial_error => mount.error = None,
+            None => {}
+        }
+    }
 }
 
 async fn upload_pending_chunks(
@@ -594,7 +665,7 @@ async fn upload_pending_chunks(
     backend_url: &str,
     token: &str,
     chunks: &[Chunk],
-) -> Result<()> {
+) -> Result<(), DaemonError> {
     if chunks.is_empty() {
         return Ok(());
     }
@@ -613,17 +684,14 @@ async fn upload_pending_chunks(
         .bearer_auth(token)
         .json(&BatchRequest::new(BatchOperation::Upload, objects))
         .send()
+        .await?;
+    let batch = backend_response_or_error(batch)
         .await?
-        .error_for_status()?
         .json::<BatchResponse>()
         .await?;
     for object in batch.objects {
         if let Some(error) = object.error {
-            return Err(anyhow!(
-                "batch upload error for {}: {}",
-                object.oid,
-                error.message
-            ));
+            return Err(anyhow!("batch upload error for {}: {}", object.oid, error.message).into());
         }
         let Some(action) = object.actions.and_then(|actions| actions.upload) else {
             continue;
@@ -639,9 +707,50 @@ async fn upload_pending_chunks(
                 HeaderValue::from_str(&value)?,
             );
         }
-        request.send().await?.error_for_status()?;
+        backend_response_or_error(request.send().await?).await?;
     }
     Ok(())
+}
+
+async fn submit_op_daemon(
+    client: &reqwest::Client,
+    backend_url: &str,
+    token: &str,
+    folder_id: &str,
+    req: &SubmitOpRequest,
+) -> Result<SubmitOpResponse, DaemonError> {
+    let response = client
+        .post(format!(
+            "{}/folders/{}/ops",
+            api_base(backend_url),
+            folder_id
+        ))
+        .bearer_auth(token)
+        .json(req)
+        .send()
+        .await?;
+    if response.status() == StatusCode::FORBIDDEN {
+        return Err(DaemonError::Internal(format!(
+            "authorization failed submitting op for folder {folder_id}"
+        )));
+    }
+    Ok(backend_response_or_error(response)
+        .await?
+        .json::<SubmitOpResponse>()
+        .await?)
+}
+
+fn upload_failure_message(error: &DaemonError) -> String {
+    if let DaemonError::Backend { body, .. } = error {
+        match body.get("error").and_then(|error| error.as_str()) {
+            Some("subscription_inactive") => {
+                return "Sync paused: subscription inactive".to_owned();
+            }
+            Some("over_quota") => return "Sync paused: storage quota exceeded".to_owned(),
+            _ => {}
+        }
+    }
+    error.to_string()
 }
 
 fn manifest_content_hash(manifest: &[ChunkRef]) -> String {
@@ -706,10 +815,8 @@ mod fp_watch_tests {
 
     fn test_state(mount: MountState) -> DaemonState {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!(
-            "../../valv-sync/src/persistence/schema.sql"
-        ))
-        .unwrap();
+        conn.execute_batch(include_str!("../../valv-sync/src/persistence/schema.sql"))
+            .unwrap();
         mounts::upsert_mount(
             &conn,
             &mount.path,
@@ -819,7 +926,7 @@ mod fp_watch_tests {
     async fn unknown_folder_id_returns_404() {
         let state = test_state(test_mount("/sync", "folder-1"));
 
-        let (status, _) = fp_watch(
+        let error = fp_watch(
             State(state),
             Query(FpWatchQuery {
                 folder_id: Some("unknown-folder".into()),
@@ -829,6 +936,319 @@ mod fp_watch_tests {
         .await
         .unwrap_err();
 
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(matches!(error, DaemonError::NotFound(_)));
+    }
+}
+
+#[cfg(test)]
+mod fp_error_tests {
+    use std::{
+        collections::HashMap,
+        fs,
+        sync::{atomic::AtomicBool, Arc},
+        time::Duration,
+    };
+
+    use axum::extract::Query;
+    use axum::{body, extract::State, response::IntoResponse, Json};
+    use serde_json::Value;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::{Mutex, Notify},
+    };
+    use valv_sync::{
+        persistence::{mounts as mount_store, nodes as node_store, LocalNode},
+        protocol::ipc::{FpDeleteRequest, FpUploadRequest},
+    };
+
+    use crate::config::DaemonConfig;
+
+    use super::*;
+
+    async fn backend_url_with_response(status_line: &str, body: &'static str) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_line = status_line.to_owned();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 2048];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn node(node_id: &str, parent_id: Option<&str>, name: &str) -> LocalNode {
+        LocalNode {
+            node_id: node_id.to_owned(),
+            folder_id: "folder-1".to_owned(),
+            parent_id: parent_id.map(str::to_owned),
+            name: name.to_owned(),
+            node_type: "file".into(),
+            current_version_id: None,
+            server_seq: 7,
+            deleted_at: None,
+        }
+    }
+
+    fn test_mount() -> MountState {
+        MountState {
+            path: "/sync".to_owned(),
+            folder_id: "folder-1".to_owned(),
+            grant_id: None,
+            scope_node_id: None,
+            mount_token: None,
+            can_write: true,
+            name: "Test Folder".to_owned(),
+            active_syncs: 0,
+            pending_ops: 0,
+            last_synced_at: None,
+            error: None,
+            sync_lock: Arc::new(Mutex::new(())),
+            cursor_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn test_state(backend_url: String) -> DaemonState {
+        let mount = test_mount();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../valv-sync/src/persistence/schema.sql"))
+            .unwrap();
+        mount_store::upsert_mount(
+            &conn,
+            &mount.path,
+            &mount.folder_id,
+            None,
+            None,
+            None,
+            mount.can_write,
+        )
+        .unwrap();
+        DaemonState {
+            paused: Arc::new(AtomicBool::new(false)),
+            fs_events_paused: Arc::new(AtomicBool::new(false)),
+            mounts: Arc::new(Mutex::new(vec![mount])),
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            db: Arc::new(Mutex::new(conn)),
+            client: reqwest::Client::new(),
+            config: DaemonConfig {
+                backend_url,
+                device_id: "device-1".to_owned(),
+                device_token: "token".to_owned(),
+                device_name: "Test Device".to_owned(),
+                mounts: Vec::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn fp_delete_conflict_response_has_json_body() {
+        let backend_url = backend_url_with_response(
+            "HTTP/1.1 200 OK",
+            r#"{"result":"superseded","current_seq":8}"#,
+        )
+        .await;
+        let state = test_state(backend_url);
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("node-1", None, "doc.txt")).unwrap();
+        }
+
+        let error = fp_delete(
+            State(state),
+            Json(FpDeleteRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 1,
+            }),
+        )
+        .await
+        .unwrap_err();
+        let response = error.into_response();
+        let status = response.status();
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice::<Value>(&bytes).unwrap();
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "superseded");
+    }
+
+    #[tokio::test]
+    async fn upload_job_failure_sets_mount_status_error() {
+        let backend_url = backend_url_with_response(
+            "HTTP/1.1 402 Payment Required",
+            r#"{"error":"subscription_inactive","status":"none"}"#,
+        )
+        .await;
+        let state = test_state(backend_url);
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("parent-1", None, "Parent")).unwrap();
+        }
+
+        upload_job(
+            state.clone(),
+            FpUploadRequest {
+                node_id: None,
+                parent_id: "parent-1".to_owned(),
+                name: "doc.txt".to_owned(),
+                based_on_seq: None,
+                file_path: "/unused/staged-content".to_owned(),
+            },
+            "node-new".to_owned(),
+        )
+        .await;
+
+        let response = crate::control::get_status(State(state))
+            .await
+            .unwrap()
+            .into_response();
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status =
+            serde_json::from_slice::<valv_sync::protocol::ipc::DaemonStatus>(&bytes).unwrap();
+
+        assert_eq!(
+            status.mounts[0].error.as_deref(),
+            Some("Sync paused: subscription inactive")
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_job_failure_does_not_end_concurrent_sync() {
+        let backend_url = backend_url_with_response(
+            "HTTP/1.1 402 Payment Required",
+            r#"{"error":"subscription_inactive","status":"none"}"#,
+        )
+        .await;
+        let state = test_state(backend_url);
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("parent-1", None, "Parent")).unwrap();
+        }
+        let sync_lock = {
+            let mounts = state.mounts.lock().await;
+            mounts[0].sync_lock.clone()
+        };
+        let sync_guard = sync_lock.lock().await;
+        {
+            let mut mounts = state.mounts.lock().await;
+            mounts[0].active_syncs = 1;
+            mounts[0].error = Some("sync still running".to_owned());
+        }
+
+        let upload = tokio::spawn(upload_job(
+            state.clone(),
+            FpUploadRequest {
+                node_id: None,
+                parent_id: "parent-1".to_owned(),
+                name: "doc.txt".to_owned(),
+                based_on_seq: None,
+                file_path: "/unused/staged-content".to_owned(),
+            },
+            "node-new".to_owned(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let mounts = state.mounts.lock().await;
+            assert_eq!(mounts[0].active_syncs, 1);
+            assert_eq!(mounts[0].error.as_deref(), Some("sync still running"));
+            assert!(mounts[0].status().syncing);
+        }
+
+        drop(sync_guard);
+        upload.await.unwrap();
+
+        let mounts = state.mounts.lock().await;
+        assert_eq!(mounts[0].active_syncs, 1);
+        assert_eq!(
+            mounts[0].error.as_deref(),
+            Some("Sync paused: subscription inactive")
+        );
+        assert!(mounts[0].status().syncing);
+    }
+
+    #[tokio::test]
+    async fn upload_job_success_clears_stale_mount_error() {
+        let backend_url = backend_url_with_response(
+            "HTTP/1.1 200 OK",
+            r#"{"result":"applied","server_seq":8,"node_id":"node-1"}"#,
+        )
+        .await;
+        let state = test_state(backend_url);
+        let staged = std::env::temp_dir().join(format!("valvd-upload-{}", Uuid::new_v4()));
+        fs::write(&staged, b"").unwrap();
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("parent-1", None, "Parent")).unwrap();
+            node_store::upsert_node(&conn, &node("node-1", Some("parent-1"), "doc.txt")).unwrap();
+            let mut mounts = state.mounts.lock().await;
+            mounts[0].error = Some("old upload failure".to_owned());
+        }
+
+        upload_job(
+            state.clone(),
+            FpUploadRequest {
+                node_id: Some("node-1".to_owned()),
+                parent_id: "parent-1".to_owned(),
+                name: "doc.txt".to_owned(),
+                based_on_seq: Some(7),
+                file_path: staged.to_string_lossy().to_string(),
+            },
+            "node-1".to_owned(),
+        )
+        .await;
+
+        let mounts = state.mounts.lock().await;
+        assert_eq!(mounts[0].error, None);
+        let _ = fs::remove_file(staged);
+    }
+
+    #[tokio::test]
+    async fn submit_op_daemon_preserves_forbidden_auth_message() {
+        let backend_url =
+            backend_url_with_response("HTTP/1.1 403 Forbidden", r#"{"error":"forbidden"}"#).await;
+
+        let error = submit_op_daemon(
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "folder-1",
+            &SubmitOpRequest::Delete {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 1,
+                payload: DeletePayload {},
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, DaemonError::Internal(_)));
+        assert_eq!(
+            error.to_string(),
+            "authorization failed submitting op for folder folder-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_folder_id_query_returns_bad_request() {
+        let error = fp_anchor(
+            State(test_state("http://127.0.0.1:1".to_owned())),
+            Query(FpFolderQuery {
+                folder_id: Some(String::new()),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, DaemonError::BadRequest(_)));
     }
 }
