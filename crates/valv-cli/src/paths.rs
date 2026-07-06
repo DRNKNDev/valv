@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use valv_sync::{
     persistence::{mounts, open_db},
     watch::resolve_abs_path,
@@ -16,15 +16,20 @@ pub(crate) struct ResolvedTarget {
 }
 
 pub(crate) fn resolve_target_path(path: &str) -> Result<ResolvedTarget> {
-    let db_path = data_dir()?.join("sync.db");
-    let conn = open_db(&db_path)?;
+    let db_path = data_dir()
+        .context("failed to determine Valv data directory")?
+        .join("sync.db");
+    let conn = open_db(&db_path)
+        .with_context(|| format!("failed to open sync database {}", db_path.display()))?;
     let target = expand_tilde(path);
-    let mount = mounts::list_mounts(&conn)?
+    let mount = mounts::list_mounts(&conn)
+        .context("failed to list mounted folders")?
         .into_iter()
         .filter(|mount| target.starts_with(&mount.path))
         .max_by_key(|mount| mount.path.len())
         .ok_or_else(|| anyhow!("path is not inside a mounted folder: {}", target.display()))?;
-    let node = resolve_abs_path(&conn, Path::new(&mount.path), &mount.folder_id, &target)?
+    let node = resolve_abs_path(&conn, Path::new(&mount.path), &mount.folder_id, &target)
+        .with_context(|| format!("failed to resolve target path {}", target.display()))?
         .ok_or_else(|| {
             anyhow!(
                 "path is not present in the local mirror: {}",
@@ -38,8 +43,13 @@ pub(crate) fn resolve_target_path(path: &str) -> Result<ResolvedTarget> {
 }
 
 pub(crate) fn first_mount_folder_id() -> Result<String> {
-    let conn = open_db(&data_dir()?.join("sync.db"))?;
-    let mount = mounts::list_mounts(&conn)?
+    let db_path = data_dir()
+        .context("failed to determine Valv data directory")?
+        .join("sync.db");
+    let conn = open_db(&db_path)
+        .with_context(|| format!("failed to open sync database {}", db_path.display()))?;
+    let mount = mounts::list_mounts(&conn)
+        .context("failed to list mounted folders")?
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no mounted folders"))?;
@@ -47,7 +57,7 @@ pub(crate) fn first_mount_folder_id() -> Result<String> {
 }
 
 pub(crate) fn resolve_valvd_path() -> Result<PathBuf> {
-    let current = env::current_exe()?;
+    let current = env::current_exe().context("failed to determine current executable path")?;
     if let Some(parent) = current.parent() {
         let sibling = parent.join("valvd");
         if sibling.exists() {
@@ -70,15 +80,21 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 pub(crate) fn config_path() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".config/valv/config.toml"))
+    Ok(home_dir()
+        .context("failed to determine home directory for config path")?
+        .join(".config/valv/config.toml"))
 }
 
 pub(crate) fn data_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".local/share/valv"))
+    Ok(home_dir()
+        .context("failed to determine home directory for data path")?
+        .join(".local/share/valv"))
 }
 
 pub(crate) fn socket_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("valvd.sock"))
+    Ok(data_dir()
+        .context("failed to determine Valv data directory for socket path")?
+        .join("valvd.sock"))
 }
 
 fn home_dir() -> Result<PathBuf> {
