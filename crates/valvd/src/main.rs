@@ -3,9 +3,10 @@ use std::{
     fs,
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc,
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -86,9 +87,43 @@ struct DaemonState {
     // respawns that mount's own tasks instead of every persisted mount's.
     tasks: Arc<Mutex<HashMap<String, Vec<JoinHandle<()>>>>>,
     account: Arc<Mutex<Option<AccountStatus>>>,
+    backend_health: Arc<BackendHealth>,
     db: Arc<Mutex<Connection>>,
     client: reqwest::Client,
     config: DaemonConfig,
+}
+
+#[derive(Debug, Default)]
+struct BackendHealth {
+    last_success_at: AtomicI64,
+    last_failure_at: AtomicI64,
+}
+
+impl BackendHealth {
+    fn record_success(&self) {
+        let now = current_unix_seconds();
+        let last_failure = self.last_failure_at.load(Ordering::Acquire);
+        self.last_success_at
+            .store(now.max(last_failure), Ordering::Release);
+    }
+
+    fn record_failure(&self) {
+        let now = current_unix_seconds();
+        let last_success = self.last_success_at.load(Ordering::Acquire);
+        self.last_failure_at
+            .store(now.max(last_success + 1), Ordering::Release);
+    }
+
+    fn is_connected(&self) -> bool {
+        self.last_success_at.load(Ordering::Acquire) >= self.last_failure_at.load(Ordering::Acquire)
+    }
+}
+
+fn current_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +200,7 @@ async fn run() -> Result<()> {
         mounts: Arc::new(Mutex::new(mount_states)),
         tasks: Arc::new(Mutex::new(HashMap::new())),
         account: Arc::new(Mutex::new(None)),
+        backend_health: Arc::new(BackendHealth::default()),
         db: Arc::new(Mutex::new(conn)),
         client: reqwest::Client::new(),
         config,
@@ -358,6 +394,19 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn backend_health_uses_latest_recorded_outcome() {
+        let health = BackendHealth::default();
+        assert!(health.is_connected());
+
+        health.record_failure();
+        health.record_success();
+        assert!(health.is_connected());
+
+        health.record_failure();
+        assert!(!health.is_connected());
+    }
+
     fn test_state() -> DaemonState {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("../../valv-sync/src/persistence/schema.sql"))
@@ -368,6 +417,7 @@ mod tests {
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            backend_health: Arc::new(BackendHealth::default()),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: DaemonConfig {

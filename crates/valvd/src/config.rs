@@ -40,6 +40,9 @@ pub(crate) struct MountConfig {
 
 pub(crate) fn merge_config_mounts(conn: &Connection, config_mounts: &[MountConfig]) -> Result<()> {
     for mount in config_mounts {
+        if mounts::get_mount(conn, &mount.path)?.is_some() {
+            continue;
+        }
         mounts::upsert_mount(
             conn,
             &mount.path,
@@ -197,6 +200,8 @@ pub(crate) fn set_owner_only_permissions(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use valv_sync::persistence::mounts;
 
     #[test]
     fn config_missing_backend_url_returns_actionable_error() {
@@ -252,5 +257,91 @@ mounts = []
         .unwrap();
 
         assert!(config.mounts.is_empty());
+    }
+
+    #[test]
+    fn merge_config_mounts_inserts_missing_config_mount() {
+        let conn = test_conn();
+        merge_config_mounts(
+            &conn,
+            &[MountConfig {
+                path: "/sync".to_owned(),
+                folder_id: "folder-1".to_owned(),
+                grant_id: Some("grant-1".to_owned()),
+                scope_node_id: Some("scope-1".to_owned()),
+                mount_token: Some("mount-token-1".to_owned()),
+            }],
+        )
+        .unwrap();
+
+        let mount = mounts::get_mount(&conn, "/sync").unwrap().unwrap();
+        assert_eq!(mount.folder_id, "folder-1");
+        assert_eq!(mount.grant_id.as_deref(), Some("grant-1"));
+        assert_eq!(mount.scope_node_id.as_deref(), Some("scope-1"));
+        assert_eq!(mount.mount_token.as_deref(), Some("mount-token-1"));
+        assert!(mount.can_write);
+    }
+
+    #[test]
+    fn merge_config_mounts_does_not_overwrite_existing_mount_fields() {
+        let conn = test_conn();
+        mounts::upsert_mount(
+            &conn,
+            "/sync",
+            "folder-existing",
+            Some("grant-existing"),
+            Some("scope-existing"),
+            Some("token-existing"),
+            true,
+        )
+        .unwrap();
+
+        merge_config_mounts(
+            &conn,
+            &[MountConfig {
+                path: "/sync".to_owned(),
+                folder_id: "folder-stale".to_owned(),
+                grant_id: Some("grant-stale".to_owned()),
+                scope_node_id: Some("scope-stale".to_owned()),
+                mount_token: Some("token-stale".to_owned()),
+            }],
+        )
+        .unwrap();
+
+        let mount = mounts::get_mount(&conn, "/sync").unwrap().unwrap();
+        assert_eq!(mount.folder_id, "folder-existing");
+        assert_eq!(mount.grant_id.as_deref(), Some("grant-existing"));
+        assert_eq!(mount.scope_node_id.as_deref(), Some("scope-existing"));
+        assert_eq!(mount.mount_token.as_deref(), Some("token-existing"));
+        assert!(mount.can_write);
+    }
+
+    #[test]
+    fn merge_config_mounts_does_not_flip_read_only_mount_writable() {
+        let conn = test_conn();
+        mounts::upsert_mount(&conn, "/sync", "folder-existing", None, None, None, false).unwrap();
+
+        merge_config_mounts(
+            &conn,
+            &[MountConfig {
+                path: "/sync".to_owned(),
+                folder_id: "folder-stale".to_owned(),
+                grant_id: None,
+                scope_node_id: None,
+                mount_token: None,
+            }],
+        )
+        .unwrap();
+
+        let mount = mounts::get_mount(&conn, "/sync").unwrap().unwrap();
+        assert_eq!(mount.folder_id, "folder-existing");
+        assert!(!mount.can_write);
+    }
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../valv-sync/src/persistence/schema.sql"))
+            .unwrap();
+        conn
     }
 }

@@ -430,15 +430,15 @@ async fn upload_file_new_version(
     }
 
     let req = SubmitOpRequest::NewVersion {
-            node_id: node_id.to_owned(),
-            based_on_seq,
-            payload: NewVersionPayload {
-                version_id: Uuid::new_v4().to_string(),
-                content_hash,
-                size_bytes,
-                manifest,
-            },
-        };
+        node_id: node_id.to_owned(),
+        based_on_seq,
+        payload: NewVersionPayload {
+            version_id: Uuid::new_v4().to_string(),
+            content_hash,
+            size_bytes,
+            manifest,
+        },
+    };
     let response = submit_op(client, backend_url, token, &mount.folder_id, &req).await?;
     {
         let conn = db.lock().await;
@@ -532,7 +532,7 @@ async fn handle_delete(
     if path.exists() {
         return Ok(());
     }
-    let req = {
+    let (req, node_id) = {
         let conn = db.lock().await;
         let Some(node) = resolve_abs_path(&conn, &mount.path, &mount.folder_id, path)? else {
             eprintln!(
@@ -545,13 +545,22 @@ async fn handle_delete(
         if node.parent_id.is_none() {
             return Ok(());
         }
-        SubmitOpRequest::Delete {
-            node_id: node.node_id,
-            based_on_seq: node.server_seq,
-            payload: DeletePayload {},
-        }
+        (
+            SubmitOpRequest::Delete {
+                node_id: node.node_id.clone(),
+                based_on_seq: node.server_seq,
+                payload: DeletePayload {},
+            },
+            node.node_id,
+        )
     };
-    submit_op(client, backend_url, token, &mount.folder_id, &req).await?;
+    match submit_op(client, backend_url, token, &mount.folder_id, &req).await? {
+        SubmitOpResponse::Applied { server_seq, .. } => {
+            let conn = db.lock().await;
+            nodes::mark_deleted(&conn, &node_id, server_seq)?;
+        }
+        SubmitOpResponse::Superseded { .. } | SubmitOpResponse::ConflictCopy { .. } => {}
+    }
     Ok(())
 }
 
@@ -1008,6 +1017,137 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn handle_delete_applied_response_marks_local_node_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delete-me.txt");
+        fs::write(&path, b"").unwrap();
+        let db = seeded_db();
+        seed_file(&db, "file-node", "delete-me.txt", 4).await;
+        fs::remove_file(&path).unwrap();
+        let (backend_url, server) = submit_op_server(vec![SubmitOpResponse::Applied {
+            node_id: "file-node".into(),
+            server_seq: 7,
+        }])
+        .await;
+
+        handle_delete(
+            &watch_mount(dir.path()),
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            &path,
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let conn = db.lock().await;
+        let node = get_node(&conn, "file-node").unwrap().unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["op_type"], "delete");
+        assert_eq!(node.server_seq, 7);
+        assert!(node.deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn handle_delete_superseded_response_leaves_local_node_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delete-me.txt");
+        fs::write(&path, b"").unwrap();
+        let db = seeded_db();
+        seed_file(&db, "file-node", "delete-me.txt", 4).await;
+        fs::remove_file(&path).unwrap();
+        let (backend_url, server) =
+            submit_op_server(vec![SubmitOpResponse::Superseded { current_seq: 99 }]).await;
+
+        handle_delete(
+            &watch_mount(dir.path()),
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            &path,
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let conn = db.lock().await;
+        let node = get_node(&conn, "file-node").unwrap().unwrap();
+
+        assert_eq!(node.server_seq, 4);
+        assert!(node.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_then_later_create_same_path_submits_fresh_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recreated.txt");
+        fs::write(&path, b"").unwrap();
+        let db = seeded_db();
+        seed_file(&db, "old-node", "recreated.txt", 4).await;
+        fs::remove_file(&path).unwrap();
+        let (backend_url, server) = submit_op_server(vec![SubmitOpResponse::Applied {
+            node_id: "old-node".into(),
+            server_seq: 7,
+        }])
+        .await;
+        let mount = watch_mount(dir.path());
+        let client = reqwest::Client::new();
+
+        handle_delete(&mount, &db, &client, &backend_url, "token", &path)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let conn = db.lock().await;
+            let old = get_node(&conn, "old-node").unwrap().unwrap();
+            assert!(old.deleted_at.is_some());
+            assert!(resolve_abs_path(&conn, dir.path(), "folder-1", &path)
+                .unwrap()
+                .is_none());
+        }
+
+        fs::write(&path, b"").unwrap();
+        let (backend_url, server) = submit_op_server(vec![
+            SubmitOpResponse::Applied {
+                node_id: "new-node".into(),
+                server_seq: 8,
+            },
+            SubmitOpResponse::Applied {
+                node_id: "new-version".into(),
+                server_seq: 9,
+            },
+        ])
+        .await;
+        handle_create(&mount, &db, &client, &backend_url, "token", &path)
+            .await
+            .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let conn = db.lock().await;
+        let old = get_node(&conn, "old-node").unwrap().unwrap();
+        let new = get_node(&conn, "new-node").unwrap().unwrap();
+
+        assert_eq!(requests[0]["op_type"], "create");
+        assert_eq!(requests[0]["payload"]["name"], "recreated.txt");
+        assert!(old.deleted_at.is_some());
+        assert_eq!(new.parent_id.as_deref(), Some("root-node"));
+        assert_eq!(new.name, "recreated.txt");
+    }
+
     fn seeded_db() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(schema_sql()).unwrap();
@@ -1026,6 +1166,24 @@ mod tests {
         )
         .unwrap();
         Arc::new(Mutex::new(conn))
+    }
+
+    async fn seed_file(db: &Arc<Mutex<Connection>>, node_id: &str, name: &str, server_seq: i64) {
+        let conn = db.lock().await;
+        upsert_node(
+            &conn,
+            &LocalNode {
+                node_id: node_id.into(),
+                folder_id: "folder-1".into(),
+                parent_id: Some("root-node".into()),
+                name: name.into(),
+                node_type: "file".into(),
+                current_version_id: None,
+                server_seq,
+                deleted_at: None,
+            },
+        )
+        .unwrap();
     }
 
     fn watch_mount(path: &Path) -> WatchMount {

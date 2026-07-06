@@ -23,6 +23,16 @@ pub fn list_mounts(conn: &Connection) -> Result<Vec<LocalMount>> {
     Ok(mounts)
 }
 
+pub fn get_mount(conn: &Connection, path: &str) -> Result<Option<LocalMount>> {
+    conn.query_row(
+        "SELECT path, folder_id, grant_id, scope_node_id, mount_token, cursor, can_write, name FROM mounts WHERE path = ?1",
+        params![path],
+        row_to_mount,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 pub fn upsert_mount(
     conn: &Connection,
     path: &str,
@@ -41,7 +51,14 @@ pub fn upsert_mount(
             scope_node_id = excluded.scope_node_id,
             mount_token = excluded.mount_token,
             can_write = excluded.can_write",
-        params![path, folder_id, grant_id, scope_node_id, mount_token, can_write],
+        params![
+            path,
+            folder_id,
+            grant_id,
+            scope_node_id,
+            mount_token,
+            can_write
+        ],
     )?;
     Ok(())
 }
