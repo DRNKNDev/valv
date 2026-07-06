@@ -1,5 +1,6 @@
 import Combine
 import DaemonKit
+import AppKit
 import SwiftUI
 
 /// The entire onboarding experience: one continuous sequence of 6 pages in a single
@@ -47,6 +48,7 @@ private struct WelcomeOnboardingPage: View {
         OnboardingCardChrome(
             metadata: OnboardingPageMetadata(
                 imageName: "OnboardingWelcome",
+                heroSymbolName: "sparkles",
                 title: "Welcome to Valv",
                 description: "Sync your files across every device, and share them with anyone."
             ),
@@ -73,6 +75,7 @@ private struct DaemonSetupOnboardingPage: View {
         OnboardingCardChrome(
             metadata: OnboardingPageMetadata(
                 imageName: "OnboardingDaemonSetup",
+                heroSymbolName: "menubar.rectangle",
                 title: "Valv lives in your menu bar",
                 description: "Check sync status, pause, and manage folders from the menu bar icon at any time."
             ),
@@ -138,14 +141,12 @@ private struct DaemonSetupOnboardingPage: View {
                         daemonManager.declineTakeover()
                         coordinator.advance()
                     }
-                    .foregroundStyle(.white)
                     Button("Let Valv.app Manage It") {
                         Task {
                             await daemonManager.consentToTakeover()
                             coordinator.advance()
                         }
                     }
-                    .foregroundStyle(.white)
                 }
             }
         }
@@ -188,6 +189,7 @@ private struct SignInOnboardingPage: View {
         OnboardingCardChrome(
             metadata: OnboardingPageMetadata(
                 imageName: "OnboardingSignIn",
+                heroSymbolName: "person.crop.circle.badge.checkmark",
                 title: "Sign in to your account",
                 description: "Valv syncs through your account, so your files follow you to every device."
             ),
@@ -206,6 +208,12 @@ private struct SignInOnboardingPage: View {
                     ProgressView("Waiting for sign-in…")
                         .tint(.white)
                         .foregroundStyle(.white.opacity(0.85))
+                    Button("Cancel") {
+                        callbackCenter.clearExpectedState()
+                        isWaiting = false
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.white.opacity(0.70))
                 } else {
                     OnboardingPrimaryButton(title: "Continue in Browser") {
                         let state = UUID().uuidString
@@ -280,6 +288,7 @@ private struct FirstFolderOnboardingPage: View {
         OnboardingCardChrome(
             metadata: OnboardingPageMetadata(
                 imageName: "OnboardingFirstFolder",
+                heroSymbolName: "folder.badge.plus",
                 title: "Add your first folder",
                 description: "Synced folders appear in Finder under Valv, alongside your other locations."
             ),
@@ -295,7 +304,7 @@ private struct FirstFolderOnboardingPage: View {
                 HStack {
                     TextField("Folder ID or invite link", text: $folderIdOrLink)
                         .textFieldStyle(.roundedBorder)
-                    Button("Link") { linkExistingFolder() }
+                    Button("Add") { linkExistingFolder() }
                         .disabled(folderIdOrLink.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
 
@@ -312,6 +321,7 @@ private struct FirstFolderOnboardingPage: View {
             panel.canChooseDirectories = true
             panel.canChooseFiles = false
             panel.prompt = "Select"
+            NSApp.activate(ignoringOtherApps: true)
             guard panel.runModal() == .OK, let url = panel.url else { return }
             do {
                 let response = try await store.mount(MountRequest(path: url.path))
@@ -331,6 +341,7 @@ private struct FirstFolderOnboardingPage: View {
             panel.canChooseDirectories = true
             panel.canChooseFiles = false
             panel.prompt = "Select"
+            NSApp.activate(ignoringOtherApps: true)
             guard panel.runModal() == .OK, let url = panel.url else { return }
 
             let value = folderIdOrLink.trimmingCharacters(in: .whitespaces)
@@ -361,6 +372,7 @@ private struct FirstFolderOnboardingPage: View {
         alert.messageText = "Couldn't add folder"
         alert.informativeText = error.localizedDescription
         alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
     }
 }
@@ -375,6 +387,7 @@ private struct ShareExplainerOnboardingPage: View {
         OnboardingCardChrome(
             metadata: OnboardingPageMetadata(
                 imageName: "OnboardingShareExplainer",
+                heroSymbolName: "person.2.wave.2",
                 title: "Share with anyone",
                 description: "Right-click any file or folder in Finder and choose Share… to invite someone, with read-only or read-write access."
             ),
@@ -407,6 +420,7 @@ private struct CompletionOnboardingPage: View {
         OnboardingCardChrome(
             metadata: OnboardingPageMetadata(
                 imageName: "OnboardingCompletion",
+                heroSymbolName: "checkmark.seal",
                 title: "You're all set",
                 description: description
             ),
@@ -421,7 +435,6 @@ private struct CompletionOnboardingPage: View {
                     Button("Show Me in Finder") {
                         NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
                     }
-                    .foregroundStyle(.white)
                 }
 
                 Button(daemonManager.cliInstallStatus.actionTitle) {

@@ -5,6 +5,7 @@ import SwiftUI
 /// interactive controls below them) stays each page's own view code.
 struct OnboardingPageMetadata {
     let imageName: String
+    let heroSymbolName: String
     let title: String
     let description: String
 }
@@ -32,10 +33,7 @@ struct OnboardingCardChrome<Content: View>: View {
     static var imageAspectRatio: CGFloat { 16.0 / 10.0 }
     var imageHeight: CGFloat { (Self.cardWidth / Self.imageAspectRatio).rounded() }
 
-    /// Brand teal (`--primary`, dark-mode variant) from `private/packages/ui/src/globals.css`
-    /// (`oklch(0.62 0.10 165)`) - reads correctly against this card's near-black
-    /// background, unlike TourKit's own hardcoded blue.
-    static var brandTeal: Color { Color(red: 0x41 / 255, green: 0x99 / 255, blue: 0x77 / 255) }
+    static var brandTeal: Color { Color("AccentColor") }
     static var brandTealDeep: Color { Color(red: 0x19 / 255, green: 0x34 / 255, blue: 0x29 / 255) }
 
     var body: some View {
@@ -85,6 +83,14 @@ struct OnboardingCardChrome<Content: View>: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .allowsHitTesting(false)
 
+            Image(systemName: metadata.heroSymbolName)
+                .symbolRenderingMode(.hierarchical)
+                .font(.system(size: 72, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.88))
+                .shadow(color: .black.opacity(0.22), radius: 10, y: 5)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                .allowsHitTesting(false)
+
             topControls
         }
         .frame(width: Self.cardWidth, height: imageHeight)
@@ -92,13 +98,13 @@ struct OnboardingCardChrome<Content: View>: View {
 
     private var topControls: some View {
         HStack {
-            iconButton(systemName: "chevron.left", action: onBack)
+            iconButton(systemName: "chevron.left", label: "Back", action: onBack)
                 .opacity(pageIndex > 0 ? 1 : 0)
                 .disabled(pageIndex == 0)
 
             Spacer()
 
-            iconButton(systemName: "checkmark", action: onClose)
+            iconButton(systemName: "xmark", label: "Close", action: onClose)
                 .opacity(canClose ? 1 : 0)
                 .disabled(!canClose)
         }
@@ -106,7 +112,7 @@ struct OnboardingCardChrome<Content: View>: View {
         .padding(.top, 12)
     }
 
-    private func iconButton(systemName: String, action: @escaping () -> Void) -> some View {
+    private func iconButton(systemName: String, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemName)
                 .font(.system(size: 13, weight: .semibold))
@@ -118,6 +124,7 @@ struct OnboardingCardChrome<Content: View>: View {
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(label)
     }
 
     private var bottomPanel: some View {

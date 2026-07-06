@@ -70,6 +70,7 @@ final class OnboardingWindowController {
         )
         window.isOpaque = false
         window.backgroundColor = .clear
+        window.appearance = NSAppearance(named: .darkAqua)
         window.hasShadow = true
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
