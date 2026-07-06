@@ -66,6 +66,7 @@ private struct WelcomeOnboardingPage: View {
 private struct DaemonSetupOnboardingPage: View {
     @ObservedObject var coordinator: OnboardingCoordinator
     @EnvironmentObject private var daemonManager: DaemonManager
+    @State private var isRetryingInstall = false
     let onDismiss: () -> Void
 
     var body: some View {
@@ -81,7 +82,13 @@ private struct DaemonSetupOnboardingPage: View {
             onBack: coordinator.goBack,
             onClose: onDismiss
         ) {
-            if let decision = daemonManager.pendingDecision {
+            if isRetryingInstall {
+                ProgressView("Retrying sync daemon setup…")
+                    .tint(.white)
+                    .foregroundStyle(.white.opacity(0.85))
+            } else if let installError = daemonManager.installError {
+                installFailureContent(installError)
+            } else if let decision = daemonManager.pendingDecision {
                 incompatibleDecisionContent(decision)
             } else {
                 ProgressView("Setting up the sync daemon…")
@@ -89,6 +96,29 @@ private struct DaemonSetupOnboardingPage: View {
                     .foregroundStyle(.white.opacity(0.85))
                     .task { await waitForReconciliation() }
             }
+        }
+    }
+
+    private func installFailureContent(_ message: String) -> some View {
+        VStack(spacing: 10) {
+            Text("Valv couldn't install the sync daemon.")
+                .font(.subheadline).bold()
+                .foregroundStyle(.white)
+            Text(message)
+                .font(.caption)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.white.opacity(0.70))
+            Button("Retry") {
+                Task {
+                    isRetryingInstall = true
+                    await OnboardingDaemonInstallRetry.perform(
+                        daemonManager: daemonManager,
+                        coordinator: coordinator
+                    )
+                    isRetryingInstall = false
+                }
+            }
+            .foregroundStyle(.white)
         }
     }
 
@@ -128,7 +158,17 @@ private struct DaemonSetupOnboardingPage: View {
         while !daemonManager.hasReconciled {
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
-        if daemonManager.pendingDecision == nil {
+        if daemonManager.pendingDecision == nil, daemonManager.installError == nil {
+            coordinator.advance()
+        }
+    }
+}
+
+enum OnboardingDaemonInstallRetry {
+    static func perform(daemonManager: DaemonManager, coordinator: OnboardingCoordinator) async {
+        daemonManager.installError = nil
+        await daemonManager.performCleanInstall()
+        if daemonManager.installError == nil {
             coordinator.advance()
         }
     }
@@ -273,11 +313,15 @@ private struct FirstFolderOnboardingPage: View {
             panel.canChooseFiles = false
             panel.prompt = "Select"
             guard panel.runModal() == .OK, let url = panel.url else { return }
-            if let response = try? await store.mount(MountRequest(path: url.path)) {
+            do {
+                let response = try await store.mount(MountRequest(path: url.path))
                 coordinator.recordMountedFolder(name: url.lastPathComponent, path: response.path)
+                await domainManager.signalRootEnumerator()
+                coordinator.advance()
+            } catch {
+                await domainManager.signalRootEnumerator()
+                showMountError(error)
             }
-            await domainManager.signalRootEnumerator()
-            coordinator.advance()
         }
     }
 
@@ -300,12 +344,24 @@ private struct FirstFolderOnboardingPage: View {
                 request = MountRequest(path: url.path, folderId: value)
             }
 
-            if let response = try? await store.mount(request) {
+            do {
+                let response = try await store.mount(request)
                 coordinator.recordMountedFolder(name: url.lastPathComponent, path: response.path)
+                await domainManager.signalRootEnumerator()
+                coordinator.advance()
+            } catch {
+                await domainManager.signalRootEnumerator()
+                showMountError(error)
             }
-            await domainManager.signalRootEnumerator()
-            coordinator.advance()
         }
+    }
+
+    private func showMountError(_ error: Error) {
+        let alert = NSAlert()
+        alert.messageText = "Couldn't add folder"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 }
 

@@ -48,30 +48,51 @@ final class DaemonManager: ObservableObject {
     }
 
     private static let launchAgentLabel = "dev.drnkn.valvd"
-    private static let minimumRequiredVersion = "0.0.0"
+    // valvd 0.1.0 is the first distributable version after the daemon shipped the
+    // routes/transports this app requires: /fp/share and /fp/watch in c60f7ba, plus
+    // TCP-loopback support for sandboxed macOS clients in fdc38e5. Version reporting
+    // itself was wired in 4de6ea9 when the crate version moved to 0.1.0.
+    private static let minimumRequiredVersion = "0.1.0"
 
     @Published private(set) var isManagedByValv = false
     @Published private(set) var cliInstallStatus: CLIInstallStatus = .notChecked
     @Published var pendingDecision: ReconciliationOutcome?
+    @Published var installError: String?
     /// Set once `reconcileOnLaunch()` has run to completion (success, clean install, or
     /// a pending decision) - lets the onboarding daemon-setup page distinguish "still
     /// checking" from "checked, nothing needs the user" without inferring it from
     /// unrelated state.
     @Published private(set) var hasReconciled = false
 
-    private let fileManager = FileManager.default
+    private let fileManager: FileManager
+    private let homeDirectory: URL
+    private let bundledBinDirectoryOverride: URL?
+    private let cleanInstallOperation: ((Bool) async throws -> Void)?
     private let client: DaemonClient
 
-    init(client: DaemonClient = DaemonClient()) {
+    init(
+        client: DaemonClient = DaemonClient(),
+        fileManager: FileManager = .default,
+        homeDirectory: URL? = nil,
+        bundledBinDirectory: URL? = nil,
+        startOnLaunch: Bool = true,
+        cleanInstallOperation: ((Bool) async throws -> Void)? = nil
+    ) {
         self.client = client
-        Task { [weak self] in
-            await self?.reconcileOnLaunch()
-            self?.checkCLIInstallStatus()
+        self.fileManager = fileManager
+        self.homeDirectory = homeDirectory ?? fileManager.homeDirectoryForCurrentUser
+        self.bundledBinDirectoryOverride = bundledBinDirectory
+        self.cleanInstallOperation = cleanInstallOperation
+        if startOnLaunch {
+            Task { [weak self] in
+                await self?.reconcileOnLaunch()
+                self?.checkCLIInstallStatus()
+            }
         }
     }
 
     private var homeURL: URL {
-        fileManager.homeDirectoryForCurrentUser
+        homeDirectory
     }
 
     private var stableBinDirectory: URL {
@@ -83,7 +104,7 @@ final class DaemonManager: ObservableObject {
     }
 
     private var bundledBinDirectory: URL {
-        Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/bin")
+        bundledBinDirectoryOverride ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/bin")
     }
 
     // MARK: - Reconciliation (task 9's core flow)
@@ -151,12 +172,18 @@ final class DaemonManager: ObservableObject {
         }
     }
 
-    private func performCleanInstall(overwriteExisting: Bool = false) async {
+    func performCleanInstall(overwriteExisting: Bool = false) async {
         do {
-            try copyBundledBinariesToStableLocation()
-            try await runValvDaemonInstall()
+            if let cleanInstallOperation {
+                try await cleanInstallOperation(overwriteExisting)
+            } else {
+                try copyBundledBinariesToStableLocation()
+                try await runValvDaemonInstall()
+            }
+            installError = nil
             isManagedByValv = true
         } catch {
+            installError = error.localizedDescription
             NSLog("DaemonManager: clean install failed: %@", error.localizedDescription)
         }
     }
@@ -197,12 +224,35 @@ final class DaemonManager: ObservableObject {
 
     private func isVersionCompatible(_ version: String?) -> Bool {
         guard let version else { return false }
-        // Simple string comparison is sufficient here: every version this change needs
-        // to distinguish from is either "old enough it lacks the routes entirely" or
-        // "current" - a full semver comparator is more machinery than the actual
-        // decision needs (left as a documented open question in design.md for when a
-        // more nuanced minimum-version policy is needed).
-        return version >= Self.minimumRequiredVersion
+        return Self.isVersion(version, atLeast: Self.minimumRequiredVersion)
+    }
+
+    static func isVersion(_ version: String, atLeast minimumVersion: String) -> Bool {
+        guard let versionComponents = parseVersion(version),
+              let minimumComponents = parseVersion(minimumVersion)
+        else {
+            return false
+        }
+        for index in 0..<3 {
+            if versionComponents[index] > minimumComponents[index] {
+                return true
+            }
+            if versionComponents[index] < minimumComponents[index] {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func parseVersion(_ version: String) -> [Int]? {
+        let parts = version.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3 else { return nil }
+        var components: [Int] = []
+        for part in parts {
+            guard let component = Int(part) else { return nil }
+            components.append(component)
+        }
+        return components
     }
 
     // MARK: - CLI install (task 9's PATH action)
