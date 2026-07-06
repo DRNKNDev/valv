@@ -24,6 +24,7 @@ pub(crate) async fn cmd_grant_create(args: GrantCreateArgs) -> Result<()> {
             .json(&InviteCreateRequest {
                 invited_email: email,
                 scope_node_id: target.scope_node_id,
+                can_write,
             })
             .send()
             .await?
@@ -123,6 +124,7 @@ async fn fetch_grants(config: &CliConfig) -> Result<Vec<GrantListEntry>> {
 struct InviteCreateRequest {
     invited_email: String,
     scope_node_id: String,
+    can_write: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,5 +186,24 @@ mod tests {
         };
 
         assert_eq!(entry.grantee(), "u");
+    }
+
+    #[test]
+    fn invite_create_request_serializes_can_write() {
+        let writable = serde_json::to_value(InviteCreateRequest {
+            invited_email: "friend@example.com".into(),
+            scope_node_id: "node-1".into(),
+            can_write: true,
+        })
+        .unwrap();
+        let read_only = serde_json::to_value(InviteCreateRequest {
+            invited_email: "friend@example.com".into(),
+            scope_node_id: "node-1".into(),
+            can_write: false,
+        })
+        .unwrap();
+
+        assert_eq!(writable["can_write"], true);
+        assert_eq!(read_only["can_write"], false);
     }
 }
