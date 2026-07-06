@@ -3,7 +3,16 @@ import { or } from "drizzle-orm";
 
 import { type CoreAuth } from "../auth/index.js";
 import { checkGrant } from "./authz.js";
-import { type MetadataVariables, eq, getFolderRoot, inTransaction, newId, requirePrincipal } from "./common.js";
+import {
+  type MetadataVariables,
+  eq,
+  getFolderRoot,
+  inTransaction,
+  newId,
+  requirePrincipal,
+  resolveDeviceUserId,
+  resolveEffectiveUserId,
+} from "./common.js";
 
 type FolderRouteStore = {
   createFolderForRoute?: (opts: {
@@ -127,28 +136,6 @@ export function registerFolderRoutes(router: Hono<{ Variables: MetadataVariables
 
     return ctx.json({ folder_id: folderId, name: folder.name });
   });
-}
-
-async function resolveEffectiveUserId(
-  auth: CoreAuth,
-  principal: { type: "user"; userId: string } | { type: "device"; deviceId: string },
-): Promise<string | undefined> {
-  if (principal.type === "user") {
-    return principal.userId;
-  }
-  return resolveDeviceUserId(auth, principal.deviceId);
-}
-
-async function resolveDeviceUserId(auth: CoreAuth, deviceId: string): Promise<string | undefined> {
-  if (hasFolderRouteStore(auth.db) && auth.db.getDeviceUserIdForRoute) {
-    return auth.db.getDeviceUserIdForRoute(deviceId);
-  }
-  const rows = await auth.db
-    .select({ userId: auth.schema.devices.userId })
-    .from(auth.schema.devices)
-    .where(eq(auth.schema.devices.deviceId, deviceId))
-    .limit(1);
-  return rows[0]?.userId ?? undefined;
 }
 
 function hasFolderRouteStore(db: CoreAuth["db"]): db is CoreAuth["db"] & FolderRouteStore {

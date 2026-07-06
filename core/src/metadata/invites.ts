@@ -11,6 +11,7 @@ import {
   inTransaction,
   newId,
   requirePrincipal,
+  resolveEffectiveUserId,
   type MetadataVariables,
 } from "./common.js";
 import { checkGrant } from "./authz.js";
@@ -67,6 +68,11 @@ export function registerInviteRoutes(
       return ctx.json({ error: grant.reason }, 403);
     }
 
+    const invitedByUserId = await resolveEffectiveUserId(auth, principal);
+    if (!invitedByUserId) {
+      return ctx.json({ error: "agent_devices_cannot_create_invites" }, 403);
+    }
+
     // Defaults to true (read-write) to preserve existing behavior for callers that
     // don't pass this field. Gated on the caller's own write capability above, not on
     // what's being requested for the invite - same principle as POST
@@ -83,7 +89,7 @@ export function registerInviteRoutes(
         folderId,
         scopeNodeId,
         invitedEmail,
-        invitedByUserId: principal.type === "user" ? principal.userId : principal.deviceId,
+        invitedByUserId,
         canWrite,
         expiresAt,
       });
@@ -101,7 +107,7 @@ export function registerInviteRoutes(
         folderId,
         scopeNodeId,
         invitedEmail,
-        invitedByUserId: principal.type === "user" ? principal.userId : principal.deviceId,
+        invitedByUserId,
         canWrite,
         status: "pending",
         expiresAt,

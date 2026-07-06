@@ -50,10 +50,35 @@ export async function getFolderRoot(auth: CoreAuth, folderId: string, db = auth.
   return rows[0]?.nodeId;
 }
 
+export async function resolveEffectiveUserId(auth: CoreAuth, principal: Principal): Promise<string | undefined> {
+  if (principal.type === "user") {
+    return principal.userId;
+  }
+  return resolveDeviceUserId(auth, principal.deviceId);
+}
+
+export async function resolveDeviceUserId(auth: CoreAuth, deviceId: string): Promise<string | undefined> {
+  if (hasDeviceUserRouteLoader(auth.db)) {
+    return auth.db.getDeviceUserIdForRoute(deviceId);
+  }
+  const rows = await auth.db
+    .select({ userId: auth.schema.devices.userId })
+    .from(auth.schema.devices)
+    .where(eq(auth.schema.devices.deviceId, deviceId))
+    .limit(1);
+  return rows[0]?.userId ?? undefined;
+}
+
 function hasFolderRootLoader(db: CoreAuth["db"]): db is CoreAuth["db"] & {
   getFolderRootForAuthz: (folderId: string) => Promise<string | undefined>;
 } {
   return "getFolderRootForAuthz" in db;
+}
+
+function hasDeviceUserRouteLoader(db: CoreAuth["db"]): db is CoreAuth["db"] & {
+  getDeviceUserIdForRoute: (deviceId: string) => Promise<string | undefined>;
+} {
+  return "getDeviceUserIdForRoute" in db;
 }
 
 export async function assertGrant(

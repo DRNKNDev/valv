@@ -97,6 +97,55 @@ describe("invite routes", () => {
     expect(db.folderInvites[0]).toMatchObject({ canWrite: false });
   });
 
+  it("attributes invites created by user principals to the user id", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("root");
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" });
+
+    const response = await app.request("/folders/folder-1/invites", {
+      method: "POST",
+      body: JSON.stringify({ invited_email: "friend@example.com" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.folderInvites[0]).toMatchObject({ invitedByUserId: "user-1" });
+  });
+
+  it("attributes invites created by human devices to the device owner", async () => {
+    const db = new LifecycleDb();
+    db.devices.push({ deviceId: "device-1", userId: "user-1", name: "Laptop", tokenHash: "hash" });
+    db.folderGrants.push(grant("grant-owner", { scopeNodeId: "root", userId: "user-1", canWrite: true }));
+    const app = metadataAppFor(db, { type: "device", deviceId: "device-1" });
+
+    const response = await app.request("/folders/folder-1/invites", {
+      method: "POST",
+      body: JSON.stringify({ invited_email: "friend@example.com" }),
+      headers: { authorization: "Bearer device-token", "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.folderInvites[0]).toMatchObject({ invitedByUserId: "user-1" });
+    expect(db.folderInvites[0]?.invitedByUserId).not.toBe("device-1");
+  });
+
+  it("rejects invite creation from agent devices even with write-capable grants", async () => {
+    const db = new LifecycleDb();
+    db.devices.push({ deviceId: "agent-1", userId: null, name: "Agent", tokenHash: "hash" });
+    db.folderGrants.push(grant("grant-agent", { scopeNodeId: "root", deviceId: "agent-1", canWrite: true }));
+    const app = metadataAppFor(db, { type: "device", deviceId: "agent-1" });
+
+    const response = await app.request("/folders/folder-1/invites", {
+      method: "POST",
+      body: JSON.stringify({ invited_email: "friend@example.com" }),
+      headers: { authorization: "Bearer device-token", "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({ error: "agent_devices_cannot_create_invites" });
+    expect(db.folderInvites).toHaveLength(0);
+  });
+
   it("accepting a read-only invite grants a read-only, not read-write, scope", async () => {
     const db = new LifecycleDb();
     db.folderInvites.push({
