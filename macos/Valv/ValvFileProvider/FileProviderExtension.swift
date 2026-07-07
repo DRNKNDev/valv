@@ -199,33 +199,78 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 
         let task = Task {
             do {
-                if changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier) {
-                    // Defense in depth for the fp-rename-move stopgap: Finder should
-                    // not offer rename/reparent without the capabilities, but reject
-                    // both here too until the daemon has a real /fp/rename route.
-                    completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError))
-                    return
+                let metadataChanged = changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier)
+                let sourceItem = try await client.fpItem(nodeId: nodeId)
+                var basedOnSeq = sourceItem.serverSeq
+                var parentIdForUpload = sourceItem.parentId ?? nodeId
+
+                if metadataChanged {
+                    let newName = changedFields.contains(.filename) ? item.filename : nil
+                    let newParentId: String?
+                    if changedFields.contains(.parentItemIdentifier) {
+                        let sourceFolderId = sourceItem.folderId
+                        let destinationFolderId = try await folderId(for: item.parentItemIdentifier)
+                        guard sourceFolderId == destinationFolderId else {
+                            completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError))
+                            return
+                        }
+                        guard case .node(let parentNodeId) = ValvItemIdentifier(item.parentItemIdentifier) else {
+                            completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError))
+                            return
+                        }
+                        newParentId = parentNodeId
+                        parentIdForUpload = parentNodeId
+                    } else {
+                        newParentId = nil
+                    }
+
+                    let move = try await client.fpMove(
+                        nodeId: nodeId,
+                        basedOnSeq: basedOnSeq,
+                        newName: newName,
+                        newParentId: newParentId
+                    )
+                    basedOnSeq = move.serverSeq
                 }
 
                 if changedFields.contains(.contents), let newContents {
-                    let sourceItem = try await client.fpItem(nodeId: nodeId)
                     _ = try await client.fpUpload(FpUploadRequest(
                         nodeId: nodeId,
-                        parentId: sourceItem.parentId ?? nodeId,
+                        parentId: parentIdForUpload,
                         name: item.filename,
-                        basedOnSeq: sourceItem.serverSeq,
+                        basedOnSeq: basedOnSeq,
                         filePath: newContents.path
                     ))
+                } else if changedFields.contains(.contents) {
+                    throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError)
                 }
-                // Rename/reparent metadata-only changes are expected to arrive back
-                // through the normal sync loop (push_local picks up the rename on the
-                // materialized mount path) rather than a dedicated metadata-only IPC
-                // route - matching the daemon's existing rename handling for
-                // non-GUI-driven mounts.
 
                 let updatedItem = try await resolveItem(for: item.itemIdentifier)
                 progress.completedUnitCount = 100
                 completionHandler(updatedItem, [], false, nil)
+            } catch DaemonClientError.httpStatus(409, let body) {
+                switch daemonErrorCode(from: body) {
+                case "superseded":
+                    do {
+                        let updatedItem = try await resolveItem(for: item.itemIdentifier)
+                        progress.completedUnitCount = 100
+                        completionHandler(updatedItem, [], false, nil)
+                    } catch {
+                        completionHandler(nil, [], false, error)
+                    }
+                case "name_collision":
+                    completionHandler(
+                        nil,
+                        [],
+                        false,
+                        NSError(
+                            domain: NSFileProviderErrorDomain,
+                            code: NSFileProviderError.Code.filenameCollision.rawValue
+                        )
+                    )
+                default:
+                    completionHandler(nil, [], false, DaemonClientError.httpStatus(409, body))
+                }
             } catch {
                 Self.logger.error("modifyItem failed for \(item.itemIdentifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 completionHandler(nil, [], false, error)
@@ -275,6 +320,17 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         case .node(let nodeId):
             return try await client.fpItem(nodeId: nodeId).folderId
         }
+    }
+
+    private struct DaemonJSONErrorBody: Decodable {
+        let error: String?
+    }
+
+    private func daemonErrorCode(from body: String) -> String? {
+        guard let data = body.data(using: .utf8) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(DaemonJSONErrorBody.self, from: data).error
     }
 
     // MARK: - Enumeration
