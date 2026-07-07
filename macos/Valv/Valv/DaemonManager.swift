@@ -103,6 +103,10 @@ final class DaemonManager: ObservableObject {
         homeURL.appendingPathComponent("Library/LaunchAgents/\(Self.launchAgentLabel).plist")
     }
 
+    private var configFileURL: URL {
+        homeURL.appendingPathComponent(".config/valv/config.toml")
+    }
+
     private var bundledBinDirectory: URL {
         bundledBinDirectoryOverride ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/bin")
     }
@@ -125,10 +129,31 @@ final class DaemonManager: ObservableObject {
             return
         }
 
+        guard fileManager.fileExists(atPath: registeredPath) else {
+            // The plist is registered but the binary it points at is gone (e.g. the
+            // whole stable install directory was removed out-of-band while the
+            // launchd job itself was left behind). There's no real external install
+            // to reconcile against here, so treat it like a fresh install rather
+            // than asking the user to decide about a phantom "incompatible" one -
+            // `resolveVersion` below can't distinguish "genuinely incompatible" from
+            // "nothing there to run" and would otherwise show the wrong decision UI.
+            await performCleanInstall(overwriteExisting: true)
+            return
+        }
+
         let existingVersion = await resolveVersion(ofBinaryAt: registeredPath)
         if isVersionCompatible(existingVersion) {
             isManagedByValv = registeredPath.hasPrefix(stableBinDirectory.path)
             if isManagedByValv {
+                if !fileManager.fileExists(atPath: configFileURL.path) {
+                    // The launchd job is registered but config.toml is gone (e.g.
+                    // removed out-of-band while the job itself was left in place) -
+                    // valvd exits immediately on every KeepAlive restart without it,
+                    // crash-looping forever with no way for this app to notice unless
+                    // it checks. Repair by reinstalling, which recreates the template.
+                    await performCleanInstall(overwriteExisting: true)
+                    return
+                }
                 await refreshStableCopyIfBundledIsNewer()
             }
             return
@@ -219,7 +244,13 @@ final class DaemonManager: ObservableObject {
         if let status = try? await client.status() {
             return status.version
         }
-        return try? await runCapturingOutput(executable: path, arguments: ["--version"])
+        // clap's default `--version` output is "<bin-name> <version>" (e.g.
+        // "valvd 0.1.0"), not a bare semver - take the last whitespace-separated
+        // token so `parseVersion` gets "0.1.0", not the whole string.
+        guard let output = try? await runCapturingOutput(executable: path, arguments: ["--version"]) else {
+            return nil
+        }
+        return output.split(separator: " ").last.map(String.init)
     }
 
     private func isVersionCompatible(_ version: String?) -> Bool {
@@ -310,6 +341,11 @@ final class DaemonManager: ObservableObject {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        // Without this, Process leaves stdin unset and the child inherits ours -
+        // under Xcode that's a live PTY that never delivers EOF, so any prompt the
+        // child reads from stdin (e.g. valvd's `ensure_config_template`) blocks
+        // forever instead of hitting a closed/empty stream and moving on.
+        process.standardInput = FileHandle.nullDevice
         try process.run()
         process.waitUntilExit()
         guard process.terminationStatus == 0 else {
@@ -321,6 +357,7 @@ final class DaemonManager: ObservableObject {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
         let pipe = Pipe()
         process.standardOutput = pipe
         try process.run()

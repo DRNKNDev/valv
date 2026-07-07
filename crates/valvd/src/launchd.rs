@@ -13,6 +13,12 @@ const LAUNCH_AGENT_LABEL: &str = "dev.drnkn.valvd";
 pub(crate) fn install_daemon() -> Result<()> {
     config::ensure_config_template()?;
     let plist_path = launch_agent_path()?;
+    // `bootstrap` refuses to (re)register a Label already loaded in the domain -
+    // fails with the generic "Bootstrap failed: 5: Input/output error" regardless
+    // of whether the existing job is actually running or crash-looped. Boot out
+    // any prior registration first (ignoring failure - "wasn't loaded" is the
+    // normal fresh-install case) so install_daemon is safe to re-run as a repair.
+    run_launchctl("bootout", &plist_path, false)?;
     let valvd_path = config::resolve_valvd_path()?;
     write_launch_agent_plist(&plist_path, &valvd_path)?;
     run_launchctl("bootstrap", &plist_path, true)?;

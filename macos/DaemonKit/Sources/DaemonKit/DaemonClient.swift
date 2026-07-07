@@ -279,32 +279,43 @@ public actor DaemonClient {
     }
 
     private func waitUntilReady(_ connection: NWConnection) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            var didResume = false
-            let resumeOnce: (Result<Void, Error>) -> Void = { result in
-                guard !didResume else { return }
-                didResume = true
-                switch result {
-                case .success:
-                    continuation.resume()
-                case .failure(let error):
-                    continuation.resume(throwing: error)
+        // Task cancellation alone does not stop an `NWConnection` - if `withTimeout`'s
+        // sibling deadline task fires while this connection is sitting in `.waiting`
+        // (as happens connecting to a stale/dead port), nothing ever drives it to
+        // `.ready`/`.failed`/`.cancelled`, so the continuation below never resumes and
+        // the task group can never finish awaiting this child - defeating the timeout
+        // it's supposed to race against. `withTaskCancellationHandler` closes that gap
+        // by cancelling the connection itself the moment the task is cancelled.
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                var didResume = false
+                let resumeOnce: (Result<Void, Error>) -> Void = { result in
+                    guard !didResume else { return }
+                    didResume = true
+                    switch result {
+                    case .success:
+                        continuation.resume()
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                    }
                 }
-            }
 
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    resumeOnce(.success(()))
-                case .failed(let error):
-                    resumeOnce(.failure(DaemonClientError.connectionFailed(error.localizedDescription)))
-                case .cancelled:
-                    resumeOnce(.failure(DaemonClientError.connectionFailed("cancelled")))
-                default:
-                    break
+                connection.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        resumeOnce(.success(()))
+                    case .failed(let error):
+                        resumeOnce(.failure(DaemonClientError.connectionFailed(error.localizedDescription)))
+                    case .cancelled:
+                        resumeOnce(.failure(DaemonClientError.connectionFailed("cancelled")))
+                    default:
+                        break
+                    }
                 }
+                connection.start(queue: .global())
             }
-            connection.start(queue: .global())
+        } onCancel: {
+            connection.cancel()
         }
     }
 
