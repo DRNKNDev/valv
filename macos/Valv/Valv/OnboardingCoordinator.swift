@@ -10,7 +10,7 @@ enum OnboardingPage: Int, CaseIterable {
     case completion
 }
 
-/// Delivers the `valv://auth-callback` URL from `ValvApp`'s `.onOpenURL` to whichever
+/// Delivers the `valv://auth-callback` URL from Valv's app-level URL handler to whichever
 /// onboarding page is listening, and retains the expected state nonce for the
 /// current browser sign-in attempt.
 final class AuthCallbackCenter: ObservableObject {

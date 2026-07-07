@@ -8,6 +8,15 @@ import SwiftUI
 /// lazily on first click, and empirically even its label view's `.task` doesn't fire
 /// reliably for a status-item-hosted view, so this is the reliable hook.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL)
+        )
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard !DaemonStore.shared.hasSignedIn else { return }
         OnboardingWindowController.shared.present(
@@ -15,6 +24,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             daemonManager: DaemonManager.shared,
             domainManager: FileProviderDomainManager.shared
         )
+    }
+
+    @objc private func handleGetURLEvent(
+        _ event: NSAppleEventDescriptor,
+        withReplyEvent replyEvent: NSAppleEventDescriptor
+    ) {
+        guard let rawURL = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+              let url = URL(string: rawURL),
+              url.scheme == "valv",
+              url.host == "auth-callback" else {
+            return
+        }
+
+        AuthCallbackCenter.shared.handle(url)
     }
 }
 
@@ -31,9 +54,6 @@ struct ValvApp: App {
                 .environmentObject(store)
                 .environmentObject(daemonManager)
                 .environmentObject(domainManager)
-                .onOpenURL { url in
-                    AuthCallbackCenter.shared.handle(url)
-                }
         } label: {
             Image(systemName: symbolName(for: store.iconState))
         }
