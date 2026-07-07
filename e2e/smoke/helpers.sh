@@ -149,13 +149,18 @@ wait_for_idle() {
     local status
     status=$(HOME="$home_dir" "$VALV_BIN" status 2>/dev/null || true)
     if [ -n "$status" ]; then
+      # `valv status` prints a space-aligned table (see valv-cli print_table):
+      # a "Connected/Disconnected" line, a header row, a dashes row, then one
+      # data row per mount: `<path> <syncing> <pending_ops> <last_synced_at> <error>`.
+      # Parse the syncing column ($2) for the mount's row with default (whitespace)
+      # field splitting — the header/dashes/status lines never match an exact path.
       if [ -n "$mount_path" ]; then
-        local mount_status
-        mount_status=$(printf '%s\n' "$status" | awk -v path="$mount_path" 'BEGIN { FS = "\t" } $1 == path { print; found = 1 } END { if (!found) exit 1 }' || true)
-        if [ -n "$mount_status" ] && ! printf '%s\n' "$mount_status" | grep -q $'\ttrue\t'; then
+        local syncing
+        syncing=$(printf '%s\n' "$status" | awk -v path="$mount_path" '$1 == path { print $2; exit }')
+        if [ -n "$syncing" ] && [ "$syncing" != "true" ]; then
           return 0
         fi
-      elif ! printf '%s\n' "$status" | grep -q $'\ttrue\t'; then
+      elif ! printf '%s\n' "$status" | awk '$2 == "true" { found = 1 } END { exit(found ? 0 : 1) }'; then
         return 0
       fi
     fi
@@ -183,7 +188,7 @@ mount_folder() {
   mkdir -p "$mount_path"
   local output
   output=$(HOME="$home_dir" "$VALV_BIN" mount "$mount_path" "$@")
-  printf '%s\n' "$output" | node -e "const fs = require('fs'); const text = fs.readFileSync(0, 'utf8'); const m = text.match(/folder ([^ ]+)/); if (!m) process.exit(1); process.stdout.write(m[1]);"
+  printf '%s\n' "$output" | node -e "const fs = require('fs'); const text = fs.readFileSync(0, 'utf8'); const m = text.match(/folder ([^ :]+)/); if (!m) process.exit(1); process.stdout.write(m[1]);"
 }
 
 assert_bucket_key() {
