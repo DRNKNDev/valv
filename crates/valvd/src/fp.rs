@@ -21,12 +21,12 @@ use valv_sync::{
         http::{BatchOperation, BatchRequest, BatchRequestObject, BatchResponse},
         ipc::{
             FpAnchorResponse, FpChangesResponse, FpChunkDownload, FpContentResponse,
-            FpDeleteRequest, FpEnumerateResponse, FpItem, FpShareRequest, FpShareResponse,
-            FpUploadQueued, FpUploadRequest,
+            FpDeleteRequest, FpEnumerateResponse, FpItem, FpMoveRequest, FpMoveResponse,
+            FpShareRequest, FpShareResponse, FpUploadQueued, FpUploadRequest,
         },
         sync::{
-            ChunkRef, CreatePayload, DeletePayload, NewVersionPayload, NodeType, SubmitOpRequest,
-            SubmitOpResponse,
+            ChunkRef, CreatePayload, DeletePayload, MovePayload, NewVersionPayload, NodeType,
+            RenamePayload, SubmitOpRequest, SubmitOpResponse,
         },
     },
 };
@@ -279,6 +279,84 @@ pub(crate) async fn fp_delete(
     }
 }
 
+pub(crate) async fn fp_move(
+    State(state): State<DaemonState>,
+    Json(req): Json<FpMoveRequest>,
+) -> Result<Json<FpMoveResponse>, DaemonError> {
+    validate_move_request(&req)?;
+    let (folder_id, token, mut updated_node) = {
+        let conn = state.db.lock().await;
+        let Some(node) = nodes::get_node(&conn, &req.node_id)? else {
+            return Err(DaemonError::NotFound("node_not_found".to_owned()));
+        };
+        let mount = resolve_mount_for_folder_id(&state, &node.folder_id).await?;
+        (
+            node.folder_id.clone(),
+            mount.effective_token(&state.config).to_owned(),
+            node,
+        )
+    };
+
+    let mut based_on_seq = req.based_on_seq;
+    let mut applied_seq = None;
+
+    if let Some(new_name) = req.new_name.as_deref() {
+        let response = submit_op_daemon(
+            &state.client,
+            &state.config.backend_url,
+            &token,
+            &folder_id,
+            &SubmitOpRequest::Rename {
+                node_id: req.node_id.clone(),
+                based_on_seq,
+                payload: RenamePayload {
+                    new_name: new_name.to_owned(),
+                },
+            },
+        )
+        .await?;
+        based_on_seq = applied_server_seq(response)?;
+        updated_node.name = new_name.to_owned();
+        updated_node.server_seq = based_on_seq;
+        {
+            let conn = state.db.lock().await;
+            nodes::upsert_node(&conn, &updated_node)?;
+        }
+        applied_seq = Some(based_on_seq);
+    }
+
+    if let Some(new_parent_id) = req.new_parent_id.as_deref() {
+        let response = submit_op_daemon(
+            &state.client,
+            &state.config.backend_url,
+            &token,
+            &folder_id,
+            &SubmitOpRequest::Move {
+                node_id: req.node_id.clone(),
+                based_on_seq,
+                payload: MovePayload {
+                    new_parent_id: new_parent_id.to_owned(),
+                },
+            },
+        )
+        .await?;
+        based_on_seq = applied_server_seq(response)?;
+        updated_node.parent_id = Some(new_parent_id.to_owned());
+        updated_node.server_seq = based_on_seq;
+        {
+            let conn = state.db.lock().await;
+            nodes::upsert_node(&conn, &updated_node)?;
+        }
+        applied_seq = Some(based_on_seq);
+    }
+
+    let server_seq = applied_seq.expect("validated request contains at least one change");
+    Ok(Json(FpMoveResponse {
+        node_id: req.node_id,
+        server_seq,
+    }))
+}
+
 pub(crate) async fn fp_share(
     State(state): State<DaemonState>,
     Json(req): Json<FpShareRequest>,
@@ -358,6 +436,42 @@ fn validate_upload_request(req: &FpUploadRequest) -> Result<(), DaemonError> {
         return Err(DaemonError::BadRequest("file_path is required".to_owned()));
     }
     Ok(())
+}
+
+fn validate_move_request(req: &FpMoveRequest) -> Result<(), DaemonError> {
+    if req.node_id.trim().is_empty() {
+        return Err(DaemonError::BadRequest("node_id is required".to_owned()));
+    }
+    if req.new_name.is_none() && req.new_parent_id.is_none() {
+        return Err(DaemonError::BadRequest(
+            "new_name or new_parent_id is required".to_owned(),
+        ));
+    }
+    if req.new_name.as_deref().is_some_and(str::is_empty) {
+        return Err(DaemonError::BadRequest(
+            "new_name cannot be empty".to_owned(),
+        ));
+    }
+    if req.new_parent_id.as_deref().is_some_and(str::is_empty) {
+        return Err(DaemonError::BadRequest(
+            "new_parent_id cannot be empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn applied_server_seq(response: SubmitOpResponse) -> Result<i64, DaemonError> {
+    match response {
+        SubmitOpResponse::Applied { server_seq, .. } => Ok(server_seq),
+        SubmitOpResponse::Superseded { current_seq } => Err(DaemonError::Conflict(json!({
+            "error": "superseded",
+            "current_seq": current_seq
+        }))),
+        SubmitOpResponse::ConflictCopy { server_seq, .. } => Err(DaemonError::Conflict(json!({
+            "error": "conflict_copy",
+            "server_seq": server_seq
+        }))),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -729,11 +843,6 @@ async fn submit_op_daemon(
         .json(req)
         .send()
         .await?;
-    if response.status() == StatusCode::FORBIDDEN {
-        return Err(DaemonError::Internal(format!(
-            "authorization failed submitting op for folder {folder_id}"
-        )));
-    }
     Ok(backend_response_or_error(response)
         .await?
         .json::<SubmitOpResponse>()
@@ -961,7 +1070,7 @@ mod fp_error_tests {
     };
     use valv_sync::{
         persistence::{mounts as mount_store, nodes as node_store, LocalNode},
-        protocol::ipc::{FpDeleteRequest, FpUploadRequest},
+        protocol::ipc::{FpDeleteRequest, FpMoveRequest, FpUploadRequest},
     };
 
     use crate::config::DaemonConfig;
@@ -986,6 +1095,70 @@ mod fp_error_tests {
         format!("http://{addr}")
     }
 
+    async fn backend_url_recording_responses(
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        tokio::spawn(async move {
+            for (status_line, body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_body = read_http_json_body(&mut stream).await;
+                captured.lock().await.push(request_body);
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    async fn read_http_json_body(stream: &mut tokio::net::TcpStream) -> Value {
+        let mut buffer = Vec::new();
+        let mut chunk = [0; 1024];
+        let header_end;
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "connection closed before request headers");
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+        let headers = std::str::from_utf8(&buffer[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("content-length:")
+                    .or_else(|| line.strip_prefix("Content-Length:"))
+            })
+            .map(str::trim)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        while buffer.len() < header_end + content_length {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "connection closed before request body");
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        serde_json::from_slice(&buffer[header_end..header_end + content_length]).unwrap()
+    }
+
+    async fn response_json(error: DaemonError) -> (StatusCode, Value) {
+        let response = error.into_response();
+        let status = response.status();
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice::<Value>(&bytes).unwrap();
+        (status, body)
+    }
+
     fn node(node_id: &str, parent_id: Option<&str>, name: &str) -> LocalNode {
         LocalNode {
             node_id: node_id.to_owned(),
@@ -996,6 +1169,13 @@ mod fp_error_tests {
             current_version_id: None,
             server_seq: 7,
             deleted_at: None,
+        }
+    }
+
+    fn folder_node(node_id: &str, parent_id: Option<&str>, name: &str) -> LocalNode {
+        LocalNode {
+            node_type: "folder".into(),
+            ..node(node_id, parent_id, name)
         }
     }
 
@@ -1082,6 +1262,288 @@ mod fp_error_tests {
 
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "superseded");
+    }
+
+    #[tokio::test]
+    async fn fp_move_applied_rename_updates_mirror() {
+        let (backend_url, requests) = backend_url_recording_responses(vec![(
+            "HTTP/1.1 200 OK",
+            r#"{"result":"applied","server_seq":8,"node_id":"node-1"}"#,
+        )])
+        .await;
+        let state = test_state(backend_url);
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("node-1", Some("parent-1"), "doc.txt")).unwrap();
+        }
+
+        let response = fp_move(
+            State(state.clone()),
+            Json(FpMoveRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 7,
+                new_name: Some("renamed.txt".to_owned()),
+                new_parent_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.server_seq, 8);
+        let conn = state.db.lock().await;
+        let updated = node_store::get_node(&conn, "node-1").unwrap().unwrap();
+        assert_eq!(updated.name, "renamed.txt");
+        assert_eq!(updated.parent_id.as_deref(), Some("parent-1"));
+        assert_eq!(updated.server_seq, 8);
+        let captured = requests.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["op_type"], "rename");
+        assert_eq!(captured[0]["based_on_seq"], 7);
+        assert_eq!(captured[0]["payload"]["new_name"], "renamed.txt");
+    }
+
+    #[tokio::test]
+    async fn fp_move_applied_move_updates_parent() {
+        let (backend_url, requests) = backend_url_recording_responses(vec![(
+            "HTTP/1.1 200 OK",
+            r#"{"result":"applied","server_seq":9,"node_id":"node-1"}"#,
+        )])
+        .await;
+        let state = test_state(backend_url);
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("node-1", Some("parent-1"), "doc.txt")).unwrap();
+            node_store::upsert_node(&conn, &folder_node("parent-2", None, "Dest")).unwrap();
+        }
+
+        let response = fp_move(
+            State(state.clone()),
+            Json(FpMoveRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 7,
+                new_name: None,
+                new_parent_id: Some("parent-2".to_owned()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.server_seq, 9);
+        let conn = state.db.lock().await;
+        let updated = node_store::get_node(&conn, "node-1").unwrap().unwrap();
+        assert_eq!(updated.name, "doc.txt");
+        assert_eq!(updated.parent_id.as_deref(), Some("parent-2"));
+        assert_eq!(updated.server_seq, 9);
+        let captured = requests.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["op_type"], "move");
+        assert_eq!(captured[0]["based_on_seq"], 7);
+        assert_eq!(captured[0]["payload"]["new_parent_id"], "parent-2");
+    }
+
+    #[tokio::test]
+    async fn fp_move_combined_change_chains_move_on_rename_seq() {
+        let (backend_url, requests) = backend_url_recording_responses(vec![
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"result":"applied","server_seq":8,"node_id":"node-1"}"#,
+            ),
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"result":"applied","server_seq":9,"node_id":"node-1"}"#,
+            ),
+        ])
+        .await;
+        let state = test_state(backend_url);
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("node-1", Some("parent-1"), "doc.txt")).unwrap();
+            node_store::upsert_node(&conn, &folder_node("parent-2", None, "Dest")).unwrap();
+        }
+
+        let response = fp_move(
+            State(state.clone()),
+            Json(FpMoveRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 7,
+                new_name: Some("renamed.txt".to_owned()),
+                new_parent_id: Some("parent-2".to_owned()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.server_seq, 9);
+        let conn = state.db.lock().await;
+        let updated = node_store::get_node(&conn, "node-1").unwrap().unwrap();
+        assert_eq!(updated.name, "renamed.txt");
+        assert_eq!(updated.parent_id.as_deref(), Some("parent-2"));
+        assert_eq!(updated.server_seq, 9);
+        let captured = requests.lock().await;
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0]["op_type"], "rename");
+        assert_eq!(captured[0]["based_on_seq"], 7);
+        assert_eq!(captured[1]["op_type"], "move");
+        assert_eq!(captured[1]["based_on_seq"], 8);
+    }
+
+    #[tokio::test]
+    async fn fp_move_combined_rename_applied_then_move_superseded_persists_rename() {
+        let (backend_url, requests) = backend_url_recording_responses(vec![
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"result":"applied","server_seq":8,"node_id":"node-1"}"#,
+            ),
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"result":"superseded","current_seq":10}"#,
+            ),
+        ])
+        .await;
+        let state = test_state(backend_url);
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("node-1", Some("parent-1"), "doc.txt")).unwrap();
+            node_store::upsert_node(&conn, &folder_node("parent-2", None, "Dest")).unwrap();
+        }
+
+        let error = fp_move(
+            State(state.clone()),
+            Json(FpMoveRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 7,
+                new_name: Some("renamed.txt".to_owned()),
+                new_parent_id: Some("parent-2".to_owned()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        let (status, body) = response_json(error).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({ "error": "superseded", "current_seq": 10 }));
+        let conn = state.db.lock().await;
+        let updated = node_store::get_node(&conn, "node-1").unwrap().unwrap();
+        assert_eq!(updated.name, "renamed.txt");
+        assert_eq!(updated.parent_id.as_deref(), Some("parent-1"));
+        assert_eq!(updated.server_seq, 8);
+        let captured = requests.lock().await;
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0]["op_type"], "rename");
+        assert_eq!(captured[0]["based_on_seq"], 7);
+        assert_eq!(captured[1]["op_type"], "move");
+        assert_eq!(captured[1]["based_on_seq"], 8);
+    }
+
+    #[tokio::test]
+    async fn fp_move_superseded_returns_structured_409_and_preserves_mirror() {
+        let (backend_url, _requests) = backend_url_recording_responses(vec![(
+            "HTTP/1.1 200 OK",
+            r#"{"result":"superseded","current_seq":10}"#,
+        )])
+        .await;
+        let state = test_state(backend_url);
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("node-1", Some("parent-1"), "doc.txt")).unwrap();
+        }
+
+        let error = fp_move(
+            State(state.clone()),
+            Json(FpMoveRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 7,
+                new_name: Some("renamed.txt".to_owned()),
+                new_parent_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        let (status, body) = response_json(error).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({ "error": "superseded", "current_seq": 10 }));
+        let conn = state.db.lock().await;
+        let unchanged = node_store::get_node(&conn, "node-1").unwrap().unwrap();
+        assert_eq!(unchanged.name, "doc.txt");
+        assert_eq!(unchanged.server_seq, 7);
+    }
+
+    #[tokio::test]
+    async fn fp_move_name_collision_passes_through_backend_409() {
+        let (backend_url, _requests) = backend_url_recording_responses(vec![(
+            "HTTP/1.1 409 Conflict",
+            r#"{"error":"name_collision"}"#,
+        )])
+        .await;
+        let state = test_state(backend_url);
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("node-1", Some("parent-1"), "doc.txt")).unwrap();
+        }
+
+        let error = fp_move(
+            State(state),
+            Json(FpMoveRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 7,
+                new_name: Some("existing.txt".to_owned()),
+                new_parent_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        let (status, body) = response_json(error).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({ "error": "name_collision" }));
+    }
+
+    #[tokio::test]
+    async fn fp_move_unknown_node_returns_404_without_backend_call() {
+        let backend_url =
+            backend_url_with_response("HTTP/1.1 500 Internal Server Error", r#"{}"#).await;
+        let state = test_state(backend_url);
+
+        let error = fp_move(
+            State(state),
+            Json(FpMoveRequest {
+                node_id: "missing-node".to_owned(),
+                based_on_seq: 7,
+                new_name: Some("renamed.txt".to_owned()),
+                new_parent_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        let (status, body) = response_json(error).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, json!({ "error": "node_not_found" }));
+    }
+
+    #[tokio::test]
+    async fn fp_move_rejects_request_with_no_changes() {
+        let state = test_state("http://127.0.0.1:1".to_owned());
+
+        let error = fp_move(
+            State(state),
+            Json(FpMoveRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 7,
+                new_name: None,
+                new_parent_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        let (status, body) = response_json(error).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            json!({ "error": "new_name or new_parent_id is required" })
+        );
     }
 
     #[tokio::test]
@@ -1217,7 +1679,7 @@ mod fp_error_tests {
     }
 
     #[tokio::test]
-    async fn submit_op_daemon_preserves_forbidden_auth_message() {
+    async fn submit_op_daemon_preserves_forbidden_backend_body() {
         let backend_url =
             backend_url_with_response("HTTP/1.1 403 Forbidden", r#"{"error":"forbidden"}"#).await;
 
@@ -1235,11 +1697,9 @@ mod fp_error_tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(error, DaemonError::Internal(_)));
-        assert_eq!(
-            error.to_string(),
-            "authorization failed submitting op for folder folder-1"
-        );
+        let (status, body) = response_json(error).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({ "error": "forbidden" }));
     }
 
     #[tokio::test]

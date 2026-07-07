@@ -288,6 +288,7 @@ fn build_router(state: DaemonState) -> Router {
         .route("/fp/content/:node_id", get(fp::fp_content))
         .route("/fp/upload", post(fp::fp_upload))
         .route("/fp/delete", post(fp::fp_delete).delete(fp::fp_delete))
+        .route("/fp/move", post(fp::fp_move))
         .route("/fp/share", post(fp::fp_share))
         .route("/fp/watch", get(fp::fp_watch))
         .route("/nodes/:node_id/path", get(nodes::get_node_path))
