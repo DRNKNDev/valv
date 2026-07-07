@@ -1,104 +1,52 @@
-import Network
 import XCTest
 
 @testable import DaemonKit
 
-/// Minimal in-process TCP server that speaks just enough HTTP/1.1 to test
-/// `DaemonClient` without a real `valvd`. Not a general-purpose test double -
-/// keyed by exact request line, one canned response per registered path.
-final class MockDaemonServer {
-    private let listener: NWListener
+/// Minimal raw-HTTP transport for `DaemonClient` tests. It avoids opening a real
+/// listener while still exercising request encoding and HTTP response parsing.
+final class MockDaemonTransport: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "MockDaemonTransport")
     private var responsesByRequestLine: [String: (status: Int, body: String)] = [:]
+    private var requestBodiesByRequestLine: [String: [Data]] = [:]
 
-    private init(listener: NWListener) {
-        self.listener = listener
-    }
-
-    static func start() async throws -> MockDaemonServer {
-        let listener = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: 0)!)
-        let server = MockDaemonServer(listener: listener)
-        listener.newConnectionHandler = { [weak server] connection in
-            server?.handle(connection)
-        }
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            listener.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    continuation.resume()
-                case .failed(let error):
-                    continuation.resume(throwing: error)
-                default:
-                    break
-                }
-            }
-            listener.start(queue: .global())
-        }
-        return server
-    }
-
-    var port: UInt16 {
-        listener.port!.rawValue
-    }
-
-    /// Registers a canned response for an exact `"METHOD /path"` request line.
     func respond(to requestLine: String, status: Int, body: String) {
-        responsesByRequestLine[requestLine] = (status, body)
-    }
-
-    func stop() {
-        listener.cancel()
-    }
-
-    private func handle(_ connection: NWConnection) {
-        connection.start(queue: .global())
-        receive(on: connection, accumulated: Data())
-    }
-
-    private func receive(on connection: NWConnection, accumulated: Data) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, _ in
-            guard let self else { return }
-            var buffer = accumulated
-            if let data {
-                buffer.append(data)
-            }
-            // Requests here are always header-only (GET) or small enough to arrive in
-            // one chunk; a real client always closes after receiving, so waiting for
-            // the double-CRLF is sufficient without full Content-Length tracking.
-            if let headerEnd = buffer.range(of: Data("\r\n\r\n".utf8)) {
-                let headerText = String(data: buffer[..<headerEnd.lowerBound], encoding: .utf8) ?? ""
-                let requestLine = headerText.components(separatedBy: "\r\n").first ?? ""
-                let parts = requestLine.split(separator: " ")
-                let key = parts.count >= 2 ? "\(parts[0]) \(parts[1])" : requestLine
-
-                let response = self.responsesByRequestLine[key] ?? (404, "{\"error\":\"not_found\"}")
-                let statusText = response.status == 200 ? "OK" : "Error"
-                let responseText = "HTTP/1.1 \(response.status) \(statusText)\r\n"
-                    + "Content-Type: application/json\r\n"
-                    + "Content-Length: \(response.body.utf8.count)\r\n"
-                    + "Connection: close\r\n\r\n"
-                    + response.body
-                connection.send(
-                    content: Data(responseText.utf8),
-                    completion: .contentProcessed { _ in
-                        connection.cancel()
-                    }
-                )
-                return
-            }
-            if isComplete {
-                connection.cancel()
-                return
-            }
-            self.receive(on: connection, accumulated: buffer)
+        queue.sync {
+            responsesByRequestLine[requestLine] = (status, body)
         }
+    }
+
+    func requestBodies(for requestLine: String) -> [Data] {
+        queue.sync {
+            requestBodiesByRequestLine[requestLine] ?? []
+        }
+    }
+
+    func client() -> DaemonClient {
+        DaemonClient(portProvider: { 0 }, rawTransport: { [self] method, path, body, _ in
+            let key = "\(method) \(path)"
+            let response = queue.sync {
+                requestBodiesByRequestLine[key, default: []].append(body ?? Data())
+                return responsesByRequestLine[key] ?? (404, "{\"error\":\"not_found\"}")
+            }
+            return Self.rawHTTPResponse(status: response.status, body: response.body)
+        })
+    }
+
+    private static func rawHTTPResponse(status: Int, body: String) -> Data {
+        let statusText = status == 200 ? "OK" : "Error"
+        let responseText = "HTTP/1.1 \(status) \(statusText)\r\n"
+            + "Content-Type: application/json\r\n"
+            + "Content-Length: \(body.utf8.count)\r\n"
+            + "Connection: close\r\n\r\n"
+            + body
+        return Data(responseText.utf8)
     }
 }
 
 final class DaemonClientTests: XCTestCase {
     func testStatusDecodesSuccessfully() async throws {
-        let server = try await MockDaemonServer.start()
-        defer { server.stop() }
-        server.respond(
+        let transport = MockDaemonTransport()
+        transport.respond(
             to: "GET /status",
             status: 200,
             body: """
@@ -106,8 +54,7 @@ final class DaemonClientTests: XCTestCase {
             """
         )
 
-        let client = DaemonClient(portProvider: { server.port })
-        let status = try await client.status()
+        let status = try await transport.client().status()
 
         XCTAssertFalse(status.paused)
         XCTAssertTrue(status.backendConnected)
@@ -116,9 +63,8 @@ final class DaemonClientTests: XCTestCase {
     }
 
     func testMountsDecodesArrayWithSnakeCaseFields() async throws {
-        let server = try await MockDaemonServer.start()
-        defer { server.stop() }
-        server.respond(
+        let transport = MockDaemonTransport()
+        transport.respond(
             to: "GET /mounts",
             status: 200,
             body: """
@@ -127,8 +73,7 @@ final class DaemonClientTests: XCTestCase {
             """
         )
 
-        let client = DaemonClient(portProvider: { server.port })
-        let mounts = try await client.mounts()
+        let mounts = try await transport.client().mounts()
 
         XCTAssertEqual(mounts.count, 1)
         XCTAssertEqual(mounts[0].folderId, "f1")
@@ -140,9 +85,8 @@ final class DaemonClientTests: XCTestCase {
     }
 
     func testNonSuccessStatusThrowsHttpStatusError() async throws {
-        let server = try await MockDaemonServer.start()
-        defer { server.stop() }
-        server.respond(
+        let transport = MockDaemonTransport()
+        transport.respond(
             to: "POST /fp/share",
             status: 403,
             body: """
@@ -150,10 +94,8 @@ final class DaemonClientTests: XCTestCase {
             """
         )
 
-        let client = DaemonClient(portProvider: { server.port })
-
         do {
-            _ = try await client.fpShare(nodeId: "n1", invitedEmail: "friend@example.com")
+            _ = try await transport.client().fpShare(nodeId: "n1", invitedEmail: "friend@example.com")
             XCTFail("expected fpShare to throw for a 403 response")
         } catch let DaemonClientError.httpStatus(status, body) {
             XCTAssertEqual(status, 403)
@@ -162,9 +104,8 @@ final class DaemonClientTests: XCTestCase {
     }
 
     func testFpShareEncodesRequestBodyAndDecodesResponse() async throws {
-        let server = try await MockDaemonServer.start()
-        defer { server.stop() }
-        server.respond(
+        let transport = MockDaemonTransport()
+        transport.respond(
             to: "POST /fp/share",
             status: 200,
             body: """
@@ -172,10 +113,65 @@ final class DaemonClientTests: XCTestCase {
             """
         )
 
-        let client = DaemonClient(portProvider: { server.port })
-        let response = try await client.fpShare(nodeId: "n1", invitedEmail: "friend@example.com")
+        let response = try await transport.client().fpShare(
+            nodeId: "n1",
+            invitedEmail: "friend@example.com"
+        )
 
         XCTAssertEqual(response.inviteUrl, "https://valv.example/invites/abc/accept")
+    }
+
+    func testFpMoveEncodesRequestBodyAndDecodesResponse() async throws {
+        let transport = MockDaemonTransport()
+        transport.respond(
+            to: "POST /fp/move",
+            status: 200,
+            body: """
+            {"node_id":"n1","server_seq":8}
+            """
+        )
+
+        let response = try await transport.client().fpMove(
+            nodeId: "n1",
+            basedOnSeq: 7,
+            newName: "renamed.txt",
+            newParentId: "p2"
+        )
+
+        XCTAssertEqual(response.nodeId, "n1")
+        XCTAssertEqual(response.serverSeq, 8)
+        let bodies = transport.requestBodies(for: "POST /fp/move")
+        XCTAssertEqual(bodies.count, 1)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: bodies[0]) as? [String: Any])
+        XCTAssertEqual(json["node_id"] as? String, "n1")
+        XCTAssertEqual(json["based_on_seq"] as? Int, 7)
+        XCTAssertEqual(json["new_name"] as? String, "renamed.txt")
+        XCTAssertEqual(json["new_parent_id"] as? String, "p2")
+    }
+
+    func testFpMoveConflictBodyIsPreservedForCallers() async throws {
+        let transport = MockDaemonTransport()
+        transport.respond(
+            to: "POST /fp/move",
+            status: 409,
+            body: """
+            {"error":"superseded","current_seq":10}
+            """
+        )
+
+        do {
+            _ = try await transport.client().fpMove(
+                nodeId: "n1",
+                basedOnSeq: 7,
+                newName: "renamed.txt",
+                newParentId: nil
+            )
+            XCTFail("expected fpMove to throw for a 409 response")
+        } catch let DaemonClientError.httpStatus(status, body) {
+            XCTAssertEqual(status, 409)
+            XCTAssertTrue(body.contains("\"error\":\"superseded\""))
+            XCTAssertTrue(body.contains("\"current_seq\":10"))
+        }
     }
 
     func testPortResolutionFailureSurfacesAsPortFileUnavailable() async throws {
@@ -192,20 +188,15 @@ final class DaemonClientTests: XCTestCase {
     }
 
     func testUnmountSucceedsWithNoContentResponse() async throws {
-        let server = try await MockDaemonServer.start()
-        defer { server.stop() }
-        server.respond(to: "DELETE /mount", status: 204, body: "")
+        let transport = MockDaemonTransport()
+        transport.respond(to: "DELETE /mount", status: 204, body: "")
 
-        let client = DaemonClient(portProvider: { server.port })
-
-        // Should not throw - unmount() discards the (empty) response body.
-        try await client.unmount(folderId: "folder-a")
+        try await transport.client().unmount(folderId: "folder-a")
     }
 
     func testUnmountUnknownFolderThrowsHttpStatusError() async throws {
-        let server = try await MockDaemonServer.start()
-        defer { server.stop() }
-        server.respond(
+        let transport = MockDaemonTransport()
+        transport.respond(
             to: "DELETE /mount",
             status: 404,
             body: """
@@ -213,10 +204,8 @@ final class DaemonClientTests: XCTestCase {
             """
         )
 
-        let client = DaemonClient(portProvider: { server.port })
-
         do {
-            try await client.unmount(folderId: "unknown-folder")
+            try await transport.client().unmount(folderId: "unknown-folder")
             XCTFail("expected unmount to throw for a 404 response")
         } catch let DaemonClientError.httpStatus(status, body) {
             XCTAssertEqual(status, 404)

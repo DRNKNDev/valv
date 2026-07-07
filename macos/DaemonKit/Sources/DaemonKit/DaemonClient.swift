@@ -47,6 +47,7 @@ public actor DaemonClient {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     private let portProvider: @Sendable () throws -> UInt16
+    private let rawTransport: (@Sendable (_ method: String, _ path: String, _ body: Data?, _ timeout: TimeInterval) async throws -> Data)?
 
     public init(appGroupIdentifier: String = DaemonClient.appGroupIdentifier) {
         self.init(portProvider: {
@@ -60,8 +61,12 @@ public actor DaemonClient {
     /// SecurityApplicationGroupIdentifier:)` returns `nil` without them). Internal, not
     /// public - accessed by `DaemonKitTests` via `@testable import DaemonKit`, not part
     /// of the library's real API surface.
-    init(portProvider: @escaping @Sendable () throws -> UInt16) {
+    init(
+        portProvider: @escaping @Sendable () throws -> UInt16,
+        rawTransport: (@Sendable (_ method: String, _ path: String, _ body: Data?, _ timeout: TimeInterval) async throws -> Data)? = nil
+    ) {
         self.portProvider = portProvider
+        self.rawTransport = rawTransport
         self.encoder = JSONEncoder()
         self.decoder = JSONDecoder()
     }
@@ -140,6 +145,18 @@ public actor DaemonClient {
         _ = try await requestData(method: "POST", path: "/fp/delete", body: body)
     }
 
+    public func fpMove(nodeId: String, basedOnSeq: Int, newName: String?, newParentId: String?) async throws -> FpMoveResponse {
+        try await post(
+            "/fp/move",
+            body: FpMoveRequest(
+                nodeId: nodeId,
+                basedOnSeq: basedOnSeq,
+                newName: newName,
+                newParentId: newParentId
+            )
+        )
+    }
+
     /// Long-polls until the mount's cursor advances past `sinceSeq` or the daemon's
     /// ~25s timeout elapses (see `ipc-fp-api` spec's `GET /fp/watch` requirement).
     /// Callers are expected to call this in a loop, using the returned `serverSeq`
@@ -210,7 +227,10 @@ public actor DaemonClient {
         body: Data? = nil,
         timeout: TimeInterval = 10
     ) async throws -> Data {
-        try await withTimeout(timeout) {
+        if let rawTransport {
+            return try parseHTTPResponse(try await rawTransport(method, path, body, timeout))
+        }
+        return try await withTimeout(timeout) {
             let port = try self.portProvider()
             guard let nwPort = NWEndpoint.Port(rawValue: port) else {
                 throw DaemonClientError.invalidPortFile("\(port)")

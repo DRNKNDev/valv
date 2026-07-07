@@ -323,6 +323,37 @@ public struct FpDeleteRequest: Codable, Hashable, Sendable {
     }
 }
 
+public struct FpMoveRequest: Codable, Hashable, Sendable {
+    public let nodeId: String
+    public let basedOnSeq: Int
+    public let newName: String?
+    public let newParentId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case nodeId = "node_id"
+        case basedOnSeq = "based_on_seq"
+        case newName = "new_name"
+        case newParentId = "new_parent_id"
+    }
+
+    public init(nodeId: String, basedOnSeq: Int, newName: String?, newParentId: String?) {
+        self.nodeId = nodeId
+        self.basedOnSeq = basedOnSeq
+        self.newName = newName
+        self.newParentId = newParentId
+    }
+}
+
+public struct FpMoveResponse: Codable, Hashable, Sendable {
+    public let nodeId: String
+    public let serverSeq: Int
+
+    enum CodingKeys: String, CodingKey {
+        case nodeId = "node_id"
+        case serverSeq = "server_seq"
+    }
+}
+
 public struct FpShareRequest: Codable, Hashable, Sendable {
     public let nodeId: String
     public let invitedEmail: String
