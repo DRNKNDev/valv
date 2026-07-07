@@ -198,6 +198,22 @@ pub struct FpDeleteRequest {
     pub based_on_seq: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FpMoveRequest {
+    pub node_id: String,
+    pub based_on_seq: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_parent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FpMoveResponse {
+    pub node_id: String,
+    pub server_seq: i64,
+}
+
 fn default_true() -> bool {
     true
 }

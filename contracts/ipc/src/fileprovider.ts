@@ -78,6 +78,20 @@ export interface FpDeleteRequest {
   based_on_seq: number;
 }
 
+// At least one of new_name/new_parent_id is required. When both are provided,
+// the daemon submits rename first, then move based on the rename's server_seq.
+export interface FpMoveRequest {
+  node_id: string;
+  based_on_seq: number;
+  new_name?: string;
+  new_parent_id?: string;
+}
+
+export interface FpMoveResponse {
+  node_id: string;
+  server_seq: number;
+}
+
 export interface FpShareRequest {
   node_id: string;
   invited_email: string;
