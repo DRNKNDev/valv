@@ -249,6 +249,7 @@ export function metadataAppFor(
     hub?: MetadataHub;
     sendInviteEmail?: SendInviteEmail;
     onFolderCreated?: (info: { folderId: string; ownerUserId: string; grantId: string }) => Promise<void>;
+    minProtocolVersion?: number;
   } = {},
 ): Hono {
   if (principal.type === "device" && "setDevicePrincipal" in db && typeof db.setDevicePrincipal === "function") {
@@ -266,6 +267,7 @@ export function metadataAppFor(
     hub: opts.hub ?? { notify: () => undefined },
     sendInviteEmail: opts.sendInviteEmail,
     onFolderCreated: opts.onFolderCreated,
+    minProtocolVersion: opts.minProtocolVersion,
   }) as Hono;
 }
 
