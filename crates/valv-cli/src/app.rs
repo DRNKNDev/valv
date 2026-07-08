@@ -20,6 +20,9 @@ use crate::{
 #[derive(Parser)]
 #[command(name = "valv", about = "Valv sync CLI", version)]
 struct Cli {
+    /// Print machine-readable JSON instead of a human-formatted table; supported on status, versions, and grants.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -152,7 +155,9 @@ enum DaemonCommand {
 }
 
 pub(crate) async fn run() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let json = cli.json;
+    match cli.command {
         Command::Auth { command } => match command {
             AuthCommand::Login {
                 web_base_url,
@@ -179,19 +184,19 @@ pub(crate) async fn run() -> Result<()> {
             grant,
         } => cmd_mount(path, folder, grant).await,
         Command::Unmount { folder } => cmd_unmount(folder).await,
-        Command::Status => cmd_status().await,
+        Command::Status => cmd_status(json).await,
         Command::Pause => cmd_pause_resume("pause", "Paused sync: background sync is paused").await,
         Command::Resume => {
             cmd_pause_resume("resume", "Resumed sync: background sync is running").await
         }
         Command::Sync { folder } => cmd_sync(folder).await,
-        Command::Versions { path } => cmd_versions(path).await,
+        Command::Versions { path } => cmd_versions(path, json).await,
         Command::Restore { path, version_id } => cmd_restore(path, version_id).await,
         Command::Grant { command } => match command {
             GrantCommand::Create(args) => cmd_grant_create(args).await,
             GrantCommand::Revoke { grant_id } => cmd_grant_revoke(grant_id).await,
         },
-        Command::Grants { folder_path } => cmd_grants(folder_path).await,
+        Command::Grants { folder_path } => cmd_grants(folder_path, json).await,
         Command::Daemon { command } => delegate_daemon(command),
     }
 }
@@ -256,7 +261,7 @@ async fn cmd_unmount(folder: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_versions(path: String) -> Result<()> {
+async fn cmd_versions(path: String, json: bool) -> Result<()> {
     let local_path = canonical_path(&path)?;
     let response = daemon_client()
         .context("failed to create daemon client for versions")?
@@ -266,6 +271,10 @@ async fn cmd_versions(path: String) -> Result<()> {
         .await
         .map_err(|error| daemon_request_error("versions", error))?;
     let response = parse_daemon_json::<VersionsResponse>(response).await?;
+    if json {
+        println!("{}", versions_json(&response)?);
+        return Ok(());
+    }
     let rows = response
         .versions
         .into_iter()
@@ -329,7 +338,7 @@ fn canonical_path(path: &str) -> Result<String> {
         .into_owned())
 }
 
-async fn cmd_status() -> Result<()> {
+async fn cmd_status(json: bool) -> Result<()> {
     let response = daemon_client()
         .context("failed to create daemon client for status")?
         .get("http://localhost/status")
@@ -337,6 +346,10 @@ async fn cmd_status() -> Result<()> {
         .await
         .map_err(|error| daemon_request_error("status", error))?;
     let status = parse_daemon_json::<DaemonStatus>(response).await?;
+    if json {
+        println!("{}", status_json(&status)?);
+        return Ok(());
+    }
     if status.paused {
         println!("Paused");
     } else if status.backend_connected {
@@ -362,6 +375,14 @@ async fn cmd_status() -> Result<()> {
         &rows,
     );
     Ok(())
+}
+
+fn status_json(status: &DaemonStatus) -> Result<String> {
+    serde_json::to_string(status).context("failed to serialize status as JSON")
+}
+
+fn versions_json(response: &VersionsResponse) -> Result<String> {
+    serde_json::to_string(&response.versions).context("failed to serialize versions as JSON")
 }
 
 async fn cmd_pause_resume(route: &str, message: &str) -> Result<()> {
@@ -420,4 +441,59 @@ fn delegate_daemon(command: DaemonCommand) -> Result<()> {
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use valv_sync::protocol::ipc::{MountStatus, VersionEntry};
+
+    #[test]
+    fn status_json_round_trips_without_human_table_text() {
+        let status = DaemonStatus {
+            paused: false,
+            backend_connected: true,
+            version: "0.1.0".into(),
+            mounts: vec![MountStatus {
+                path: "/tmp/valv".into(),
+                folder_id: "folder-1".into(),
+                name: "Valv".into(),
+                scope_node_id: None,
+                grant_id: None,
+                can_write: true,
+                syncing: false,
+                pending_ops: 0,
+                last_synced_at: None,
+                error: None,
+            }],
+            account: None,
+        };
+
+        let output = status_json(&status).unwrap();
+        let parsed: DaemonStatus = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(parsed, status);
+        assert!(!output.contains("path syncing"));
+        assert!(!output.contains("Connected"));
+    }
+
+    #[test]
+    fn versions_json_emits_array_without_human_table_text() {
+        let response = VersionsResponse {
+            versions: vec![VersionEntry {
+                version_id: "version-1".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                size_bytes: 42,
+                author_device_name: "Device".into(),
+                is_conflict_copy: false,
+            }],
+        };
+
+        let output = versions_json(&response).unwrap();
+        let parsed: Vec<VersionEntry> = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(parsed, response.versions);
+        assert!(output.starts_with('['));
+        assert!(!output.contains("version_id created_at"));
+    }
 }

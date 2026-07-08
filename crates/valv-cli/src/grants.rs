@@ -111,7 +111,7 @@ pub(crate) async fn cmd_grant_create(args: GrantCreateArgs) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn cmd_grants(folder_path: Option<String>) -> Result<()> {
+pub(crate) async fn cmd_grants(folder_path: Option<String>, json: bool) -> Result<()> {
     let config = load_config().context("failed to load CLI config for grant listing")?;
     let folder_id = match folder_path {
         Some(path) => {
@@ -124,9 +124,16 @@ pub(crate) async fn cmd_grants(folder_path: Option<String>) -> Result<()> {
     let grants = fetch_grants(&config)
         .await
         .context("failed to fetch grants for listing")?;
-    let rows = grants
+    let grants = grants
         .into_iter()
         .filter(|grant| grant.folder_id == folder_id)
+        .collect::<Vec<_>>();
+    if json {
+        println!("{}", grants_json(&grants)?);
+        return Ok(());
+    }
+    let rows = grants
+        .into_iter()
         .map(|grant| {
             let grantee = grant.grantee();
             vec![
@@ -151,6 +158,10 @@ pub(crate) async fn cmd_grants(folder_path: Option<String>) -> Result<()> {
         &rows,
     );
     Ok(())
+}
+
+fn grants_json(grants: &[GrantListEntry]) -> Result<String> {
+    serde_json::to_string(grants).context("failed to serialize grants as JSON")
 }
 
 pub(crate) async fn cmd_grant_revoke(grant_id: String) -> Result<()> {
@@ -220,7 +231,7 @@ struct GrantCreateResponse {
     token: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct GrantListEntry {
     grant_id: String,
     folder_id: String,
@@ -283,6 +294,27 @@ mod tests {
 
         assert_eq!(writable["can_write"], true);
         assert_eq!(read_only["can_write"], false);
+    }
+
+    #[test]
+    fn grants_json_emits_array_without_human_table_text() {
+        let grants = vec![GrantListEntry {
+            grant_id: "grant-1".into(),
+            folder_id: "folder-1".into(),
+            scope_node_id: "node-1".into(),
+            role: Some("owner".into()),
+            can_read: Some(true),
+            can_write: Some(true),
+            user_id: Some("user-1".into()),
+            device_id: None,
+        }];
+
+        let output = grants_json(&grants).unwrap();
+        let parsed: Vec<GrantListEntry> = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(parsed[0].grant_id, "grant-1");
+        assert!(output.starts_with('['));
+        assert!(!output.contains("grant_id scope grantee"));
     }
 
     #[tokio::test]
