@@ -77,6 +77,7 @@ pub struct SyncRequest {
 pub struct SyncSummary {
     pub creates_submitted: u64,
     pub versions_submitted: u64,
+    pub deletes_submitted: u64,
     pub pulled_ops: i64,
     pub errors: u64,
 }

@@ -396,8 +396,11 @@ async fn cmd_sync(folder: Option<String>) -> Result<()> {
     spinner.finish_and_clear();
     let summary = summary?;
     println!(
-        "Synced {subject}: {} created, {} updated, {} remote ops applied",
-        summary.creates_submitted, summary.versions_submitted, summary.pulled_ops
+        "Synced {subject}: {} created, {} updated, {} deleted, {} remote ops applied",
+        summary.creates_submitted,
+        summary.versions_submitted,
+        summary.deletes_submitted,
+        summary.pulled_ops
     );
     Ok(())
 }

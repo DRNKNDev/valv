@@ -1015,12 +1015,14 @@ async fn set_mount_pending_ops(state: &DaemonState, folder_id: &str, pending_ops
 fn merge_push_summary(summary: &mut SyncSummary, push_summary: &PushSummary) {
     summary.creates_submitted += push_summary.creates_submitted;
     summary.versions_submitted += push_summary.versions_submitted;
+    summary.deletes_submitted += push_summary.deletes_submitted;
     summary.errors += push_summary.errors;
 }
 
 fn merge_sync_summary(summary: &mut SyncSummary, mount_summary: SyncSummary) {
     summary.creates_submitted += mount_summary.creates_submitted;
     summary.versions_submitted += mount_summary.versions_submitted;
+    summary.deletes_submitted += mount_summary.deletes_submitted;
     summary.pulled_ops += mount_summary.pulled_ops;
     summary.errors += mount_summary.errors;
 }
