@@ -3,7 +3,7 @@ import type { Hono } from "hono";
 import type { CoreAuth, CoreDb, Principal } from "../src/auth/index.js";
 import { pgSchema } from "../src/db/schema.js";
 import type { SendInviteEmail } from "../src/email/index.js";
-import { createMetadataRouter, type MetadataHub } from "../src/metadata/index.js";
+import { createMetadataRouter, type MetadataHub, type OnGrantCreated } from "../src/metadata/index.js";
 
 export type FolderGrant = {
   grantId: string;
@@ -249,6 +249,7 @@ export function metadataAppFor(
     hub?: MetadataHub;
     sendInviteEmail?: SendInviteEmail;
     onFolderCreated?: (info: { folderId: string; ownerUserId: string; grantId: string }) => Promise<void>;
+    onGrantCreated?: OnGrantCreated;
   } = {},
 ): Hono {
   if (principal.type === "device" && "setDevicePrincipal" in db && typeof db.setDevicePrincipal === "function") {
@@ -266,6 +267,7 @@ export function metadataAppFor(
     hub: opts.hub ?? { notify: () => undefined },
     sendInviteEmail: opts.sendInviteEmail,
     onFolderCreated: opts.onFolderCreated,
+    onGrantCreated: opts.onGrantCreated,
   }) as Hono;
 }
 

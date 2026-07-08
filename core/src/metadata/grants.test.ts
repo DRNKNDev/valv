@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { sha256Hex } from "../auth/index.js";
 import { grant, LifecycleDb, metadataAppFor } from "../../tests/support.js";
@@ -118,6 +118,48 @@ describe("grant routes", () => {
     expect(db.devices[0]).toMatchObject({ userId: null, name: "Agent" });
     expect(db.devices[0]?.tokenHash).toBe(sha256Hex(body.token));
     expect(db.folderGrants[0]).toMatchObject({ deviceId: body.device_id, userId: null, canWrite: false });
+  });
+
+  it("fires onGrantCreated with the new folder, grant, and device ids", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("root");
+    const onGrantCreated = vi.fn(async () => undefined);
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" }, { onGrantCreated });
+
+    const response = await app.request("/folders/folder-1/grants", {
+      method: "POST",
+      body: JSON.stringify({ name: "Agent", can_read: true, can_write: false }),
+      headers: { "content-type": "application/json" },
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(onGrantCreated).toHaveBeenCalledWith({
+      folderId: "folder-1",
+      grantId: body.grant_id,
+      deviceId: body.device_id,
+    });
+  });
+
+  it("does not fail grant creation when onGrantCreated rejects", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("root");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" }, {
+      onGrantCreated: vi.fn(async () => {
+        throw new Error("boom");
+      }),
+    });
+
+    const response = await app.request("/folders/folder-1/grants", {
+      method: "POST",
+      body: JSON.stringify({ name: "Agent" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(consoleError).toHaveBeenCalledWith("onGrantCreated hook failed", expect.any(Error));
+    consoleError.mockRestore();
   });
 
   it("revokes device tokens when deleting through the full route-store hooks", async () => {

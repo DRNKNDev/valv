@@ -4,7 +4,7 @@ import { createAuthMiddleware, type CoreAuth } from "../auth/index.js";
 import type { SendInviteEmail } from "../email/index.js";
 import type { MetadataHub, MetadataVariables } from "./common.js";
 import { registerFolderRoutes } from "./folders.js";
-import { registerGrantRoutes } from "./grants.js";
+import { registerGrantRoutes, type OnGrantCreated } from "./grants.js";
 import { registerInviteRoutes } from "./invites.js";
 import { registerDeltaRoutes } from "./delta.js";
 import { registerOpRoutes, type CommittedOp } from "./ops.js";
@@ -16,6 +16,7 @@ export type CreateMetadataRouterOptions = {
   hub: MetadataHub;
   sendInviteEmail?: SendInviteEmail;
   onFolderCreated?: (info: { folderId: string; ownerUserId: string; grantId: string }) => Promise<void>;
+  onGrantCreated?: OnGrantCreated;
   onOpCommitted?: (op: CommittedOp) => Promise<void>;
 };
 
@@ -24,7 +25,7 @@ export function createMetadataRouter(opts: CreateMetadataRouterOptions): Hono<{ 
   router.use("*", createAuthMiddleware(opts.auth));
   registerFolderRoutes(router, opts.auth, opts.onFolderCreated);
   registerInviteRoutes(router, opts.auth, opts.sendInviteEmail);
-  registerGrantRoutes(router, opts.auth);
+  registerGrantRoutes(router, opts.auth, opts.onGrantCreated);
   registerOpRoutes(router, opts.auth, opts.hub, opts.onOpCommitted);
   registerDeltaRoutes(router, opts.auth);
   registerVersionRoutes(router, opts.auth, opts.hub, opts.onOpCommitted);
@@ -33,4 +34,5 @@ export function createMetadataRouter(opts: CreateMetadataRouterOptions): Hono<{ 
 
 export type { MetadataHub } from "./common.js";
 export type { CommittedOp } from "./ops.js";
+export type { OnGrantCreated } from "./grants.js";
 export { checkGrant } from "./authz.js";
