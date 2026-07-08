@@ -7,15 +7,14 @@ use anyhow::{anyhow, Result};
 use reqwest::StatusCode;
 use rusqlite::{params, Connection};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
     chunking::chunk_file,
     persistence::versions::{self, LocalVersion},
     protocol::sync::{
-        ChunkRef, NewVersionPayload, SubmitOpRequest, SubmitOpResponse, PROTOCOL_HEADER,
-        PROTOCOL_VERSION,
+        manifest_content_hash, ChunkRef, NewVersionPayload, SubmitOpRequest, SubmitOpResponse,
+        PROTOCOL_HEADER, PROTOCOL_VERSION,
     },
     storage::upload_chunks,
     sync_engine::update_required::{update_required_from_response, UpdateRequired},
@@ -78,9 +77,38 @@ pub fn materialize_conflict_copy(
         }
         None => format!("{file_name} (conflicted copy, {device_name}, {date})"),
     };
-    let conflict_path = original_path.with_file_name(conflict_name);
+    let conflict_path = disambiguate_conflict_path(original_path.with_file_name(conflict_name))?;
     fs::copy(original_path, &conflict_path)?;
     Ok(conflict_path)
+}
+
+fn disambiguate_conflict_path(desired: PathBuf) -> Result<PathBuf> {
+    if !desired.exists() {
+        return Ok(desired);
+    }
+    let parent = desired.parent().map(Path::to_path_buf);
+    let stem = desired
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow!("path has no valid file stem: {}", desired.display()))?;
+    let extension = desired.extension().and_then(|ext| ext.to_str());
+    for counter in 2..=20 {
+        let file_name = match extension {
+            Some(ext) => format!("{stem} ({counter}).{ext}"),
+            None => format!("{stem} ({counter})"),
+        };
+        let candidate = parent.as_ref().map_or_else(
+            || PathBuf::from(&file_name),
+            |parent| parent.join(&file_name),
+        );
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow!(
+        "conflict copy path exhausted disambiguation attempts for {}",
+        desired.display()
+    ))
 }
 
 pub async fn upload_then_submit_new_version(
@@ -118,6 +146,8 @@ pub async fn upload_then_submit_new_version(
     let response = submit_op(client, backend_url, token, folder_id, &req).await?;
     apply_submitted_new_version(conn, folder_id, node_id, &req, &response)?;
     if matches!(response, SubmitOpResponse::ConflictCopy { .. }) {
+        // dmp-text-merge's give-up path reaches this same helper once; the
+        // suffix disambiguation changes only the returned path, not call flow.
         materialize_conflict_copy(path, device_name, date)?;
     }
     Ok(response)
@@ -166,14 +196,6 @@ pub fn apply_submitted_new_version(
         )?;
     }
     Ok(())
-}
-
-fn manifest_content_hash(manifest: &[ChunkRef]) -> String {
-    let mut hasher = Sha256::new();
-    for chunk in manifest {
-        hasher.update(chunk.chunk_hash.as_bytes());
-    }
-    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
@@ -230,6 +252,76 @@ mod tests {
             conflict.file_name().and_then(|name| name.to_str()),
             Some("archive.tar (conflicted copy, CI Agent, 2026-06-27).gz")
         );
+    }
+
+    #[test]
+    fn second_conflict_copy_gets_counter_suffix_without_overwriting_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        fs::write(&path, b"new").unwrap();
+        let first = path.with_file_name("report (conflicted copy, Alice MacBook, 2026-06-27).md");
+        fs::write(&first, b"first").unwrap();
+
+        let second = materialize_conflict_copy(&path, "Alice MacBook", "2026-06-27").unwrap();
+
+        assert_eq!(
+            second.file_name().and_then(|name| name.to_str()),
+            Some("report (conflicted copy, Alice MacBook, 2026-06-27) (2).md")
+        );
+        assert_eq!(fs::read(first).unwrap(), b"first");
+        assert_eq!(fs::read(second).unwrap(), b"new");
+    }
+
+    #[test]
+    fn third_conflict_copy_gets_next_counter_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        fs::write(&path, b"new").unwrap();
+        let first = path.with_file_name("report (conflicted copy, Alice MacBook, 2026-06-27).md");
+        let second =
+            path.with_file_name("report (conflicted copy, Alice MacBook, 2026-06-27) (2).md");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+
+        let third = materialize_conflict_copy(&path, "Alice MacBook", "2026-06-27").unwrap();
+
+        assert_eq!(
+            third.file_name().and_then(|name| name.to_str()),
+            Some("report (conflicted copy, Alice MacBook, 2026-06-27) (3).md")
+        );
+        assert_eq!(fs::read(first).unwrap(), b"first");
+        assert_eq!(fs::read(second).unwrap(), b"second");
+        assert_eq!(fs::read(third).unwrap(), b"new");
+    }
+
+    #[test]
+    fn exhausted_conflict_copy_counter_returns_err_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        fs::write(&path, b"new").unwrap();
+        let base = "report (conflicted copy, Alice MacBook, 2026-06-27)";
+        fs::write(dir.path().join(format!("{base}.md")), b"base").unwrap();
+        for counter in 2..=20 {
+            fs::write(
+                dir.path().join(format!("{base} ({counter}).md")),
+                b"existing",
+            )
+            .unwrap();
+        }
+
+        let error = materialize_conflict_copy(&path, "Alice MacBook", "2026-06-27").unwrap_err();
+
+        assert!(error.to_string().contains("exhausted"));
+        assert_eq!(
+            fs::read(dir.path().join(format!("{base}.md"))).unwrap(),
+            b"base"
+        );
+        for counter in 2..=20 {
+            assert_eq!(
+                fs::read(dir.path().join(format!("{base} ({counter}).md"))).unwrap(),
+                b"existing"
+            );
+        }
     }
 
     #[tokio::test]
