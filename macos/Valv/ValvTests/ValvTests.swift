@@ -7,6 +7,7 @@
 
 import Foundation
 import Testing
+import DaemonKit
 @testable import Valv
 
 struct ValvTests {
@@ -99,6 +100,34 @@ struct ValvTests {
         #expect(DaemonManager.isVersion("0.10.0", atLeast: "0.9.0"))
         #expect(!DaemonManager.isVersion("0.8.9", atLeast: "0.9.0"))
         #expect(!DaemonManager.isVersion("not-a-version", atLeast: "0.9.0"))
+    }
+
+    @Test func updateRequiredSummaryOverridesTextWithoutChangingIconState() throws {
+        let decoder = JSONDecoder()
+        let status = try decoder.decode(DaemonStatus.self, from: Data("""
+        {
+          "paused": false,
+          "backend_connected": true,
+          "version": "0.1.0",
+          "update_required": true,
+          "mounts": [
+            {
+              "path": "/tmp/valv",
+              "folder_id": "folder-1",
+              "name": "Valv",
+              "can_write": true,
+              "syncing": true,
+              "pending_ops": 0,
+              "last_synced_at": null,
+              "update_required": true
+            }
+          ]
+        }
+        """.utf8))
+
+        #expect(MenuBarContentView.summaryText(status: status, iconState: .syncing, isDisconnected: false) == "Update Valv to keep syncing")
+        #expect(MenuBarContentView.summaryText(status: withoutUpdateRequired(status), iconState: .syncing, isDisconnected: false) == "Syncing...")
+        #expect(Set([IconState.notSetUp, .error, .paused, .syncing, .synced]).count == 5)
     }
 
     @Test func cleanInstallFailureSetsInstallErrorAndReconcileStillSettles() async {
@@ -269,6 +298,18 @@ struct ValvTests {
         }
 
         try body(directory)
+    }
+
+    private func withoutUpdateRequired(_ status: DaemonStatus) throws -> DaemonStatus {
+        let data = try JSONEncoder().encode(status)
+        var object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        object["update_required"] = false
+        var mounts = try #require(object["mounts"] as? [[String: Any]])
+        for index in mounts.indices {
+            mounts[index]["update_required"] = false
+        }
+        object["mounts"] = mounts
+        return try JSONDecoder().decode(DaemonStatus.self, from: JSONSerialization.data(withJSONObject: object))
     }
 
 }
