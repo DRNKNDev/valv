@@ -1567,6 +1567,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialize_version_inserts_versions_row_only_after_rename_succeeds() {
+        let content = b"hello ordering".to_vec();
+        let chunk_hash = test_chunk_hash(&content);
+        let manifest = vec![ChunkRef {
+            chunk_hash: chunk_hash.clone(),
+            offset: 0,
+            length: content.len() as u64,
+        }];
+        let state = test_state_with_backend(
+            "v1",
+            manifest_content_hash(&manifest),
+            content.len() as u64,
+            manifest,
+            HashMap::from([(chunk_hash, content)]),
+        )
+        .await;
+        let mount = test_mount("/tmp/unused");
+        let dir = tempfile::tempdir().unwrap();
+        // The target path is an existing directory, so verification (hash/size)
+        // succeeds and the temp file is written, but the final `fs::rename` onto
+        // `path` fails (can't rename a file over a directory). This proves the
+        // `versions` row is only inserted after the rename step actually
+        // succeeds - a failure at (or before) rename must leave no row behind.
+        let path = dir.path().join("file.txt");
+        fs::create_dir_all(&path).unwrap();
+
+        let error = materialize_version(&state, &mount, "n1", "v1", &path)
+            .await
+            .unwrap_err();
+
+        assert!(path.is_dir(), "rename must not have replaced the directory");
+        let conn = state.db.lock().await;
+        assert!(
+            versions::get_version(&conn, "v1").unwrap().is_none(),
+            "no versions row should exist when rename failed: {error}"
+        );
+        let temp_leftovers = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(".valv-tmp-"))
+            })
+            .count();
+        assert_eq!(temp_leftovers, 0, "failed rename must clean up its temp file");
+    }
+
+    #[tokio::test]
+    async fn materialize_mount_files_reattempts_download_for_metadata_only_version_row() {
+        let content = b"real materialized content".to_vec();
+        let chunk_hash = test_chunk_hash(&content);
+        let manifest = vec![ChunkRef {
+            chunk_hash: chunk_hash.clone(),
+            offset: 0,
+            length: content.len() as u64,
+        }];
+        let state = test_state_with_backend(
+            "v1",
+            manifest_content_hash(&manifest),
+            content.len() as u64,
+            manifest.clone(),
+            HashMap::from([(chunk_hash, content.clone())]),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        // A stale/partial leftover file already sits at the target path, and a
+        // metadata-only `versions` row (content_materialized_at still NULL,
+        // e.g. mirrored in from an op-log entry) already exists for `v1`. Bare
+        // row + path existence must NOT be treated as "already materialized".
+        let stale_path = dir.path().join("file.txt");
+        fs::write(&stale_path, b"stale leftover, not the real content").unwrap();
+        {
+            let conn = state.db.lock().await;
+            mounts::upsert_mount(&conn, &mount.path, &mount.folder_id, None, None, None, true)
+                .unwrap();
+            nodes::upsert_node(&conn, &root_node()).unwrap();
+            nodes::upsert_node(
+                &conn,
+                &LocalNode {
+                    node_id: "n1".into(),
+                    folder_id: mount.folder_id.clone(),
+                    parent_id: Some("root".into()),
+                    name: "file.txt".into(),
+                    node_type: "file".into(),
+                    current_version_id: Some("v1".into()),
+                    server_seq: 1,
+                    deleted_at: None,
+                },
+            )
+            .unwrap();
+            upsert_version(
+                &conn,
+                &LocalVersion {
+                    version_id: "v1".into(),
+                    node_id: "n1".into(),
+                    folder_id: mount.folder_id.clone(),
+                    content_hash: "metadata-only-placeholder-hash".into(),
+                    size_bytes: 999,
+                    manifest_json: "[]".into(),
+                },
+            )
+            .unwrap();
+            assert!(versions::has_any_version_for_node(&conn, "n1").unwrap());
+            assert!(!versions::has_materialized_content_for_version(&conn, "v1").unwrap());
+        }
+
+        materialize_mount_files(&state, &mount).await.unwrap();
+
+        assert_eq!(fs::read(&stale_path).unwrap(), content);
+        let conn = state.db.lock().await;
+        assert!(versions::has_materialized_content_for_version(&conn, "v1").unwrap());
+        let stored = versions::get_version(&conn, "v1").unwrap().unwrap();
+        assert_eq!(stored.content_hash, manifest_content_hash(&manifest));
+    }
+
+    #[tokio::test]
     async fn background_scope_materializes_without_prior_version() {
         let state = test_state();
         let dir = tempfile::tempdir().unwrap();
