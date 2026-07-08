@@ -2,13 +2,13 @@ import { Hono } from "hono";
 import { eq, inArray, sql } from "drizzle-orm";
 
 import type { CoreAuth, Principal } from "../auth/index.js";
-import { pgSchema } from "../db/schema.js";
 import { checkGrant } from "./authz.js";
 import type { ChunkRef, SubmitOpRequest, SubmitOpResponse } from "@valv/contracts-sync";
 import {
   inTransaction,
   newId,
   requirePrincipal,
+  supportsForUpdate,
   type MetadataHub,
   type MetadataVariables,
 } from "./common.js";
@@ -79,7 +79,7 @@ export async function submitOp(
   }
 
   const { response, committedOp } = await inTransaction(auth, async (tx) => {
-    if (auth.schema === pgSchema && typeof tx.execute === "function") {
+    if (supportsForUpdate(auth.schema) && typeof tx.execute === "function") {
       await tx.execute(sql`SELECT node_id FROM nodes WHERE node_id = ${op.node_id} FOR UPDATE`);
     }
     const nodes = await tx

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { and, desc, eq, isNull } from "drizzle-orm";
 import type { Context } from "hono";
 
-import type { AuthVariables, CoreAuth, Principal } from "../auth/index.js";
+import type { AuthVariables, CoreAuth, CoreSchema, Principal } from "../auth/index.js";
 import { sqliteSchema } from "../db/schema.js";
 import { checkGrant } from "./authz.js";
 
@@ -23,10 +23,14 @@ export function newId(): string {
 }
 
 export async function inTransaction<T>(auth: CoreAuth, fn: (tx: CoreAuth["db"]) => Promise<T>): Promise<T> {
-  if (typeof auth.db.transaction === "function" && auth.schema !== sqliteSchema) {
+  if (typeof auth.db.transaction === "function" && supportsForUpdate(auth.schema)) {
     return auth.db.transaction(fn);
   }
   return fn(auth.db);
+}
+
+export function supportsForUpdate(schema: CoreSchema): boolean {
+  return schema !== sqliteSchema;
 }
 
 export function requirePrincipal(ctx: Context<{ Variables: MetadataVariables }>): Principal {

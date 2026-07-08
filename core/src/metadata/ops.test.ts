@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { CoreAuth, CoreDb, Principal } from "../auth/index.js";
-import { pgSchema } from "../db/schema.js";
+import { pgSchema, sqliteSchema } from "../db/schema.js";
 import type { MetadataHub } from "./common.js";
 import { submitOp } from "./ops.js";
 
@@ -179,6 +179,34 @@ describe("submitOp", () => {
     expect(db.ops).toHaveLength(0);
     expect(hub.notifications).toEqual([]);
   });
+
+  it("issues FOR UPDATE for a Postgres schema superset", async () => {
+    const db = new OpTestDb();
+    const hub = new TestHub();
+
+    await submitOp(authFor(db, { ...pgSchema, extraTable: pgSchema.nodes }), hub, "folder-1", devicePrincipal, {
+      op_type: "rename",
+      node_id: "doc",
+      based_on_seq: 1,
+      payload: { new_name: "locked.md" },
+    });
+
+    expect(db.executeSql).toEqual([expect.stringContaining("FOR UPDATE")]);
+  });
+
+  it("does not issue FOR UPDATE for SQLite schema", async () => {
+    const db = new OpTestDb();
+    const hub = new TestHub();
+
+    await expect(submitOp(authFor(db, sqliteSchema), hub, "folder-1", devicePrincipal, {
+      op_type: "rename",
+      node_id: "doc",
+      based_on_seq: 1,
+      payload: { new_name: "unlocked.md" },
+    })).rejects.toBeInstanceOf(Response);
+
+    expect(db.executeSql).toEqual([]);
+  });
 });
 
 const devicePrincipal: Principal = { type: "device", deviceId: "device-1" };
@@ -256,6 +284,7 @@ class OpTestDb implements CoreDb {
   versions: TestVersion[] = [];
   versionChunks: TestVersionChunk[] = [];
   ops: Array<{ serverSeq: number; folderId: string; nodeId: string; opType: string; opPayload: unknown }> = [];
+  executeSql: string[] = [];
   chunkRefcounts = new Map<string, number>();
   private lastInsertedVersionManifest: TestVersion["manifest"] = [];
   private previousVersionManifest: TestVersion["manifest"] = [];
@@ -323,6 +352,10 @@ class OpTestDb implements CoreDb {
         },
       }),
     };
+  }
+
+  async execute(query: unknown): Promise<void> {
+    this.executeSql.push(sqlText(query));
   }
 
   async getNodeForAuthz(nodeId: string): Promise<{ nodeId: string; folderId: string; parentId: string | null } | undefined> {
@@ -433,6 +466,22 @@ class TestHub implements MetadataHub {
   }
 }
 
-function authFor(db: OpTestDb): CoreAuth {
-  return { db, schema: pgSchema } as unknown as CoreAuth;
+function authFor(db: OpTestDb, schema: CoreAuth["schema"] = pgSchema): CoreAuth {
+  return { db, schema } as unknown as CoreAuth;
+}
+
+function sqlText(query: unknown): string {
+  if (typeof query === "string") {
+    return query;
+  }
+  if (query && typeof query === "object" && "queryChunks" in query) {
+    return ((query as { queryChunks: unknown[] }).queryChunks).map((chunk) => {
+      if (chunk && typeof chunk === "object" && "value" in chunk) {
+        const value = (chunk as { value: unknown }).value;
+        return Array.isArray(value) ? value.join("") : "";
+      }
+      return "";
+    }).join("");
+  }
+  return String(query);
 }
