@@ -1,4 +1,8 @@
-use std::{fs, path::Path, sync::atomic::Ordering};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::atomic::Ordering,
+};
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -11,7 +15,6 @@ use reqwest::header::{HeaderName, HeaderValue};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use valv_sync::{
     api_base,
@@ -25,8 +28,9 @@ use valv_sync::{
             FpShareRequest, FpShareResponse, FpUploadQueued, FpUploadRequest,
         },
         sync::{
-            ChunkRef, CreatePayload, DeletePayload, MovePayload, NewVersionPayload, NodeType,
-            RenamePayload, SubmitOpRequest, SubmitOpResponse, PROTOCOL_HEADER, PROTOCOL_VERSION,
+            manifest_content_hash, ChunkRef, CreatePayload, DeletePayload, MovePayload,
+            NewVersionPayload, NodeType, RenamePayload, SubmitOpRequest, SubmitOpResponse,
+            PROTOCOL_HEADER, PROTOCOL_VERSION,
         },
     },
     sync_engine::{
@@ -139,10 +143,47 @@ pub(crate) async fn fp_changes(
     let mount = resolve_mount_for_query(&state, query.folder_id.as_deref()).await?;
     let conn = state.db.lock().await;
     let nodes = nodes::list_changed_since(&conn, &mount.folder_id, query.since_seq.unwrap_or(0))?;
-    let items = nodes
-        .iter()
-        .map(|node| fp_item_from_node(&conn, node))
-        .collect::<Result<Vec<_>>>()?;
+    let pending_uploads = state.pending_uploads.lock().await.clone();
+    let mut items = Vec::new();
+    let mut newly_deferred = Vec::new();
+    for node in &nodes {
+        let item = fp_item_from_node(&conn, node)?;
+        if item.deleted && pending_uploads.contains(&item.node_id) {
+            newly_deferred.push(item.node_id);
+        } else {
+            items.push(item);
+        }
+    }
+    let mut deferred_deletes = state.deferred_deletes.lock().await;
+    if !newly_deferred.is_empty() {
+        deferred_deletes
+            .entry(mount.folder_id.clone())
+            .or_default()
+            .extend(newly_deferred);
+    }
+    let ready_deferred = deferred_deletes
+        .get(&mount.folder_id)
+        .map(|node_ids| {
+            node_ids
+                .iter()
+                .filter(|node_id| !pending_uploads.contains(*node_id))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for node_id in &ready_deferred {
+        if let Some(node) = nodes::get_node(&conn, node_id)? {
+            items.push(fp_item_from_node(&conn, &node)?);
+        }
+    }
+    if let Some(node_ids) = deferred_deletes.get_mut(&mount.folder_id) {
+        for node_id in ready_deferred {
+            node_ids.remove(&node_id);
+        }
+        if node_ids.is_empty() {
+            deferred_deletes.remove(&mount.folder_id);
+        }
+    }
     let current_seq = mounts::get_cursor(&conn, &mount.folder_id)?;
     Ok(Json(FpChangesResponse {
         items,
@@ -232,6 +273,7 @@ pub(crate) async fn fp_upload(
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let context = resolve_upload_context(&state, &req, &node_id).await?;
+    state.pending_uploads.lock().await.insert(node_id.clone());
     tokio::spawn(upload_job_with_context(
         state,
         req,
@@ -608,7 +650,9 @@ async fn upload_job_with_context(
     context: UploadContext,
 ) {
     let folder_id = context.folder_id.clone();
-    if let Err(error) = upload_job_inner(&state, req, node_id.clone(), &context).await {
+    let result = upload_job_inner(&state, req, node_id.clone(), &context).await;
+    state.pending_uploads.lock().await.remove(&node_id);
+    if let Err(error) = result {
         let message = upload_failure_message(&error);
         set_upload_mount_error(&state, &context, Some(message.clone())).await;
         tracing::error!(
@@ -946,14 +990,6 @@ fn upload_failure_message(error: &DaemonError) -> String {
     error.to_string()
 }
 
-fn manifest_content_hash(manifest: &[ChunkRef]) -> String {
-    let mut hasher = Sha256::new();
-    for chunk in manifest {
-        hasher.update(chunk.chunk_hash.as_bytes());
-    }
-    hex::encode(hasher.finalize())
-}
-
 fn materialize_conflict_copy_name(path: &Path, device_name: &str) -> Result<()> {
     let date = Utc::now().format("%Y-%m-%d").to_string();
     let file_name = path
@@ -970,8 +1006,40 @@ fn materialize_conflict_copy_name(path: &Path, device_name: &str) -> Result<()> 
         }
         None => format!("{file_name} (conflicted copy, {device_name}, {date})"),
     };
-    fs::copy(path, path.with_file_name(conflict_name))?;
+    fs::copy(
+        path,
+        disambiguate_conflict_path(path.with_file_name(conflict_name))?,
+    )?;
     Ok(())
+}
+
+fn disambiguate_conflict_path(desired: PathBuf) -> Result<PathBuf> {
+    if !desired.exists() {
+        return Ok(desired);
+    }
+    let parent = desired.parent().map(Path::to_path_buf);
+    let stem = desired
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow!("path has no valid file stem: {}", desired.display()))?;
+    let extension = desired.extension().and_then(|ext| ext.to_str());
+    for counter in 2..=20 {
+        let file_name = match extension {
+            Some(ext) => format!("{stem} ({counter}).{ext}"),
+            None => format!("{stem} ({counter})"),
+        };
+        let candidate = parent.as_ref().map_or_else(
+            || PathBuf::from(&file_name),
+            |parent| parent.join(&file_name),
+        );
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow!(
+        "conflict copy path exhausted disambiguation attempts for {}",
+        desired.display()
+    ))
 }
 
 #[cfg(test)]
@@ -1029,6 +1097,8 @@ mod fp_watch_tests {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
             backend_health: Arc::new(crate::BackendHealth::default()),
+            pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_deletes: Arc::new(Mutex::new(HashMap::new())),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: DaemonConfig {
@@ -1062,6 +1132,105 @@ mod fp_watch_tests {
 
         assert_eq!(response.0.server_seq, 15);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn fp_conflict_copy_name_gets_counter_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        fs::write(&path, b"new").unwrap();
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let base = path.with_file_name(format!("report (conflicted copy, Test Device, {date}).md"));
+        fs::write(&base, b"first").unwrap();
+
+        materialize_conflict_copy_name(&path, "Test Device").unwrap();
+        let second = path.with_file_name(format!(
+            "report (conflicted copy, Test Device, {date}) (2).md"
+        ));
+
+        assert_eq!(fs::read(base).unwrap(), b"first");
+        assert_eq!(fs::read(second).unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn fp_changes_withholds_delete_for_pending_upload_and_keeps_current_seq() {
+        let state = state_with_deleted_node().await;
+        state.pending_uploads.lock().await.insert("n1".to_owned());
+
+        let response = fp_changes(
+            State(state.clone()),
+            Query(FpChangesQuery {
+                folder_id: Some("folder-1".into()),
+                since_seq: Some(0),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(response.items.is_empty());
+        assert_eq!(response.current_seq, 7);
+        assert!(state
+            .deferred_deletes
+            .lock()
+            .await
+            .get("folder-1")
+            .is_some_and(|node_ids| node_ids.contains("n1")));
+    }
+
+    #[tokio::test]
+    async fn fp_changes_redelivers_deferred_delete_after_upload_clears() {
+        let state = state_with_deleted_node().await;
+        state.pending_uploads.lock().await.insert("n1".to_owned());
+        let _ = fp_changes(
+            State(state.clone()),
+            Query(FpChangesQuery {
+                folder_id: Some("folder-1".into()),
+                since_seq: Some(0),
+            }),
+        )
+        .await
+        .unwrap();
+        state.pending_uploads.lock().await.remove("n1");
+
+        let response = fp_changes(
+            State(state.clone()),
+            Query(FpChangesQuery {
+                folder_id: Some("folder-1".into()),
+                since_seq: Some(100),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.items[0].node_id, "n1");
+        assert!(response.items[0].deleted);
+        assert!(!state.deferred_deletes.lock().await.contains_key("folder-1"));
+    }
+
+    async fn state_with_deleted_node() -> DaemonState {
+        let state = test_state(test_mount("/sync", "folder-1"));
+        {
+            let conn = state.db.lock().await;
+            mounts::set_cursor(&conn, "folder-1", 7).unwrap();
+            nodes::upsert_node(
+                &conn,
+                &LocalNode {
+                    node_id: "n1".into(),
+                    folder_id: "folder-1".into(),
+                    parent_id: None,
+                    name: "deleted.txt".into(),
+                    node_type: "file".into(),
+                    current_version_id: None,
+                    server_seq: 7,
+                    deleted_at: Some("2026-07-08T00:00:00Z".into()),
+                },
+            )
+            .unwrap();
+        }
+        state
     }
 
     #[tokio::test]
@@ -1341,6 +1510,8 @@ mod fp_error_tests {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
             backend_health: Arc::new(crate::BackendHealth::default()),
+            pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_deletes: Arc::new(Mutex::new(HashMap::new())),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: DaemonConfig {

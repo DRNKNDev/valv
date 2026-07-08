@@ -429,6 +429,8 @@ mod tests {
             tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             account: Arc::new(Mutex::new(None)),
             backend_health: Arc::new(crate::BackendHealth::default()),
+            pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_deletes: Arc::new(Mutex::new(std::collections::HashMap::new())),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: crate::DaemonConfig {

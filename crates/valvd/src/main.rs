@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::Path,
     sync::{
@@ -88,6 +88,8 @@ struct DaemonState {
     tasks: Arc<Mutex<HashMap<String, Vec<JoinHandle<()>>>>>,
     account: Arc<Mutex<Option<AccountStatus>>>,
     backend_health: Arc<BackendHealth>,
+    pending_uploads: Arc<Mutex<HashSet<String>>>,
+    deferred_deletes: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     db: Arc<Mutex<Connection>>,
     client: reqwest::Client,
     config: DaemonConfig,
@@ -252,6 +254,8 @@ async fn run() -> Result<()> {
         tasks: Arc::new(Mutex::new(HashMap::new())),
         account: Arc::new(Mutex::new(None)),
         backend_health: Arc::new(BackendHealth::default()),
+        pending_uploads: Arc::new(Mutex::new(HashSet::new())),
+        deferred_deletes: Arc::new(Mutex::new(HashMap::new())),
         db: Arc::new(Mutex::new(conn)),
         client: reqwest::Client::new(),
         config,
@@ -472,6 +476,8 @@ mod tests {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
             backend_health: Arc::new(BackendHealth::default()),
+            pending_uploads: Arc::new(Mutex::new(HashSet::new())),
+            deferred_deletes: Arc::new(Mutex::new(HashMap::new())),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: DaemonConfig {
