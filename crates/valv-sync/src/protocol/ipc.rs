@@ -16,6 +16,7 @@ pub struct MountStatus {
     pub syncing: bool,
     pub pending_ops: u64,
     pub last_synced_at: Option<String>,
+    pub update_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -34,6 +35,7 @@ pub struct DaemonStatus {
     pub paused: bool,
     pub backend_connected: bool,
     pub version: String,
+    pub update_required: bool,
     pub mounts: Vec<MountStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<AccountStatus>,

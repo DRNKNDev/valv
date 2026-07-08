@@ -6,8 +6,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 
 use crate::protocol::sync::{FolderTreeResponse, NodeSnapshot, NodeType, OpLogEntry};
+use crate::sync_engine::update_required::UpdateRequired;
 
 pub mod chunks;
+pub mod migrations;
 pub mod mounts;
 pub mod nodes;
 pub mod versions;
@@ -29,15 +31,16 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     let conn =
         Connection::open(path).with_context(|| format!("open sqlite db {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.execute_batch(schema_sql())?;
-    add_column_if_missing(&conn, "mounts", "scope_node_id", "TEXT")?;
-    add_column_if_missing(&conn, "mounts", "mount_token", "TEXT")?;
-    add_column_if_missing(&conn, "mounts", "can_write", "INTEGER NOT NULL DEFAULT 1")?;
-    add_column_if_missing(&conn, "mounts", "name", "TEXT")?;
+    migrations::run_migrations(&conn)?;
     Ok(conn)
 }
 
-fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ty: &str) -> Result<()> {
+pub(crate) fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    ty: &str,
+) -> Result<()> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = stmt
         .query_map([], |row| row.get::<_, String>(1))?
@@ -50,6 +53,13 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ty: &str)
 
 pub fn apply_op_log_entry(conn: &Connection, entry: &OpLogEntry) -> Result<Option<LocalNode>> {
     let pre_op = nodes::get_node(conn, &entry.node_id)?;
+    if entry.op_type != "create"
+        && pre_op
+            .as_ref()
+            .is_some_and(|node| node.server_seq >= entry.server_seq)
+    {
+        return Ok(pre_op);
+    }
     match entry.op_type.as_str() {
         "create" => apply_create(conn, entry)?,
         "rename" => {
@@ -74,7 +84,7 @@ pub fn apply_op_log_entry(conn: &Connection, entry: &OpLogEntry) -> Result<Optio
             )?;
         }
         "new_version" => apply_new_version(conn, entry)?,
-        other => return Err(anyhow!("unsupported op_type `{other}`")),
+        other => return Err(anyhow!(UpdateRequired::unrecognized_op_type(other))),
     };
     Ok(pre_op)
 }
@@ -231,6 +241,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::sync::{FolderTreeResponse, NodeSnapshot};
+    use crate::sync_engine::update_required::is_update_required;
 
     fn memory_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -334,6 +345,63 @@ mod tests {
         assert_eq!(node.current_version_id.as_deref(), Some("winner"));
         assert_eq!(node.server_seq, 11);
         assert!(versions::get_version(&conn, "loser").unwrap().is_some());
+    }
+
+    #[test]
+    fn unrecognized_op_type_returns_update_required() {
+        let conn = memory_db();
+        let error = apply_op_log_entry(
+            &conn,
+            &OpLogEntry {
+                server_seq: 1,
+                node_id: "n1".into(),
+                op_type: "future_op".into(),
+                op_payload: json!({}),
+                actor_device_id: "d1".into(),
+                applied_at: "2026-07-08T00:00:00Z".into(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(is_update_required(&error).is_some());
+    }
+
+    #[test]
+    fn stale_unrecognized_op_type_is_noop_not_update_required() {
+        let conn = memory_db();
+        nodes::upsert_node(
+            &conn,
+            &nodes::LocalNode {
+                node_id: "n1".into(),
+                folder_id: "folder-1".into(),
+                parent_id: None,
+                name: "current.txt".into(),
+                node_type: "file".into(),
+                current_version_id: None,
+                server_seq: 10,
+                deleted_at: None,
+            },
+        )
+        .unwrap();
+
+        let pre_op = apply_op_log_entry(
+            &conn,
+            &OpLogEntry {
+                server_seq: 8,
+                node_id: "n1".into(),
+                op_type: "future_op".into(),
+                op_payload: json!({}),
+                actor_device_id: "d1".into(),
+                applied_at: "2026-07-08T00:00:00Z".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let node = nodes::get_node(&conn, "n1").unwrap().unwrap();
+
+        assert_eq!(pre_op.server_seq, 10);
+        assert_eq!(node.server_seq, 10);
+        assert_eq!(node.name, "current.txt");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::atomic::Ordering};
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -10,7 +10,7 @@ use chrono::Utc;
 use reqwest::header::{HeaderName, HeaderValue};
 use rusqlite::Connection;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use valv_sync::{
@@ -26,13 +26,18 @@ use valv_sync::{
         },
         sync::{
             ChunkRef, CreatePayload, DeletePayload, MovePayload, NewVersionPayload, NodeType,
-            RenamePayload, SubmitOpRequest, SubmitOpResponse,
+            RenamePayload, SubmitOpRequest, SubmitOpResponse, PROTOCOL_HEADER, PROTOCOL_VERSION,
         },
+    },
+    sync_engine::{
+        op_submit::parse_submit_op_response_body,
+        update_required::{update_required_from_response, UpdateRequired},
     },
 };
 
 use crate::{
     error::{backend_response_or_error, DaemonError},
+    tasks::mark_mount_update_required,
     DaemonState, MountState,
 };
 
@@ -226,7 +231,13 @@ pub(crate) async fn fp_upload(
         .node_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    tokio::spawn(upload_job(state, req, node_id.clone()));
+    let context = resolve_upload_context(&state, &req, &node_id).await?;
+    tokio::spawn(upload_job_with_context(
+        state,
+        req,
+        node_id.clone(),
+        context,
+    ));
     Ok((
         StatusCode::ACCEPTED,
         Json(FpUploadQueued {
@@ -243,22 +254,21 @@ pub(crate) async fn fp_delete(
     if req.node_id.trim().is_empty() {
         return Err(DaemonError::BadRequest("node_id is required".to_owned()));
     }
-    let (folder_id, token) = {
+    let (mount, token) = {
         let conn = state.db.lock().await;
         let Some(node) = nodes::get_node(&conn, &req.node_id)? else {
             return Err(DaemonError::NotFound("node_not_found".to_owned()));
         };
         let mount = resolve_mount_for_folder_id(&state, &node.folder_id).await?;
         (
-            node.folder_id,
+            mount.clone(),
             mount.effective_token(&state.config).to_owned(),
         )
     };
-    let response = submit_op_daemon(
-        &state.client,
-        &state.config.backend_url,
+    let response = submit_op_daemon_for_mount(
+        &state,
+        &mount,
         &token,
-        &folder_id,
         &SubmitOpRequest::Delete {
             node_id: req.node_id,
             based_on_seq: req.based_on_seq,
@@ -284,14 +294,14 @@ pub(crate) async fn fp_move(
     Json(req): Json<FpMoveRequest>,
 ) -> Result<Json<FpMoveResponse>, DaemonError> {
     validate_move_request(&req)?;
-    let (folder_id, token, mut updated_node) = {
+    let (mount, token, mut updated_node) = {
         let conn = state.db.lock().await;
         let Some(node) = nodes::get_node(&conn, &req.node_id)? else {
             return Err(DaemonError::NotFound("node_not_found".to_owned()));
         };
         let mount = resolve_mount_for_folder_id(&state, &node.folder_id).await?;
         (
-            node.folder_id.clone(),
+            mount.clone(),
             mount.effective_token(&state.config).to_owned(),
             node,
         )
@@ -301,11 +311,10 @@ pub(crate) async fn fp_move(
     let mut applied_seq = None;
 
     if let Some(new_name) = req.new_name.as_deref() {
-        let response = submit_op_daemon(
-            &state.client,
-            &state.config.backend_url,
+        let response = submit_op_daemon_for_mount(
+            &state,
+            &mount,
             &token,
-            &folder_id,
             &SubmitOpRequest::Rename {
                 node_id: req.node_id.clone(),
                 based_on_seq,
@@ -326,11 +335,10 @@ pub(crate) async fn fp_move(
     }
 
     if let Some(new_parent_id) = req.new_parent_id.as_deref() {
-        let response = submit_op_daemon(
-            &state.client,
-            &state.config.backend_url,
+        let response = submit_op_daemon_for_mount(
+            &state,
+            &mount,
             &token,
-            &folder_id,
             &SubmitOpRequest::Move {
                 node_id: req.node_id.clone(),
                 based_on_seq,
@@ -577,6 +585,7 @@ fn fp_item_from_node(conn: &Connection, node: &LocalNode) -> Result<FpItem> {
     })
 }
 
+#[cfg(test)]
 async fn upload_job(state: DaemonState, req: FpUploadRequest, node_id: String) {
     let context = match resolve_upload_context(&state, &req, &node_id).await {
         Ok(context) => context,
@@ -589,6 +598,15 @@ async fn upload_job(state: DaemonState, req: FpUploadRequest, node_id: String) {
             return;
         }
     };
+    upload_job_with_context(state, req, node_id, context).await;
+}
+
+async fn upload_job_with_context(
+    state: DaemonState,
+    req: FpUploadRequest,
+    node_id: String,
+    context: UploadContext,
+) {
     let folder_id = context.folder_id.clone();
     if let Err(error) = upload_job_inner(&state, req, node_id.clone(), &context).await {
         let message = upload_failure_message(&error);
@@ -612,6 +630,7 @@ struct UploadContext {
     initial_error: Option<String>,
     sync_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     cursor_notify: std::sync::Arc<tokio::sync::Notify>,
+    update_required: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn resolve_upload_context(
@@ -635,6 +654,7 @@ async fn resolve_upload_context(
         let mount = resolve_mount_for_folder_id(state, &parent.folder_id).await?;
         (mount, req.parent_id.clone(), parent)
     };
+    ensure_mount_not_update_required(&mount)?;
     let existing = nodes::get_node(&conn, node_id)?.or(nodes::get_node_by_parent_and_name(
         &conn,
         &parent.folder_id,
@@ -656,6 +676,7 @@ async fn resolve_upload_context(
         initial_error: mount.error.clone(),
         sync_lock: mount.sync_lock.clone(),
         cursor_notify: mount.cursor_notify.clone(),
+        update_required: mount.update_required_flag.clone(),
     })
 }
 
@@ -666,11 +687,10 @@ async fn upload_job_inner(
     context: &UploadContext,
 ) -> Result<(), DaemonError> {
     let based_on_seq = if context.create_first {
-        match submit_op_daemon(
-            &state.client,
-            &state.config.backend_url,
+        match submit_op_daemon_for_upload_context(
+            state,
+            context,
             &context.token,
-            &context.folder_id,
             &SubmitOpRequest::Create {
                 payload: CreatePayload {
                     node_id: node_id.clone(),
@@ -730,11 +750,10 @@ async fn upload_job_inner(
             length: chunk.length,
         })
         .collect::<Vec<_>>();
-    let response = submit_op_daemon(
-        &state.client,
-        &state.config.backend_url,
+    let response = submit_op_daemon_for_upload_context(
+        state,
+        context,
         &context.token,
-        &context.folder_id,
         &SubmitOpRequest::NewVersion {
             node_id,
             based_on_seq,
@@ -753,6 +772,66 @@ async fn upload_job_inner(
     set_upload_mount_error(state, &context, None).await;
     context.cursor_notify.notify_waiters();
     Ok(())
+}
+
+fn ensure_mount_not_update_required(mount: &MountState) -> Result<(), DaemonError> {
+    if mount.update_required || mount.update_required_flag.load(Ordering::Acquire) {
+        return Err(DaemonError::UpdateRequired(
+            UpdateRequired::mount_already_halted(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_upload_context_not_update_required(context: &UploadContext) -> Result<(), DaemonError> {
+    if context.update_required.load(Ordering::Acquire) {
+        return Err(DaemonError::UpdateRequired(
+            UpdateRequired::mount_already_halted(),
+        ));
+    }
+    Ok(())
+}
+
+async fn submit_op_daemon_for_mount(
+    state: &DaemonState,
+    mount: &MountState,
+    token: &str,
+    req: &SubmitOpRequest,
+) -> Result<SubmitOpResponse, DaemonError> {
+    ensure_mount_not_update_required(mount)?;
+    let result = submit_op_daemon(
+        &state.client,
+        &state.config.backend_url,
+        token,
+        &mount.folder_id,
+        req,
+    )
+    .await;
+    if matches!(result, Err(DaemonError::UpdateRequired(_))) {
+        mark_mount_update_required(state, &mount.folder_id).await;
+    }
+    result
+}
+
+async fn submit_op_daemon_for_upload_context(
+    state: &DaemonState,
+    context: &UploadContext,
+    token: &str,
+    req: &SubmitOpRequest,
+) -> Result<SubmitOpResponse, DaemonError> {
+    ensure_upload_context_not_update_required(context)?;
+    let result = submit_op_daemon(
+        &state.client,
+        &state.config.backend_url,
+        token,
+        &context.folder_id,
+        req,
+    )
+    .await;
+    if matches!(result, Err(DaemonError::UpdateRequired(_))) {
+        mark_mount_update_required(state, &context.folder_id).await;
+    }
+    result
 }
 
 async fn set_upload_mount_error(
@@ -840,13 +919,18 @@ async fn submit_op_daemon(
             folder_id
         ))
         .bearer_auth(token)
+        .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
         .json(req)
         .send()
         .await?;
-    Ok(backend_response_or_error(response)
+    if response.status() == reqwest::StatusCode::UPGRADE_REQUIRED {
+        return Err(update_required_from_response(response).await.into());
+    }
+    let body = backend_response_or_error(response)
         .await?
-        .json::<SubmitOpResponse>()
-        .await?)
+        .json::<Value>()
+        .await?;
+    Ok(parse_submit_op_response_body(body)?)
 }
 
 fn upload_failure_message(error: &DaemonError) -> String {
@@ -916,6 +1000,8 @@ mod fp_watch_tests {
             active_syncs: 0,
             pending_ops: 0,
             last_synced_at: None,
+            update_required: false,
+            update_required_flag: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
@@ -1095,6 +1181,29 @@ mod fp_error_tests {
         format!("http://{addr}")
     }
 
+    async fn backend_url_with_response_and_request(
+        status_line: &str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_line = status_line.to_owned();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            let n = stream.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..n]).into_owned();
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        (format!("http://{addr}"), server)
+    }
+
     async fn backend_url_recording_responses(
         responses: Vec<(&'static str, &'static str)>,
     ) -> (String, Arc<Mutex<Vec<Value>>>) {
@@ -1159,6 +1268,17 @@ mod fp_error_tests {
         (status, body)
     }
 
+    async fn daemon_status(state: DaemonState) -> valv_sync::protocol::ipc::DaemonStatus {
+        let response = crate::control::get_status(State(state))
+            .await
+            .unwrap()
+            .into_response();
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
     fn node(node_id: &str, parent_id: Option<&str>, name: &str) -> LocalNode {
         LocalNode {
             node_id: node_id.to_owned(),
@@ -1191,6 +1311,8 @@ mod fp_error_tests {
             active_syncs: 0,
             pending_ops: 0,
             last_synced_at: None,
+            update_required: false,
+            update_required_flag: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
@@ -1265,6 +1387,57 @@ mod fp_error_tests {
     }
 
     #[tokio::test]
+    async fn fp_delete_update_required_marks_status_and_blocks_follow_up() {
+        let (backend_url, requests) = backend_url_recording_responses(vec![
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"result":"future","server_seq":8,"node_id":"node-1"}"#,
+            ),
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"result":"applied","server_seq":9,"node_id":"node-1"}"#,
+            ),
+        ])
+        .await;
+        let state = test_state(backend_url);
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("node-1", None, "doc.txt")).unwrap();
+        }
+
+        let first_error = fp_delete(
+            State(state.clone()),
+            Json(FpDeleteRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 7,
+            }),
+        )
+        .await
+        .unwrap_err();
+        let (first_status, first_body) = response_json(first_error).await;
+        assert_eq!(first_status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(first_body["error"], "update_required");
+
+        let status = daemon_status(state.clone()).await;
+        assert!(status.update_required);
+        assert!(status.mounts[0].update_required);
+
+        let second_error = fp_delete(
+            State(state),
+            Json(FpDeleteRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 7,
+            }),
+        )
+        .await
+        .unwrap_err();
+        let (second_status, second_body) = response_json(second_error).await;
+        assert_eq!(second_status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(second_body["error"], "update_required");
+        assert_eq!(requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn fp_move_applied_rename_updates_mirror() {
         let (backend_url, requests) = backend_url_recording_responses(vec![(
             "HTTP/1.1 200 OK",
@@ -1300,6 +1473,61 @@ mod fp_error_tests {
         assert_eq!(captured[0]["op_type"], "rename");
         assert_eq!(captured[0]["based_on_seq"], 7);
         assert_eq!(captured[0]["payload"]["new_name"], "renamed.txt");
+    }
+
+    #[tokio::test]
+    async fn fp_move_update_required_marks_status_and_blocks_follow_up() {
+        let (backend_url, requests) = backend_url_recording_responses(vec![
+            (
+                "HTTP/1.1 426 Upgrade Required",
+                r#"{"error":"protocol_too_old","min_protocol":2,"message":"Update Valv"}"#,
+            ),
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"result":"applied","server_seq":9,"node_id":"node-1"}"#,
+            ),
+        ])
+        .await;
+        let state = test_state(backend_url);
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("node-1", Some("parent-1"), "doc.txt")).unwrap();
+        }
+
+        let first_error = fp_move(
+            State(state.clone()),
+            Json(FpMoveRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 7,
+                new_name: Some("renamed.txt".to_owned()),
+                new_parent_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        let (first_status, first_body) = response_json(first_error).await;
+        assert_eq!(first_status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(first_body["min_protocol"], 2);
+
+        let status = daemon_status(state.clone()).await;
+        assert!(status.update_required);
+        assert!(status.mounts[0].update_required);
+
+        let second_error = fp_move(
+            State(state),
+            Json(FpMoveRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 7,
+                new_name: Some("again.txt".to_owned()),
+                new_parent_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        let (second_status, second_body) = response_json(second_error).await;
+        assert_eq!(second_status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(second_body["error"], "update_required");
+        assert_eq!(requests.lock().await.len(), 1);
     }
 
     #[tokio::test]
@@ -1589,6 +1817,52 @@ mod fp_error_tests {
     }
 
     #[tokio::test]
+    async fn fp_upload_update_required_marks_status_and_blocks_follow_up() {
+        let (backend_url, requests) = backend_url_recording_responses(vec![
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"result":"future","server_seq":8,"node_id":"node-1"}"#,
+            ),
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"result":"applied","server_seq":9,"node_id":"node-1"}"#,
+            ),
+        ])
+        .await;
+        let state = test_state(backend_url);
+        let staged = std::env::temp_dir().join(format!("valvd-upload-{}", Uuid::new_v4()));
+        fs::write(&staged, b"").unwrap();
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("parent-1", None, "Parent")).unwrap();
+            node_store::upsert_node(&conn, &node("node-1", Some("parent-1"), "doc.txt")).unwrap();
+        }
+        let upload_request = FpUploadRequest {
+            node_id: Some("node-1".to_owned()),
+            parent_id: "parent-1".to_owned(),
+            name: "doc.txt".to_owned(),
+            based_on_seq: Some(7),
+            file_path: staged.to_string_lossy().to_string(),
+        };
+
+        upload_job(state.clone(), upload_request.clone(), "node-1".to_owned()).await;
+
+        let status = daemon_status(state.clone()).await;
+        assert!(status.update_required);
+        assert!(status.mounts[0].update_required);
+
+        let second_error = fp_upload(State(state.clone()), Json(upload_request))
+            .await
+            .unwrap_err();
+        let (second_status, second_body) = response_json(second_error).await;
+        assert_eq!(second_status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(second_body["error"], "update_required");
+
+        assert_eq!(requests.lock().await.len(), 1);
+        let _ = fs::remove_file(staged);
+    }
+
+    #[tokio::test]
     async fn upload_job_failure_does_not_end_concurrent_sync() {
         let backend_url = backend_url_with_response(
             "HTTP/1.1 402 Payment Required",
@@ -1700,6 +1974,93 @@ mod fp_error_tests {
         let (status, body) = response_json(error).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body, json!({ "error": "forbidden" }));
+    }
+
+    #[tokio::test]
+    async fn submit_op_daemon_sends_protocol_header() {
+        let (backend_url, server) = backend_url_with_response_and_request(
+            "HTTP/1.1 200 OK",
+            r#"{"result":"applied","server_seq":2,"node_id":"node-1"}"#,
+        )
+        .await;
+
+        let response = submit_op_daemon(
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "folder-1",
+            &SubmitOpRequest::Delete {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 1,
+                payload: DeletePayload {},
+            },
+        )
+        .await
+        .unwrap();
+        let request = server.await.unwrap();
+
+        assert!(matches!(response, SubmitOpResponse::Applied { .. }));
+        assert!(request.contains("x-valv-protocol: 1") || request.contains("X-Valv-Protocol: 1"));
+    }
+
+    #[tokio::test]
+    async fn submit_op_daemon_unknown_result_returns_update_required() {
+        let backend_url = backend_url_with_response(
+            "HTTP/1.1 200 OK",
+            r#"{"result":"future","server_seq":2,"node_id":"node-1"}"#,
+        )
+        .await;
+
+        let error = submit_op_daemon(
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "folder-1",
+            &SubmitOpRequest::Delete {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 1,
+                payload: DeletePayload {},
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let (status, body) = response_json(error).await;
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(body["error"], "update_required");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("unrecognized op submission result"));
+    }
+
+    #[tokio::test]
+    async fn submit_op_daemon_426_returns_update_required_with_min_protocol() {
+        let backend_url = backend_url_with_response(
+            "HTTP/1.1 426 Upgrade Required",
+            r#"{"error":"protocol_too_old","min_protocol":2,"message":"Update Valv"}"#,
+        )
+        .await;
+
+        let error = submit_op_daemon(
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "folder-1",
+            &SubmitOpRequest::Delete {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 1,
+                payload: DeletePayload {},
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let (status, body) = response_json(error).await;
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(body["error"], "update_required");
+        assert_eq!(body["min_protocol"], 2);
+        assert_eq!(body["message"], "Update Valv");
     }
 
     #[tokio::test]

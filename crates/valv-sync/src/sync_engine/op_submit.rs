@@ -4,15 +4,21 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+use reqwest::StatusCode;
 use rusqlite::{params, Connection};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
     chunking::chunk_file,
     persistence::versions::{self, LocalVersion},
-    protocol::sync::{ChunkRef, NewVersionPayload, SubmitOpRequest, SubmitOpResponse},
+    protocol::sync::{
+        ChunkRef, NewVersionPayload, SubmitOpRequest, SubmitOpResponse, PROTOCOL_HEADER,
+        PROTOCOL_VERSION,
+    },
     storage::upload_chunks,
+    sync_engine::update_required::{update_required_from_response, UpdateRequired},
 };
 
 pub async fn submit_op(
@@ -23,16 +29,32 @@ pub async fn submit_op(
     req: &SubmitOpRequest,
 ) -> Result<SubmitOpResponse> {
     let url = format!("{}/folders/{}/ops", crate::api_base(backend_url), folder_id);
-    let response = client.post(url).bearer_auth(token).json(req).send().await?;
+    let response = client
+        .post(url)
+        .bearer_auth(token)
+        .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+        .json(req)
+        .send()
+        .await?;
+    if response.status() == StatusCode::UPGRADE_REQUIRED {
+        return Err(update_required_from_response(response).await);
+    }
     if response.status() == reqwest::StatusCode::FORBIDDEN {
         return Err(anyhow!(
             "authorization failed submitting op for folder {folder_id}"
         ));
     }
-    Ok(response
-        .error_for_status()?
-        .json::<SubmitOpResponse>()
-        .await?)
+    let body = response.error_for_status()?.json::<Value>().await?;
+    parse_submit_op_response_body(body)
+}
+
+pub fn parse_submit_op_response_body(body: Value) -> Result<SubmitOpResponse> {
+    match body.get("result").and_then(|value| value.as_str()) {
+        Some("applied" | "conflict_copy" | "superseded") => {
+            Ok(serde_json::from_value::<SubmitOpResponse>(body)?)
+        }
+        other => Err(anyhow!(UpdateRequired::unrecognized_submit_result(other))),
+    }
 }
 
 pub fn materialize_conflict_copy(
@@ -158,7 +180,13 @@ fn manifest_content_hash(manifest: &[ChunkRef]) -> String {
 mod tests {
     use std::io::Write;
 
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
     use super::*;
+    use crate::sync_engine::update_required::is_update_required;
 
     #[test]
     fn conflict_copy_name_with_extension() {
@@ -202,5 +230,119 @@ mod tests {
             conflict.file_name().and_then(|name| name.to_str()),
             Some("archive.tar (conflicted copy, CI Agent, 2026-06-27).gz")
         );
+    }
+
+    #[tokio::test]
+    async fn submit_op_sends_protocol_header_and_decodes_known_response() {
+        let (backend_url, server) = submit_response_server(
+            "200 OK",
+            br#"{"result":"applied","server_seq":7,"node_id":"n1"}"#,
+        )
+        .await;
+        let response = submit_op(
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "folder-1",
+            &SubmitOpRequest::Delete {
+                node_id: "n1".into(),
+                based_on_seq: 6,
+                payload: crate::protocol::sync::DeletePayload {},
+            },
+        )
+        .await
+        .unwrap();
+        let request = server.await.unwrap();
+
+        assert!(request.contains("x-valv-protocol: 1") || request.contains("X-Valv-Protocol: 1"));
+        assert_eq!(
+            response,
+            SubmitOpResponse::Applied {
+                server_seq: 7,
+                node_id: "n1".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_op_unknown_result_is_update_required() {
+        let (backend_url, server) = submit_response_server(
+            "200 OK",
+            br#"{"result":"future","server_seq":7,"node_id":"n1"}"#,
+        )
+        .await;
+        let error = submit_op(
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "folder-1",
+            &SubmitOpRequest::Delete {
+                node_id: "n1".into(),
+                based_on_seq: 6,
+                payload: crate::protocol::sync::DeletePayload {},
+            },
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(is_update_required(&error).is_some());
+    }
+
+    #[tokio::test]
+    async fn submit_op_426_is_update_required_with_min_protocol() {
+        let (backend_url, server) = submit_response_server(
+            "426 Upgrade Required",
+            br#"{"error":"protocol_too_old","min_protocol":2,"message":"Update Valv"}"#,
+        )
+        .await;
+        let error = submit_op(
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "folder-1",
+            &SubmitOpRequest::Delete {
+                node_id: "n1".into(),
+                based_on_seq: 6,
+                payload: crate::protocol::sync::DeletePayload {},
+            },
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        let update_required = is_update_required(&error).unwrap();
+
+        assert_eq!(update_required.min_protocol, Some(2));
+        assert_eq!(update_required.message, "Update Valv");
+    }
+
+    async fn submit_response_server(
+        status: &'static str,
+        body: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            write_response(&mut stream, status, body).await;
+            request
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    async fn read_request(stream: &mut TcpStream) -> String {
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+
+    async fn write_response(stream: &mut TcpStream, status: &str, body: &[u8]) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
     }
 }

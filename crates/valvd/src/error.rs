@@ -6,6 +6,7 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
+use valv_sync::sync_engine::update_required::{is_update_required, UpdateRequired};
 
 #[derive(Debug)]
 pub(crate) enum DaemonError {
@@ -13,6 +14,7 @@ pub(crate) enum DaemonError {
     NotFound(String),
     Conflict(Value),
     Backend { status: StatusCode, body: Value },
+    UpdateRequired(UpdateRequired),
     Internal(String),
 }
 
@@ -24,6 +26,7 @@ impl fmt::Display for DaemonError {
             | DaemonError::Internal(message) => f.write_str(message),
             DaemonError::Conflict(body) => write!(f, "{body}"),
             DaemonError::Backend { status, body } => write!(f, "backend returned {status}: {body}"),
+            DaemonError::UpdateRequired(update_required) => write!(f, "{update_required}"),
         }
     }
 }
@@ -39,6 +42,14 @@ impl IntoResponse for DaemonError {
             DaemonError::NotFound(message) => (StatusCode::NOT_FOUND, json!({ "error": message })),
             DaemonError::Conflict(body) => (StatusCode::CONFLICT, body),
             DaemonError::Backend { status, body } => (status, body),
+            DaemonError::UpdateRequired(update_required) => (
+                StatusCode::UPGRADE_REQUIRED,
+                json!({
+                    "error": "update_required",
+                    "min_protocol": update_required.min_protocol,
+                    "message": update_required.message,
+                }),
+            ),
             DaemonError::Internal(message) => {
                 tracing::error!(error = %message, "internal daemon error");
                 (
@@ -53,6 +64,9 @@ impl IntoResponse for DaemonError {
 
 impl From<anyhow::Error> for DaemonError {
     fn from(error: anyhow::Error) -> Self {
+        if let Some(update_required) = is_update_required(&error) {
+            return DaemonError::UpdateRequired(update_required.clone());
+        }
         DaemonError::Internal(error.to_string())
     }
 }

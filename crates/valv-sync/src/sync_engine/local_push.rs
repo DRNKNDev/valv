@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use anyhow::{anyhow, Result};
@@ -23,7 +26,10 @@ use crate::{
         ChunkRef, CreatePayload, DeletePayload, MovePayload, NodeType, RenamePayload,
         SubmitOpRequest, SubmitOpResponse,
     },
-    sync_engine::op_submit::{submit_op, upload_then_submit_new_version},
+    sync_engine::{
+        op_submit::{submit_op, upload_then_submit_new_version},
+        update_required::{is_update_required, UpdateRequired},
+    },
 };
 
 #[derive(Debug, Default)]
@@ -45,6 +51,59 @@ pub async fn push_local(
     token: &str,
     device_name: &str,
 ) -> Result<PushSummary> {
+    push_local_inner(
+        mount_root,
+        folder_id,
+        scope_node_id,
+        db,
+        client,
+        backend_url,
+        token,
+        device_name,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn push_local_with_update_required(
+    mount_root: &Path,
+    folder_id: &str,
+    scope_node_id: Option<&str>,
+    db: &Arc<Mutex<Connection>>,
+    client: &reqwest::Client,
+    backend_url: &str,
+    token: &str,
+    device_name: &str,
+    update_required_flag: &AtomicBool,
+) -> Result<PushSummary> {
+    push_local_inner(
+        mount_root,
+        folder_id,
+        scope_node_id,
+        db,
+        client,
+        backend_url,
+        token,
+        device_name,
+        Some(update_required_flag),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn push_local_inner(
+    mount_root: &Path,
+    folder_id: &str,
+    scope_node_id: Option<&str>,
+    db: &Arc<Mutex<Connection>>,
+    client: &reqwest::Client,
+    backend_url: &str,
+    token: &str,
+    device_name: &str,
+    update_required_flag: Option<&AtomicBool>,
+) -> Result<PushSummary> {
+    ensure_not_update_required(update_required_flag)?;
     let seed_parent_id = {
         let conn = db.lock().await;
         let root = get_root_node(&conn, folder_id)?.ok_or_else(|| {
@@ -62,6 +121,7 @@ pub async fn push_local(
     queue.push_back((mount_root.to_path_buf(), seed_parent_id));
 
     while let Some((dir_path, parent_node_id)) = queue.pop_front() {
+        ensure_not_update_required(update_required_flag)?;
         let read_dir = match fs::read_dir(&dir_path) {
             Ok(read_dir) => read_dir,
             Err(error) => {
@@ -121,6 +181,7 @@ pub async fn push_local(
         });
 
         for entry in entries {
+            ensure_not_update_required(update_required_flag)?;
             if entry.is_symlink {
                 eprintln!("push_local: skipping symlink {}", entry.abs_path.display());
                 summary.skipped += 1;
@@ -156,6 +217,7 @@ pub async fn push_local(
                             client,
                             backend_url,
                             token,
+                            update_required_flag,
                         },
                     )
                     .await?
@@ -176,6 +238,7 @@ pub async fn push_local(
                             client,
                             backend_url,
                             token,
+                            update_required_flag,
                         },
                     )
                     .await?;
@@ -194,9 +257,10 @@ pub async fn push_local(
                             backend_url,
                             token,
                             device_name,
+                            update_required_flag,
                         },
                     )
-                    .await;
+                    .await?;
                 } else {
                     if process_moved_entry(
                         &mut summary,
@@ -214,6 +278,7 @@ pub async fn push_local(
                             client,
                             backend_url,
                             token,
+                            update_required_flag,
                         },
                     )
                     .await?
@@ -234,6 +299,7 @@ pub async fn push_local(
                             client,
                             backend_url,
                             token,
+                            update_required_flag,
                         },
                     )
                     .await?;
@@ -258,6 +324,7 @@ pub async fn push_local(
         client,
         backend_url,
         token,
+        update_required_flag,
     )
     .await?;
 
@@ -276,6 +343,7 @@ struct MovedEntry<'a> {
     client: &'a reqwest::Client,
     backend_url: &'a str,
     token: &'a str,
+    update_required_flag: Option<&'a AtomicBool>,
 }
 
 async fn process_moved_entry(
@@ -320,6 +388,7 @@ async fn process_moved_entry(
         {
             Ok(response) => response,
             Err(error) => {
+                propagate_update_required(&error, entry.update_required_flag)?;
                 eprintln!(
                     "push_local: failed to submit move for {}: {error}",
                     entry.abs_path.display()
@@ -355,6 +424,7 @@ async fn process_moved_entry(
         {
             Ok(response) => response,
             Err(error) => {
+                propagate_update_required(&error, entry.update_required_flag)?;
                 let conn = entry.db.lock().await;
                 nodes::upsert_node(&conn, &node)?;
                 eprintln!(
@@ -479,7 +549,9 @@ async fn submit_deletes_for_missing(
     client: &reqwest::Client,
     backend_url: &str,
     token: &str,
+    update_required_flag: Option<&AtomicBool>,
 ) -> Result<()> {
+    ensure_not_update_required(update_required_flag)?;
     let nodes = {
         let conn = db.lock().await;
         let mut stmt = conn.prepare(
@@ -528,6 +600,7 @@ async fn submit_deletes_for_missing(
             continue;
         };
         for idx in child_indices {
+            ensure_not_update_required(update_required_flag)?;
             let node = &nodes[idx];
             if deferred_delete_node_ids.contains(&node.node_id) {
                 continue;
@@ -573,6 +646,7 @@ async fn submit_deletes_for_missing(
                     summary.skipped += 1;
                 }
                 Err(error) => {
+                    propagate_update_required(&error, update_required_flag)?;
                     eprintln!(
                         "push_local: failed to submit delete for {}: {error}",
                         path.display()
@@ -651,6 +725,7 @@ struct CreateEntry<'a> {
     client: &'a reqwest::Client,
     backend_url: &'a str,
     token: &'a str,
+    update_required_flag: Option<&'a AtomicBool>,
 }
 
 async fn create_entry(
@@ -658,6 +733,7 @@ async fn create_entry(
     queue: &mut VecDeque<(PathBuf, String)>,
     entry: CreateEntry<'_>,
 ) -> Result<()> {
+    ensure_not_update_required(entry.update_required_flag)?;
     let local_node_type = node_type_str(&entry.node_type).to_owned();
     let is_dir = matches!(entry.node_type, NodeType::Folder);
     let req = SubmitOpRequest::Create {
@@ -680,6 +756,7 @@ async fn create_entry(
     {
         Ok(response) => response,
         Err(error) => {
+            propagate_update_required(&error, entry.update_required_flag)?;
             eprintln!(
                 "push_local: failed to submit create for {}: {error}",
                 entry.abs_path.display()
@@ -732,6 +809,7 @@ async fn create_entry(
                 {
                     Ok(_) => summary.versions_submitted += 1,
                     Err(error) => {
+                        propagate_update_required(&error, entry.update_required_flag)?;
                         eprintln!(
                             "push_local: failed to upload content for {}: {error}",
                             entry.abs_path.display()
@@ -764,9 +842,11 @@ struct ExistingFile<'a> {
     backend_url: &'a str,
     token: &'a str,
     device_name: &'a str,
+    update_required_flag: Option<&'a AtomicBool>,
 }
 
-async fn process_existing_file(summary: &mut PushSummary, file: ExistingFile<'_>) {
+async fn process_existing_file(summary: &mut PushSummary, file: ExistingFile<'_>) -> Result<()> {
+    ensure_not_update_required(file.update_required_flag)?;
     let stored_version = {
         let conn = file.db.lock().await;
         let version_id = file.node.current_version_id.as_deref().unwrap_or("");
@@ -778,7 +858,7 @@ async fn process_existing_file(summary: &mut PushSummary, file: ExistingFile<'_>
                     file.abs_path.display()
                 );
                 summary.errors += 1;
-                return;
+                return Ok(());
             }
         }
     };
@@ -788,7 +868,7 @@ async fn process_existing_file(summary: &mut PushSummary, file: ExistingFile<'_>
             match file_content_hash(&file.abs_path) {
                 Ok(content_hash) if content_hash == version.content_hash => {
                     summary.skipped += 1;
-                    return;
+                    return Ok(());
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -797,7 +877,7 @@ async fn process_existing_file(summary: &mut PushSummary, file: ExistingFile<'_>
                         file.abs_path.display()
                     );
                     summary.errors += 1;
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -821,6 +901,7 @@ async fn process_existing_file(summary: &mut PushSummary, file: ExistingFile<'_>
     {
         Ok(_) => summary.versions_submitted += 1,
         Err(error) => {
+            propagate_update_required(&error, file.update_required_flag)?;
             eprintln!(
                 "push_local: failed to submit new version for {}: {error}",
                 file.abs_path.display()
@@ -828,6 +909,27 @@ async fn process_existing_file(summary: &mut PushSummary, file: ExistingFile<'_>
             summary.errors += 1;
         }
     }
+    Ok(())
+}
+
+fn ensure_not_update_required(update_required_flag: Option<&AtomicBool>) -> Result<()> {
+    if update_required_flag.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(anyhow!(UpdateRequired::mount_already_halted()));
+    }
+    Ok(())
+}
+
+fn propagate_update_required(
+    error: &anyhow::Error,
+    update_required_flag: Option<&AtomicBool>,
+) -> Result<()> {
+    if let Some(update_required) = is_update_required(error) {
+        if let Some(flag) = update_required_flag {
+            flag.store(true, Ordering::Release);
+        }
+        return Err(anyhow!(update_required.clone()));
+    }
+    Ok(())
 }
 
 fn file_name(path: &Path) -> Result<String> {

@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+pub const PROTOCOL_VERSION: i64 = 1;
+pub const PROTOCOL_HEADER: &str = "X-Valv-Protocol";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeType {
