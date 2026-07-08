@@ -24,6 +24,14 @@ export interface NewVersionPayload {
   content_hash: string;
   size_bytes: number;
   manifest: ChunkRef[];
+  force_conflict_copy?: boolean;
+}
+
+export interface ConflictManifest {
+  version_id: string;
+  content_hash: string;
+  size_bytes: number;
+  manifest: ChunkRef[];
 }
 
 export type SubmitOpRequest =
@@ -73,4 +81,11 @@ export type SubmitOpResponse =
   | {
       result: 'superseded';
       current_seq: number;
+    }
+  | {
+      result: 'conflict';
+      node_id: string;
+      current_server_seq: number;
+      base: ConflictManifest | null;
+      current: ConflictManifest;
     };

@@ -42,6 +42,16 @@ pub struct NewVersionPayload {
     pub content_hash: String,
     pub size_bytes: u64,
     pub manifest: Vec<ChunkRef>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_conflict_copy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictManifest {
+    pub version_id: String,
+    pub content_hash: String,
+    pub size_bytes: u64,
+    pub manifest: Vec<ChunkRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +97,12 @@ pub enum SubmitOpResponse {
     Superseded {
         current_seq: i64,
     },
+    Conflict {
+        node_id: String,
+        current_server_seq: i64,
+        base: Option<ConflictManifest>,
+        current: ConflictManifest,
+    },
 }
 
 impl SubmitOpResponse {
@@ -95,6 +111,7 @@ impl SubmitOpResponse {
             Self::Applied { .. } => "applied",
             Self::ConflictCopy { .. } => "conflict_copy",
             Self::Superseded { .. } => "superseded",
+            Self::Conflict { .. } => "conflict",
         }
     }
 }
