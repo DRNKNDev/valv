@@ -16,6 +16,8 @@ export type CreateMetadataRouterOptions = {
   hub: MetadataHub;
   sendInviteEmail?: SendInviteEmail;
   onFolderCreated?: (info: { folderId: string; ownerUserId: string; grantId: string }) => Promise<void>;
+  onGrantDeviceCreated?: (info: { folderId: string; scopeNodeId: string; deviceId: string; grantId: string }) => Promise<void>;
+  checkPlanForGrant?: (folderId: string) => Promise<{ allowed: boolean; status?: string } | null>;
   onOpCommitted?: (op: CommittedOp) => Promise<void>;
 };
 
@@ -24,7 +26,10 @@ export function createMetadataRouter(opts: CreateMetadataRouterOptions): Hono<{ 
   router.use("*", createAuthMiddleware(opts.auth));
   registerFolderRoutes(router, opts.auth, opts.onFolderCreated);
   registerInviteRoutes(router, opts.auth, opts.sendInviteEmail);
-  registerGrantRoutes(router, opts.auth);
+  registerGrantRoutes(router, opts.auth, {
+    onGrantDeviceCreated: opts.onGrantDeviceCreated,
+    checkPlan: opts.checkPlanForGrant,
+  });
   registerOpRoutes(router, opts.auth, opts.hub, opts.onOpCommitted);
   registerDeltaRoutes(router, opts.auth);
   registerVersionRoutes(router, opts.auth, opts.hub, opts.onOpCommitted);
