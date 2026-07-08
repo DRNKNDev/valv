@@ -60,6 +60,13 @@ pub async fn pull_delta(
             .error_for_status()?
             .json::<DeltaPullResponse>()
             .await?;
+        if delta.up_to_seq < cursor {
+            return Err(anyhow!(
+                "delta up_to_seq {} regressed below local cursor {}",
+                delta.up_to_seq,
+                cursor
+            ));
+        }
         for op in &delta.ops {
             let pre_op = apply_op_log_entry(conn, op)?;
             pulled.push(build_pulled_node(conn, op, pre_op)?);
@@ -242,6 +249,58 @@ mod tests {
 
         assert!(is_update_required(&error).is_some());
         assert_eq!(mounts::get_cursor(&conn, "folder-1").unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn pull_delta_rejects_regressing_up_to_seq_without_applying_ops() {
+        let (base_url, server) = single_response_server(
+            "200 OK",
+            br#"{"ops":[{"server_seq":51,"node_id":"n1","op_type":"create","op_payload":{"node_id":"n1","folder_id":"folder-1","parent_id":"root","name":"a.txt","type":"file"},"actor_device_id":"d1","applied_at":"2026-07-08T00:00:00Z"}],"up_to_seq":30}"#,
+        )
+        .await;
+        let mut conn = memory_db_with_mount();
+        mounts::set_cursor(&conn, "folder-1", 50).unwrap();
+
+        let error = pull_delta(
+            &reqwest::Client::new(),
+            &base_url,
+            "token",
+            "folder-1",
+            &mut conn,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.to_string().contains("regressed"));
+        assert_eq!(mounts::get_cursor(&conn, "folder-1").unwrap(), 50);
+        assert!(nodes::get_node(&conn, "n1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pull_delta_applies_equal_up_to_seq_with_non_empty_ops() {
+        let (base_url, server) = single_response_server(
+            "200 OK",
+            br#"{"ops":[{"server_seq":50,"node_id":"n1","op_type":"create","op_payload":{"node_id":"n1","folder_id":"folder-1","parent_id":"root","name":"a.txt","type":"file"},"actor_device_id":"d1","applied_at":"2026-07-08T00:00:00Z"}],"up_to_seq":50}"#,
+        )
+        .await;
+        let mut conn = memory_db_with_mount();
+        mounts::set_cursor(&conn, "folder-1", 50).unwrap();
+
+        let (cursor, pulled) = pull_delta(
+            &reqwest::Client::new(),
+            &base_url,
+            "token",
+            "folder-1",
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(cursor, 50);
+        assert_eq!(pulled.len(), 1);
+        assert!(nodes::get_node(&conn, "n1").unwrap().is_some());
     }
 
     #[tokio::test]
