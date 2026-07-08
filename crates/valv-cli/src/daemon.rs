@@ -4,7 +4,8 @@ use serde::Deserialize;
 
 use crate::paths::socket_path;
 
-const DAEMON_NOT_RUNNING: &str = "Daemon is not running. Start it with: valv daemon install";
+pub(crate) const DAEMON_NOT_RUNNING: &str =
+    "Daemon is not running. Start it with: valv daemon install";
 
 pub(crate) fn daemon_client() -> Result<reqwest::Client> {
     let path = socket_path().context("failed to determine daemon socket path")?;
