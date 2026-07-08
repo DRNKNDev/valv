@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const PROTOCOL_VERSION: i64 = 1;
 pub const PROTOCOL_HEADER: &str = "X-Valv-Protocol";
@@ -37,6 +38,14 @@ pub struct ChunkRef {
     pub chunk_hash: String,
     pub offset: u64,
     pub length: u64,
+}
+
+pub fn manifest_content_hash(manifest: &[ChunkRef]) -> String {
+    let mut hasher = Sha256::new();
+    for chunk in manifest {
+        hasher.update(chunk.chunk_hash.as_bytes());
+    }
+    hex::encode(hasher.finalize())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

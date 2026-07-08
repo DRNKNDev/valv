@@ -14,7 +14,6 @@ use chrono::Local;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use reqwest::header::{HeaderName, HeaderValue};
 use rusqlite::Connection;
-use sha2::{Digest, Sha256};
 use tokio::{
     sync::{mpsc, Mutex},
     time::sleep,
@@ -30,8 +29,8 @@ use crate::{
     },
     protocol::http::{BatchOperation, BatchRequest, BatchRequestObject, BatchResponse},
     protocol::sync::{
-        ChunkRef, CreatePayload, DeletePayload, MovePayload, NewVersionPayload, NodeType,
-        RenamePayload, SubmitOpRequest, SubmitOpResponse,
+        manifest_content_hash, ChunkRef, CreatePayload, DeletePayload, MovePayload,
+        NewVersionPayload, NodeType, RenamePayload, SubmitOpRequest, SubmitOpResponse,
     },
     sync_engine::op_submit::{apply_submitted_new_version, materialize_conflict_copy, submit_op},
 };
@@ -530,14 +529,6 @@ async fn upload_pending_chunks(
         request.send().await?.error_for_status()?;
     }
     Ok(())
-}
-
-fn manifest_content_hash(manifest: &[ChunkRef]) -> String {
-    let mut hasher = Sha256::new();
-    for chunk in manifest {
-        hasher.update(chunk.chunk_hash.as_bytes());
-    }
-    hex::encode(hasher.finalize())
 }
 
 fn is_conflict_copy_name(name: &str) -> bool {

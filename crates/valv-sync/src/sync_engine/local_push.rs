@@ -11,7 +11,6 @@ use std::{
 use anyhow::{anyhow, Result};
 use chrono::Local;
 use rusqlite::{params, Connection};
-use sha2::Digest;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -23,8 +22,8 @@ use crate::{
         versions,
     },
     protocol::sync::{
-        ChunkRef, CreatePayload, DeletePayload, MovePayload, NodeType, RenamePayload,
-        SubmitOpRequest, SubmitOpResponse,
+        manifest_content_hash, ChunkRef, CreatePayload, DeletePayload, MovePayload, NodeType,
+        RenamePayload, SubmitOpRequest, SubmitOpResponse,
     },
     sync_engine::{
         op_submit::{submit_op, upload_then_submit_new_version},
@@ -965,14 +964,6 @@ fn file_content_hash(path: &Path) -> Result<String> {
         })
         .collect::<Vec<_>>();
     Ok(manifest_content_hash(&manifest))
-}
-
-fn manifest_content_hash(manifest: &[ChunkRef]) -> String {
-    let mut hasher = sha2::Sha256::new();
-    for chunk in manifest {
-        hasher.update(chunk.chunk_hash.as_bytes());
-    }
-    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
