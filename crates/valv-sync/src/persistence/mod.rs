@@ -308,6 +308,7 @@ mod tests {
         assert_eq!(node.server_seq, 5);
         assert!(node.deleted_at.is_some());
         assert!(versions::get_version(&conn, "v1").unwrap().is_some());
+        assert!(!versions::has_materialized_content_for_node(&conn, "n1").unwrap());
     }
 
     #[test]
@@ -402,6 +403,116 @@ mod tests {
         assert_eq!(pre_op.server_seq, 10);
         assert_eq!(node.server_seq, 10);
         assert_eq!(node.name, "current.txt");
+    }
+
+    #[test]
+    fn out_of_order_non_create_ops_do_not_mutate_node() {
+        for (op_type, payload) in [
+            ("rename", json!({"new_name":"stale.txt"})),
+            ("move", json!({"new_parent_id":"stale-parent"})),
+            ("delete", json!({})),
+            (
+                "new_version",
+                json!({"version_id":"stale-v","content_hash":"hash","size_bytes":3,"manifest":[{"chunk_hash":"c1","offset":0,"length":3}]}),
+            ),
+        ] {
+            let conn = memory_db();
+            nodes::upsert_node(
+                &conn,
+                &nodes::LocalNode {
+                    node_id: "n1".into(),
+                    folder_id: "folder-1".into(),
+                    parent_id: Some("parent".into()),
+                    name: "current.txt".into(),
+                    node_type: "file".into(),
+                    current_version_id: Some("current-v".into()),
+                    server_seq: 10,
+                    deleted_at: None,
+                },
+            )
+            .unwrap();
+
+            let pre_op = apply_op_log_entry(
+                &conn,
+                &OpLogEntry {
+                    server_seq: 8,
+                    node_id: "n1".into(),
+                    op_type: op_type.into(),
+                    op_payload: payload,
+                    actor_device_id: "d1".into(),
+                    applied_at: "2026-07-08T00:00:00Z".into(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            let node = nodes::get_node(&conn, "n1").unwrap().unwrap();
+
+            assert_eq!(pre_op.server_seq, 10);
+            assert_eq!(node.name, "current.txt");
+            assert_eq!(node.parent_id.as_deref(), Some("parent"));
+            assert_eq!(node.current_version_id.as_deref(), Some("current-v"));
+            assert_eq!(node.server_seq, 10);
+            assert!(node.deleted_at.is_none());
+            assert!(versions::get_version(&conn, "stale-v").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn duplicate_server_seq_is_not_reapplied() {
+        let conn = memory_db();
+        nodes::upsert_node(
+            &conn,
+            &nodes::LocalNode {
+                node_id: "n1".into(),
+                folder_id: "folder-1".into(),
+                parent_id: None,
+                name: "current.txt".into(),
+                node_type: "file".into(),
+                current_version_id: None,
+                server_seq: 10,
+                deleted_at: None,
+            },
+        )
+        .unwrap();
+
+        apply_op_log_entry(
+            &conn,
+            &OpLogEntry {
+                server_seq: 10,
+                node_id: "n1".into(),
+                op_type: "rename".into(),
+                op_payload: json!({"new_name":"duplicate.txt"}),
+                actor_device_id: "d1".into(),
+                applied_at: "2026-07-08T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let node = nodes::get_node(&conn, "n1").unwrap().unwrap();
+
+        assert_eq!(node.name, "current.txt");
+        assert_eq!(node.server_seq, 10);
+    }
+
+    #[test]
+    fn create_op_is_exempt_from_monotonicity_guard() {
+        let conn = memory_db();
+
+        apply_op_log_entry(
+            &conn,
+            &OpLogEntry {
+                server_seq: 1,
+                node_id: "n1".into(),
+                op_type: "create".into(),
+                op_payload: json!({"node_id":"n1","folder_id":"folder-1","parent_id":"root","name":"created.txt","type":"file"}),
+                actor_device_id: "d1".into(),
+                applied_at: "2026-07-08T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let node = nodes::get_node(&conn, "n1").unwrap().unwrap();
+
+        assert_eq!(node.name, "created.txt");
+        assert_eq!(node.server_seq, 1);
     }
 
     #[test]

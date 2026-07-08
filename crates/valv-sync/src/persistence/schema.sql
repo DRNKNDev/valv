@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS versions (
     folder_id TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
-    manifest_json TEXT NOT NULL
+    manifest_json TEXT NOT NULL,
+    content_materialized_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_versions_folder

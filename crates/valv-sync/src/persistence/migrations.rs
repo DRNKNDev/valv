@@ -10,10 +10,16 @@ struct Migration {
     run: MigrationFn,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    run: migration_1,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        run: migration_1,
+    },
+    Migration {
+        version: 2,
+        run: migration_2,
+    },
+];
 
 pub fn run_migrations(conn: &Connection) -> Result<()> {
     let current_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -38,6 +44,27 @@ fn migration_1(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migration_2(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "versions")? {
+        conn.execute_batch(schema_sql())?;
+    }
+    add_column_if_missing(conn, "versions", "content_materialized_at", "TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_versions_node_materialized
+         ON versions(node_id, content_materialized_at);",
+    )?;
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::NamedTempFile;
@@ -55,24 +82,25 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
         let conn = open_db(file.path()).unwrap();
 
-        assert_eq!(user_version(&conn), 1);
+        assert_eq!(user_version(&conn), 2);
         for column in ["scope_node_id", "mount_token", "can_write", "name"] {
             assert!(mount_column_exists(&conn, column));
         }
+        assert_eq!(version_column_count(&conn, "content_materialized_at"), 1);
     }
 
     #[test]
-    fn database_at_version_1_skips_migration_ddl() {
+    fn database_at_current_version_skips_migration_ddl() {
         let file = NamedTempFile::new().unwrap();
         {
             let conn = Connection::open(file.path()).unwrap();
-            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
         }
 
         let conn = open_db(file.path()).unwrap();
 
-        assert_eq!(user_version(&conn), 1);
-        assert!(!table_exists(&conn, "mounts"));
+        assert_eq!(user_version(&conn), 2);
+        assert!(!table_exists(&conn, "mounts").unwrap());
     }
 
     #[test]
@@ -118,19 +146,11 @@ mod tests {
 
         let conn = open_db(file.path()).unwrap();
 
-        assert_eq!(user_version(&conn), 1);
+        assert_eq!(user_version(&conn), 2);
         for column in ["scope_node_id", "mount_token", "can_write", "name"] {
             assert_eq!(mount_column_count(&conn, column), 1);
         }
-    }
-
-    fn table_exists(conn: &Connection, table: &str) -> bool {
-        conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-            [table],
-            |row| row.get::<_, bool>(0),
-        )
-        .unwrap()
+        assert_eq!(version_column_count(&conn, "content_materialized_at"), 1);
     }
 
     fn mount_column_exists(conn: &Connection, column: &str) -> bool {
@@ -138,7 +158,17 @@ mod tests {
     }
 
     fn mount_column_count(conn: &Connection, column: &str) -> usize {
-        let mut stmt = conn.prepare("PRAGMA table_info(mounts)").unwrap();
+        column_count(conn, "mounts", column)
+    }
+
+    fn version_column_count(conn: &Connection, column: &str) -> usize {
+        column_count(conn, "versions", column)
+    }
+
+    fn column_count(conn: &Connection, table: &str, column: &str) -> usize {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
         stmt.query_map([], |row| row.get::<_, String>(1))
             .unwrap()
             .map(|result| result.unwrap())
