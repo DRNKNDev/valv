@@ -35,6 +35,8 @@ export type CommittedOp = {
   nodeId: string;
   opType: SubmitOpRequest["op_type"];
   previousParentId?: string | null;
+  chunkHashesAdded?: string[];
+  chunkHashesRemoved?: string[];
 };
 
 export function registerOpRoutes(
@@ -115,7 +117,7 @@ export async function submitOp(
           committedOp: undefined,
         };
       }
-      const conflictVersionId = await insertVersionAndOp(auth, tx, folderId, op.node_id, principal.deviceId, op, true);
+      const versionResult = await insertVersionAndOp(auth, tx, folderId, op.node_id, principal.deviceId, op, true);
       const serverSeq = await latestSeqForNode(auth, tx, folderId, op.node_id);
       await tx
         .update(auth.schema.nodes)
@@ -126,9 +128,15 @@ export async function submitOp(
           result: "conflict_copy",
           server_seq: serverSeq,
           node_id: op.node_id,
-          conflict_version_id: conflictVersionId,
+          conflict_version_id: versionResult.versionId,
         } satisfies SubmitOpResponse,
-        committedOp: { folderId, serverSeq, nodeId: op.node_id, opType: op.op_type } satisfies CommittedOp,
+        committedOp: {
+          folderId,
+          serverSeq,
+          nodeId: op.node_id,
+          opType: op.op_type,
+          chunkHashesAdded: versionResult.chunkHashesAdded,
+        } satisfies CommittedOp,
       };
     }
 
@@ -151,7 +159,7 @@ export async function submitOp(
 
     const previousParentId = op.op_type === "move" ? (await currentNode(auth, tx, op.node_id))?.parentId : undefined;
     await applyMetadataMutation(auth, tx, op.node_id, op);
-    await insertVersionAndOp(auth, tx, folderId, op.node_id, principal.deviceId, op, false);
+    const versionResult = await insertVersionAndOp(auth, tx, folderId, op.node_id, principal.deviceId, op, false);
     const serverSeq = await latestSeqForNode(auth, tx, folderId, op.node_id);
     await tx
       .update(auth.schema.nodes)
@@ -159,7 +167,15 @@ export async function submitOp(
       .where(eq(auth.schema.nodes.nodeId, op.node_id));
     return {
       response: { result: "applied", server_seq: serverSeq, node_id: op.node_id } satisfies SubmitOpResponse,
-      committedOp: { folderId, serverSeq, nodeId: op.node_id, opType: op.op_type, previousParentId } satisfies CommittedOp,
+      committedOp: {
+        folderId,
+        serverSeq,
+        nodeId: op.node_id,
+        opType: op.op_type,
+        previousParentId,
+        chunkHashesAdded: versionResult.chunkHashesAdded,
+        chunkHashesRemoved: versionResult.chunkHashesRemoved,
+      } satisfies CommittedOp,
     };
   });
   if (committedOp) {
@@ -271,8 +287,10 @@ async function insertVersionAndOp(
   actorDeviceId: string,
   op: Exclude<SubmitOpRequest, { op_type: "create" }>,
   isConflictCopy: boolean,
-): Promise<string> {
+): Promise<{ versionId: string; chunkHashesAdded?: string[]; chunkHashesRemoved?: string[] }> {
   let versionId = "";
+  let chunkHashesAdded: string[] | undefined;
+  let chunkHashesRemoved: string[] | undefined;
   if (op.op_type === "new_version") {
     versionId = isConflictCopy ? newId() : op.payload.version_id;
     let previousManifest: ChunkRef[] = [];
@@ -289,6 +307,7 @@ async function insertVersionAndOp(
       isConflictCopy,
     });
     const chunkHashes = [...new Set(op.payload.manifest.map((chunk: ChunkRef) => chunk.chunk_hash))];
+    chunkHashesAdded = chunkHashes;
     if (chunkHashes.length > 0) {
       await tx.insert(auth.schema.versionChunks).values(
         chunkHashes.map((chunkHash) => ({
@@ -303,7 +322,8 @@ async function insertVersionAndOp(
         .where(inArray(auth.schema.chunks.chunkHash, chunkHashes));
     }
     if (!isConflictCopy) {
-      const previousChunkHashes = previousManifest.map((chunk) => chunk.chunk_hash);
+      const previousChunkHashes = [...new Set(previousManifest.map((chunk) => chunk.chunk_hash))];
+      chunkHashesRemoved = previousChunkHashes;
       if (previousChunkHashes.length > 0) {
         await tx
           .update(auth.schema.chunks)
@@ -325,7 +345,7 @@ async function insertVersionAndOp(
     basedOnSeq: op.based_on_seq,
     actorDeviceId,
   });
-  return versionId;
+  return { versionId, chunkHashesAdded, chunkHashesRemoved };
 }
 
 async function currentVersionManifest(
