@@ -46,6 +46,7 @@ export function registerVersionRoutes(
     const folderId = ctx.req.param("id");
     const nodeId = ctx.req.param("nodeId");
     const versionId = ctx.req.param("versionId");
+    const body = (await ctx.req.json()) as { based_on_seq: number };
     const grant = await checkGrant(auth.db, nodeId, principal, "write", auth.schema);
     if (!grant.granted) {
       return ctx.json({ error: grant.reason }, 403);
@@ -79,7 +80,7 @@ export function registerVersionRoutes(
       {
         op_type: "new_version",
         node_id: nodeId,
-        based_on_seq: node.serverSeq,
+        based_on_seq: body.based_on_seq,
         payload: {
           version_id: crypto.randomUUID(),
           content_hash: version.contentHash,

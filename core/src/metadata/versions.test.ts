@@ -53,7 +53,11 @@ describe("version routes", () => {
 
     const response = await appFor(db, { type: "device", deviceId: "device-1" }, hub).request(
       "/folders/folder-1/nodes/doc/versions/old-version/restore",
-      { method: "POST", headers: { authorization: "Bearer device-token" } },
+      {
+        method: "POST",
+        headers: { authorization: "Bearer device-token", "content-type": "application/json" },
+        body: JSON.stringify({ based_on_seq: 10 }),
+      },
     );
     const body = await response.json();
 
@@ -71,10 +75,49 @@ describe("version routes", () => {
     expect(hub.notify).toHaveBeenCalledWith("folder-1", 11);
   });
 
+  it.each(["rename", "move", "delete", "new_version"])(
+    "restores a stale prior version as a conflict copy after a %s op advanced the node",
+    async () => {
+      const db = new VersionDb({ authorized: true });
+      db.nodes.set("doc", { ...db.nodes.get("doc")!, serverSeq: 12 });
+      db.versions.push(version("old-version", { manifest: [{ chunk_hash: "chunk-1", offset: 0, length: 8 }] }));
+      db.ops.push({ serverSeq: 12, folderId: "folder-1", nodeId: "doc", opType: "new_version" });
+      const hub = { notify: vi.fn() };
+
+      const response = await appFor(db, { type: "device", deviceId: "device-1" }, hub).request(
+        "/folders/folder-1/nodes/doc/versions/old-version/restore",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer device-token", "content-type": "application/json" },
+          body: JSON.stringify({ based_on_seq: 10 }),
+        },
+      );
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body).toMatchObject({ result: "conflict_copy", server_seq: 13, node_id: "doc" });
+      expect(body.conflict_version_id).toEqual(expect.any(String));
+      expect(db.insertedVersions[0]).toMatchObject({
+        nodeId: "doc",
+        contentHash: "hash-old-version",
+        sizeBytes: 100,
+        authorDeviceId: "device-1",
+        isConflictCopy: true,
+        manifest: [{ chunk_hash: "chunk-1", offset: 0, length: 8 }],
+      });
+      expect(db.nodes.get("doc")?.serverSeq).toBe(13);
+      expect(hub.notify).toHaveBeenCalledWith("folder-1", 13);
+    },
+  );
+
   it("returns 404 when restoring a missing version", async () => {
     const response = await appFor(new VersionDb({ authorized: true }), { type: "device", deviceId: "device-1" }).request(
       "/folders/folder-1/nodes/doc/versions/missing/restore",
-      { method: "POST", headers: { authorization: "Bearer device-token" } },
+      {
+        method: "POST",
+        headers: { authorization: "Bearer device-token", "content-type": "application/json" },
+        body: JSON.stringify({ based_on_seq: 10 }),
+      },
     );
 
     expect(response.status).toBe(404);

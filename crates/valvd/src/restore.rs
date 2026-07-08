@@ -207,7 +207,7 @@ mod tests {
     use uuid::Uuid;
     use valv_sync::{
         persistence::{mounts as mount_store, nodes as node_store, LocalNode},
-        protocol::ipc::VersionsRequest,
+        protocol::ipc::{RestoreRequest, VersionsRequest},
     };
 
     use crate::config::DaemonConfig;
@@ -328,5 +328,33 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, DaemonError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn post_restore_round_trips_conflict_copy_result() {
+        let mount_dir = std::env::temp_dir().join(format!("valvd-restore-{}", Uuid::new_v4()));
+        fs::create_dir_all(&mount_dir).unwrap();
+        let file_path = mount_dir.join("doc.txt");
+        fs::write(&file_path, b"content").unwrap();
+        let backend_url = backend_url_with_response(
+            r#"{"result":"conflict_copy","server_seq":9,"node_id":"doc","conflict_version_id":"conflict-1"}"#,
+        )
+        .await;
+
+        let response = post_restore(
+            State(test_state(
+                mount_dir.to_string_lossy().to_string(),
+                backend_url,
+            )),
+            Json(RestoreRequest {
+                local_path: file_path.to_string_lossy().to_string(),
+                version_id: "version-1".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.result, "conflict_copy");
+        let _ = fs::remove_dir_all(mount_dir);
     }
 }
