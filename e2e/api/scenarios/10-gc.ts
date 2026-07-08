@@ -42,6 +42,8 @@ export function gcScenarios(harness: SeededHarness): void {
         opLogTruncationIntervalMs: 60_000,
       });
       await vi.advanceTimersByTimeAsync(100);
+      stopGc();
+      stopGc = undefined;
       vi.useRealTimers();
       await waitForMissingNode(ctx, file.nodeId);
     });
