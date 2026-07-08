@@ -143,6 +143,41 @@ pub(crate) fn data_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(".local/share/valv"))
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn log_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join("Library/Logs/Valv"))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) const LOG_RETENTION_DAYS: u64 = 7;
+
+#[cfg(target_os = "macos")]
+pub(crate) fn prune_old_logs(log_dir: &Path) -> Result<()> {
+    use std::time::{Duration, SystemTime};
+
+    if !log_dir.exists() {
+        return Ok(());
+    }
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(LOG_RETENTION_DAYS * 24 * 60 * 60))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    for entry in fs::read_dir(log_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("valvd") || !entry.file_type()?.is_file() {
+            continue;
+        }
+        let modified = entry.metadata()?.modified()?;
+        if modified < cutoff {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn socket_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("valvd.sock"))
 }
@@ -227,6 +262,42 @@ device_id = "device"
         .unwrap_err();
 
         assert!(err.to_string().contains("Missing device_token"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn log_dir_uses_macos_user_logs_location() {
+        let path = log_dir().unwrap();
+
+        assert_eq!(path, home_dir().unwrap().join("Library/Logs/Valv"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prune_old_logs_deletes_only_expired_valvd_files() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("valvd.log.2026-01-01");
+        let new = dir.path().join("valvd.log");
+        let unrelated = dir.path().join("other.log");
+        fs::write(&old, b"old").unwrap();
+        fs::write(&new, b"new").unwrap();
+        fs::write(&unrelated, b"old").unwrap();
+        let status = Command::new("touch")
+            .arg("-t")
+            .arg("200001010000")
+            .arg(&old)
+            .arg(&unrelated)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        prune_old_logs(dir.path()).unwrap();
+
+        assert!(!old.exists());
+        assert!(new.exists());
+        assert!(unrelated.exists());
     }
 
     #[test]
