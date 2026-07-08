@@ -25,7 +25,6 @@ export function gcScenarios(harness: SeededHarness): void {
     afterAll(async () => ctx?.cleanup());
 
     it("purges tombstones after 0ms retention", async () => {
-      vi.useFakeTimers();
       const file = await createNode(ctx.app, ctx.context.folderId, ctx.context.token, ctx.context.rootNodeId, "dead.txt", "file");
       await submitOp(ctx.app, ctx.context.folderId, ctx.context.token, {
         op_type: "delete",
@@ -33,6 +32,7 @@ export function gcScenarios(harness: SeededHarness): void {
         based_on_seq: file.server_seq,
         payload: {},
       });
+      vi.useFakeTimers();
       vi.setSystemTime(Date.now() + 1_000);
 
       stopGc = startGc(ctx.db as Parameters<typeof startGc>[0], ctx.s3 as Parameters<typeof startGc>[1], ctx.bucket, undefined, {
