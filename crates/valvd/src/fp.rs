@@ -276,6 +276,10 @@ pub(crate) async fn fp_delete(
             "error": "conflict_copy",
             "message": "delete conflicted with a concurrent write; re-sync before retrying"
         }))),
+        SubmitOpResponse::Conflict { .. } => Err(DaemonError::Conflict(json!({
+            "error": "conflict",
+            "message": "delete conflicted with a concurrent write; re-sync before retrying"
+        }))),
     }
 }
 
@@ -470,6 +474,12 @@ fn applied_server_seq(response: SubmitOpResponse) -> Result<i64, DaemonError> {
         SubmitOpResponse::ConflictCopy { server_seq, .. } => Err(DaemonError::Conflict(json!({
             "error": "conflict_copy",
             "server_seq": server_seq
+        }))),
+        SubmitOpResponse::Conflict {
+            current_server_seq, ..
+        } => Err(DaemonError::Conflict(json!({
+            "error": "conflict",
+            "current_server_seq": current_server_seq
         }))),
     }
 }
@@ -689,7 +699,9 @@ async fn upload_job_inner(
                     "message": format!("create op was superseded for {node_id}")
                 })));
             }
-            SubmitOpResponse::ConflictCopy { .. } => context.based_on_seq,
+            SubmitOpResponse::ConflictCopy { .. } | SubmitOpResponse::Conflict { .. } => {
+                context.based_on_seq
+            }
         }
     } else {
         context.based_on_seq
@@ -743,6 +755,7 @@ async fn upload_job_inner(
                 content_hash: manifest_content_hash(&manifest),
                 size_bytes: chunks.iter().map(|chunk| chunk.length).sum(),
                 manifest,
+                force_conflict_copy: false,
             },
         },
     )

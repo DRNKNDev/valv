@@ -331,7 +331,7 @@ async fn handle_create(
                 mount.folder_id
             );
         }
-        SubmitOpResponse::ConflictCopy { .. } => {}
+        SubmitOpResponse::ConflictCopy { .. } | SubmitOpResponse::Conflict { .. } => {}
     }
     Ok(())
 }
@@ -433,6 +433,7 @@ async fn upload_file_new_version(
             content_hash,
             size_bytes,
             manifest,
+            force_conflict_copy: false,
         },
     };
     let response = submit_op(client, backend_url, token, &mount.folder_id, &req).await?;
@@ -555,7 +556,9 @@ async fn handle_delete(
             let conn = db.lock().await;
             nodes::mark_deleted(&conn, &node_id, server_seq)?;
         }
-        SubmitOpResponse::Superseded { .. } | SubmitOpResponse::ConflictCopy { .. } => {}
+        SubmitOpResponse::Superseded { .. }
+        | SubmitOpResponse::ConflictCopy { .. }
+        | SubmitOpResponse::Conflict { .. } => {}
     }
     Ok(())
 }

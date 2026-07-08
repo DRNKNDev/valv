@@ -569,7 +569,11 @@ async fn submit_deletes_for_missing(
                     nodes::mark_deleted(&conn, &node.node_id, server_seq)?;
                     summary.deletes_submitted += 1;
                 }
-                Ok(SubmitOpResponse::Superseded { .. } | SubmitOpResponse::ConflictCopy { .. }) => {
+                Ok(
+                    SubmitOpResponse::Superseded { .. }
+                    | SubmitOpResponse::ConflictCopy { .. }
+                    | SubmitOpResponse::Conflict { .. },
+                ) => {
                     summary.skipped += 1;
                 }
                 Err(error) => {
@@ -748,7 +752,7 @@ async fn create_entry(
             );
             summary.skipped += 1;
         }
-        SubmitOpResponse::ConflictCopy { .. } => {}
+        SubmitOpResponse::ConflictCopy { .. } | SubmitOpResponse::Conflict { .. } => {}
     }
 
     Ok(())

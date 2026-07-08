@@ -29,10 +29,21 @@ pub async fn submit_op(
             "authorization failed submitting op for folder {folder_id}"
         ));
     }
-    Ok(response
+    let value = response
         .error_for_status()?
-        .json::<SubmitOpResponse>()
-        .await?)
+        .json::<serde_json::Value>()
+        .await?;
+    decode_submit_op_response(value)
+}
+
+fn decode_submit_op_response(value: serde_json::Value) -> Result<SubmitOpResponse> {
+    match value.get("result").and_then(serde_json::Value::as_str) {
+        Some("applied" | "conflict_copy" | "superseded" | "conflict") => {
+            Ok(serde_json::from_value(value)?)
+        }
+        Some(other) => Err(anyhow!("unrecognized submit_op result `{other}`")),
+        None => Err(anyhow!("submit_op response missing string result")),
+    }
 }
 
 pub fn materialize_conflict_copy(
@@ -91,6 +102,7 @@ pub async fn upload_then_submit_new_version(
             content_hash: manifest_content_hash(&manifest),
             size_bytes: chunks.iter().map(|chunk| chunk.length).sum(),
             manifest,
+            force_conflict_copy: false,
         },
     };
     let response = submit_op(client, backend_url, token, folder_id, &req).await?;
@@ -118,7 +130,7 @@ pub fn apply_submitted_new_version(
             conflict_version_id,
             ..
         } => (conflict_version_id, *server_seq, true),
-        SubmitOpResponse::Superseded { .. } => return Ok(()),
+        SubmitOpResponse::Superseded { .. } | SubmitOpResponse::Conflict { .. } => return Ok(()),
     };
 
     versions::upsert_version(
