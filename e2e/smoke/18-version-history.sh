@@ -48,7 +48,9 @@ case "$restore_output" in
 esac
 wait_for_file_content "$mount_a" "versioned.txt" "v1 content" 30
 assert_file_contains "${mount_a}/versioned.txt" "v1 content"
-version_count=$(HOME="$HOME_A" "$VALV_BIN" versions "${mount_a}/versioned.txt" | wc -l | tr -d ' ')
+# `valv versions` prints a 2-line header (column names + separator) before
+# one line per version, so skip those to count actual versions.
+version_count=$(HOME="$HOME_A" "$VALV_BIN" versions "${mount_a}/versioned.txt" | tail -n +3 | wc -l | tr -d ' ')
 [ "$version_count" = "4" ] || fail "expected 4 versions after restore, got ${version_count}"
 
 wait_for_file_content "$mount_b" "versioned.txt" "v1 content" 30
