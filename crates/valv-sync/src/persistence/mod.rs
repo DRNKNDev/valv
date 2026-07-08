@@ -9,7 +9,6 @@ use crate::protocol::sync::{FolderTreeResponse, NodeSnapshot, NodeType, OpLogEnt
 use crate::sync_engine::update_required::UpdateRequired;
 
 pub mod chunks;
-pub mod migrations;
 pub mod mounts;
 pub mod nodes;
 pub mod versions;
@@ -31,24 +30,8 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     let conn =
         Connection::open(path).with_context(|| format!("open sqlite db {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    migrations::run_migrations(&conn)?;
+    conn.execute_batch(schema_sql())?;
     Ok(conn)
-}
-
-pub(crate) fn add_column_if_missing(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    ty: &str,
-) -> Result<()> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if !columns.iter().any(|name| name == column) {
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"), [])?;
-    }
-    Ok(())
 }
 
 pub fn apply_op_log_entry(conn: &Connection, entry: &OpLogEntry) -> Result<Option<LocalNode>> {
@@ -247,6 +230,35 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("schema.sql")).unwrap();
         conn
+    }
+
+    #[test]
+    fn fresh_database_has_full_mounts_schema() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let conn = open_db(file.path()).unwrap();
+
+        let mut stmt = conn.prepare("PRAGMA table_info(mounts)").unwrap();
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|result| result.unwrap())
+            .collect();
+
+        for column in [
+            "path",
+            "folder_id",
+            "grant_id",
+            "scope_node_id",
+            "mount_token",
+            "cursor",
+            "can_write",
+            "name",
+        ] {
+            assert!(
+                columns.iter().any(|name| name == column),
+                "expected mounts.{column} to exist, got columns {columns:?}"
+            );
+        }
     }
 
     #[test]
