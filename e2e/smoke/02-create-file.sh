@@ -17,4 +17,4 @@ sync_mount "$HOME_A" "$folder_id"
 
 assert_node_at_path "$folder_id" "/hello.txt"
 chunk_hash=$(first_chunk_hash_for_path "$folder_id" "/hello.txt")
-assert_bucket_key "chunks/${chunk_hash}"
+assert_bucket_key "$(expected_chunk_key "$chunk_hash")"
