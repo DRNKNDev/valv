@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::atomic::Ordering,
     time::Duration,
@@ -21,7 +22,7 @@ use valv_sync::{
     },
     protocol::{
         ipc::{AccountStatus, SyncRequest, SyncSummary},
-        sync::{ChunkRef, WsPushNotification},
+        sync::{manifest_content_hash, ChunkRef, WsPushNotification},
     },
     storage::download_chunks,
     sync_engine::{
@@ -288,10 +289,11 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
                 .await
                 .err()
                 .map(|err| err.to_string());
-            let apply_error = apply_pulled_fs_changes(state, mount, pulled)
-                .await
-                .err()
-                .map(|err| err.to_string());
+            let apply_error =
+                apply_pulled_fs_changes(state, mount, pulled, MaterializeScope::Background)
+                    .await
+                    .err()
+                    .map(|err| err.to_string());
             resume_watchers_after_debounce(state, was_paused).await;
             apply_error.or(cleanup_error)
         }
@@ -382,7 +384,9 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
             state.backend_health.record_success();
             summary.pulled_ops = pulled_ops;
             let was_paused = pause_watchers(state);
-            if let Err(error) = apply_pulled_fs_changes(state, mount, pulled).await {
+            if let Err(error) =
+                apply_pulled_fs_changes(state, mount, pulled, MaterializeScope::Full).await
+            {
                 tracing::error!(
                     folder_id = %mount.folder_id,
                     error = %error,
@@ -451,6 +455,12 @@ struct RemoteVersion {
     manifest: Vec<ChunkRef>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterializeScope {
+    Background,
+    Full,
+}
+
 pub fn node_abs_path(
     nodes_by_id: &HashMap<String, LocalNode>,
     mount_root: &Path,
@@ -479,6 +489,7 @@ async fn apply_pulled_fs_changes(
     state: &DaemonState,
     mount: &MountState,
     pulled: Vec<PulledNode>,
+    scope: MaterializeScope,
 ) -> anyhow::Result<()> {
     if pulled.is_empty() {
         return Ok(());
@@ -488,7 +499,8 @@ async fn apply_pulled_fs_changes(
     let mount_root = PathBuf::from(&mount.path);
     for pulled_node in pulled {
         if let Err(error) =
-            apply_pulled_fs_change(state, mount, &nodes_by_id, &mount_root, &pulled_node).await
+            apply_pulled_fs_change(state, mount, &nodes_by_id, &mount_root, &pulled_node, scope)
+                .await
         {
             tracing::error!(
                 folder_id = %mount.folder_id,
@@ -538,6 +550,7 @@ async fn apply_pulled_fs_change(
     nodes_by_id: &HashMap<String, LocalNode>,
     mount_root: &Path,
     pulled: &PulledNode,
+    scope: MaterializeScope,
 ) -> anyhow::Result<()> {
     match pulled.op_type.as_str() {
         "create" if pulled.node_type == "folder" => {
@@ -552,8 +565,26 @@ async fn apply_pulled_fs_change(
         }
         "create" if pulled.node_type == "file" => {
             if let Some(version_id) = pulled.new_version_id.as_deref() {
-                write_canonical_version(state, mount, nodes_by_id, mount_root, pulled, version_id)
+                if should_materialize_canonical(
+                    state,
+                    mount,
+                    nodes_by_id,
+                    mount_root,
+                    pulled,
+                    scope,
+                )
+                .await?
+                {
+                    write_canonical_version(
+                        state,
+                        mount,
+                        nodes_by_id,
+                        mount_root,
+                        pulled,
+                        version_id,
+                    )
                     .await?;
+                }
             }
         }
         "rename" | "move" => {
@@ -626,8 +657,12 @@ async fn apply_pulled_fs_change(
             let Some(version_id) = pulled.new_version_id.as_deref() else {
                 return Ok(());
             };
-            write_canonical_version(state, mount, nodes_by_id, mount_root, pulled, version_id)
-                .await?;
+            if should_materialize_canonical(state, mount, nodes_by_id, mount_root, pulled, scope)
+                .await?
+            {
+                write_canonical_version(state, mount, nodes_by_id, mount_root, pulled, version_id)
+                    .await?;
+            }
         }
         "delete" => {}
         _ => {}
@@ -659,16 +694,12 @@ async fn materialize_single_node(
     };
     let already_materialized = {
         let conn = state.db.lock().await;
-        versions::get_version(&conn, version_id)?.is_some() && path.exists()
+        versions::has_materialized_content_for_version(&conn, version_id)? && path.exists()
     };
     if already_materialized {
         return Ok(());
     }
-    let bytes = download_and_store_version(state, mount, node_id, version_id).await?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, bytes)?;
+    materialize_version(state, mount, node_id, version_id, path).await?;
     Ok(())
 }
 
@@ -708,11 +739,7 @@ async fn write_canonical_version(
     ) else {
         return Ok(());
     };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let bytes = download_and_store_version(state, mount, &pulled.node_id, version_id).await?;
-    fs::write(path, bytes)?;
+    materialize_version(state, mount, &pulled.node_id, version_id, &path).await?;
     Ok(())
 }
 
@@ -722,7 +749,77 @@ async fn download_and_store_version(
     node_id: &str,
     version_id: &str,
 ) -> anyhow::Result<Vec<u8>> {
+    let (version, bytes) = download_verified_version(state, mount, node_id, version_id).await?;
+    persist_version_metadata(state, mount, node_id, &version).await?;
+    Ok(bytes)
+}
+
+async fn materialize_version(
+    state: &DaemonState,
+    mount: &MountState,
+    node_id: &str,
+    version_id: &str,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let (version, bytes) = download_verified_version(state, mount, node_id, version_id).await?;
+    write_atomic(path, &bytes)?;
+    persist_materialized_version(state, mount, node_id, &version).await?;
+    Ok(())
+}
+
+async fn download_verified_version(
+    state: &DaemonState,
+    mount: &MountState,
+    node_id: &str,
+    version_id: &str,
+) -> anyhow::Result<(RemoteVersion, Vec<u8>)> {
     let version = fetch_remote_version(state, mount, node_id, version_id).await?;
+    let token = mount.effective_token(&state.config).to_owned();
+    let bytes = download_chunks(
+        &state.client,
+        &state.config.backend_url,
+        &token,
+        &version.manifest,
+    )
+    .await?;
+    let actual_hash = manifest_content_hash(&version.manifest);
+    if actual_hash != version.content_hash {
+        return Err(anyhow::anyhow!(
+            "content hash mismatch for version {}: expected {}, got {}",
+            version.version_id,
+            version.content_hash,
+            actual_hash
+        ));
+    }
+    if bytes.len() as u64 != version.size_bytes {
+        return Err(anyhow::anyhow!(
+            "content size mismatch for version {}: expected {}, got {}",
+            version.version_id,
+            version.size_bytes,
+            bytes.len()
+        ));
+    }
+    Ok((version, bytes.to_vec()))
+}
+
+async fn persist_materialized_version(
+    state: &DaemonState,
+    mount: &MountState,
+    node_id: &str,
+    version: &RemoteVersion,
+) -> anyhow::Result<()> {
+    persist_version_metadata(state, mount, node_id, version).await?;
+    let conn = state.db.lock().await;
+    versions::mark_content_materialized(&conn, &version.version_id)?;
+    Ok(())
+}
+
+async fn persist_version_metadata(
+    state: &DaemonState,
+    mount: &MountState,
+    node_id: &str,
+    version: &RemoteVersion,
+) -> anyhow::Result<()> {
     {
         let conn = state.db.lock().await;
         upsert_version(
@@ -736,22 +833,63 @@ async fn download_and_store_version(
                 manifest_json: serde_json::to_string(&version.manifest)?,
             },
         )?;
-    }
-    let token = mount.effective_token(&state.config).to_owned();
-    let bytes = download_chunks(
-        &state.client,
-        &state.config.backend_url,
-        &token,
-        &version.manifest,
-    )
-    .await?;
-    {
-        let conn = state.db.lock().await;
         for chunk in &version.manifest {
             chunk_store::mark_uploaded(&conn, &chunk.chunk_hash, chunk.length)?;
         }
     }
-    Ok(bytes.to_vec())
+    Ok(())
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("path has no valid file name: {}", path.display()))?;
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.valv-tmp-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut file = fs::File::create(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp_path, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+async fn should_materialize_canonical(
+    state: &DaemonState,
+    mount: &MountState,
+    nodes_by_id: &HashMap<String, LocalNode>,
+    mount_root: &Path,
+    pulled: &PulledNode,
+    scope: MaterializeScope,
+) -> anyhow::Result<bool> {
+    if scope == MaterializeScope::Full {
+        return Ok(true);
+    }
+    let Some(path) = node_abs_path(
+        nodes_by_id,
+        mount_root,
+        mount.scope_node_id.as_deref(),
+        &pulled.node_id,
+    ) else {
+        return Ok(false);
+    };
+    let has_prior_materialized_content = {
+        let conn = state.db.lock().await;
+        versions::has_materialized_content_for_node(&conn, &pulled.node_id)?
+    };
+    Ok(!(has_prior_materialized_content && !path.exists()))
 }
 
 fn conflict_copy_path(
@@ -777,7 +915,36 @@ fn conflict_copy_path(
         }
         None => format!("{file_name} (conflicted copy, {device_name}, {date})"),
     };
-    Ok(original_path.with_file_name(conflict_name))
+    disambiguate_conflict_path(original_path.with_file_name(conflict_name))
+}
+
+fn disambiguate_conflict_path(desired: PathBuf) -> anyhow::Result<PathBuf> {
+    if !desired.exists() {
+        return Ok(desired);
+    }
+    let parent = desired.parent().map(Path::to_path_buf);
+    let stem = desired
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow::anyhow!("path has no valid file stem: {}", desired.display()))?;
+    let extension = desired.extension().and_then(|ext| ext.to_str());
+    for counter in 2..=20 {
+        let file_name = match extension {
+            Some(ext) => format!("{stem} ({counter}).{ext}"),
+            None => format!("{stem} ({counter})"),
+        };
+        let candidate = parent.as_ref().map_or_else(
+            || PathBuf::from(&file_name),
+            |parent| parent.join(&file_name),
+        );
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "conflict copy path exhausted disambiguation attempts for {}",
+        desired.display()
+    ))
 }
 
 pub(crate) async fn materialize_mount_files(
@@ -846,41 +1013,12 @@ pub(crate) async fn materialize_mount_files(
             };
             let already_materialized = {
                 let conn = state.db.lock().await;
-                versions::get_version(&conn, version_id)?.is_some() && path.exists()
+                versions::has_materialized_content_for_version(&conn, version_id)? && path.exists()
             };
             if already_materialized {
                 continue;
             }
-            let version = fetch_remote_version(state, mount, &node.node_id, version_id).await?;
-            {
-                let conn = state.db.lock().await;
-                upsert_version(
-                    &conn,
-                    &LocalVersion {
-                        version_id: version.version_id.clone(),
-                        node_id: node.node_id.clone(),
-                        folder_id: mount.folder_id.clone(),
-                        content_hash: version.content_hash.clone(),
-                        size_bytes: version.size_bytes,
-                        manifest_json: serde_json::to_string(&version.manifest)?,
-                    },
-                )?;
-            }
-            let token = mount.effective_token(&state.config).to_owned();
-            let bytes = download_chunks(
-                &state.client,
-                &state.config.backend_url,
-                &token,
-                &version.manifest,
-            )
-            .await?;
-            {
-                let conn = state.db.lock().await;
-                for chunk in &version.manifest {
-                    chunk_store::mark_uploaded(&conn, &chunk.chunk_hash, chunk.length)?;
-                }
-            }
-            fs::write(&path, bytes)?;
+            materialize_version(state, mount, &node.node_id, version_id, &path).await?;
         }
     }
 
@@ -1074,6 +1212,7 @@ mod tests {
     };
 
     use rusqlite::Connection;
+    use sha2::{Digest, Sha256};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -1103,6 +1242,8 @@ mod tests {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
             backend_health: Arc::new(crate::BackendHealth::default()),
+            pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_deletes: Arc::new(Mutex::new(HashMap::new())),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: DaemonConfig {
@@ -1113,6 +1254,119 @@ mod tests {
                 mounts: Vec::new(),
             },
         }
+    }
+
+    async fn test_state_with_backend(
+        version_id: &str,
+        content_hash: String,
+        size_bytes: u64,
+        manifest: Vec<ChunkRef>,
+        chunks: HashMap<String, Vec<u8>>,
+    ) -> DaemonState {
+        let mut state = test_state();
+        state.config.backend_url =
+            materialization_server(version_id, content_hash, size_bytes, manifest, chunks).await;
+        state
+    }
+
+    fn test_chunk_hash(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    async fn materialization_server(
+        version_id: &str,
+        content_hash: String,
+        size_bytes: u64,
+        manifest: Vec<ChunkRef>,
+        chunks: HashMap<String, Vec<u8>>,
+    ) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let version_id = version_id.to_owned();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 4096];
+                let bytes_read = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                let first_line = request.lines().next().unwrap_or_default();
+                let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+
+                if path == "/api/folders/folder-1/versions/n1" {
+                    let body = serde_json::json!([
+                        {
+                            "version_id": version_id,
+                            "content_hash": content_hash,
+                            "size_bytes": size_bytes,
+                            "manifest": manifest,
+                        }
+                    ])
+                    .to_string();
+                    write_test_response(&mut stream, "application/json", body.as_bytes()).await;
+                    continue;
+                }
+
+                if path == "/api/objects/batch" {
+                    let objects = manifest
+                        .iter()
+                        .map(|chunk| {
+                            serde_json::json!({
+                                "oid": chunk.chunk_hash,
+                                "size": chunk.length,
+                                "actions": {
+                                    "download": {
+                                        "href": format!("http://{addr}/chunks/{}", chunk.chunk_hash)
+                                    }
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let body = serde_json::json!({
+                        "transfer": "basic",
+                        "objects": objects,
+                    })
+                    .to_string();
+                    write_test_response(&mut stream, "application/json", body.as_bytes()).await;
+                    continue;
+                }
+
+                if let Some(chunk_hash) = path.strip_prefix("/chunks/") {
+                    if let Some(bytes) = chunks.get(chunk_hash) {
+                        write_test_response(&mut stream, "application/octet-stream", bytes).await;
+                        continue;
+                    }
+                }
+
+                write_test_status(&mut stream, "404 Not Found", b"not found").await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn write_test_response(
+        stream: &mut tokio::net::TcpStream,
+        content_type: &str,
+        body: &[u8],
+    ) {
+        write_test_status_with_type(stream, "200 OK", content_type, body).await;
+    }
+
+    async fn write_test_status(stream: &mut tokio::net::TcpStream, status_line: &str, body: &[u8]) {
+        write_test_status_with_type(stream, status_line, "text/plain", body).await;
+    }
+
+    async fn write_test_status_with_type(
+        stream: &mut tokio::net::TcpStream,
+        status_line: &str,
+        content_type: &str,
+        body: &[u8],
+    ) {
+        let header = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
     }
 
     async fn account_usage_server(status_line: &str, body: &str) -> String {
@@ -1174,6 +1428,291 @@ mod tests {
         assert_eq!(account.status, "active");
         assert_eq!(account.usage_bytes, 123);
         assert_eq!(account.quota_bytes, Some(456));
+    }
+
+    #[test]
+    fn pulled_conflict_copy_path_gets_counter_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        let base = path.with_file_name("report (conflicted copy, other-device, 2026-07-08).md");
+        fs::write(&base, b"first").unwrap();
+
+        let conflict = conflict_copy_path(&path, "other-device", "2026-07-08").unwrap();
+
+        assert_eq!(
+            conflict.file_name().and_then(|name| name.to_str()),
+            Some("report (conflicted copy, other-device, 2026-07-08) (2).md")
+        );
+        assert_eq!(fs::read(base).unwrap(), b"first");
+    }
+
+    #[test]
+    fn write_atomic_replaces_target_and_cleans_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, b"old").unwrap();
+
+        write_atomic(&path, b"new").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let temp_leftovers = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(".valv-tmp-"))
+            })
+            .count();
+        assert_eq!(temp_leftovers, 0);
+    }
+
+    #[tokio::test]
+    async fn materialize_version_accepts_manifest_content_hash() {
+        let content = b"hello manifest".to_vec();
+        let chunk_hash = test_chunk_hash(&content);
+        let manifest = vec![ChunkRef {
+            chunk_hash: chunk_hash.clone(),
+            offset: 0,
+            length: content.len() as u64,
+        }];
+        let state = test_state_with_backend(
+            "v1",
+            manifest_content_hash(&manifest),
+            content.len() as u64,
+            manifest.clone(),
+            HashMap::from([(chunk_hash, content.clone())]),
+        )
+        .await;
+        let mount = test_mount("/tmp/unused");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+
+        materialize_version(&state, &mount, "n1", "v1", &path)
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), content);
+        let conn = state.db.lock().await;
+        assert!(versions::get_version(&conn, "v1").unwrap().is_some());
+        assert!(versions::has_materialized_content_for_node(&conn, "n1").unwrap());
+    }
+
+    #[tokio::test]
+    async fn materialize_version_rejects_manifest_content_hash_mismatch_without_writes() {
+        let content = b"hello manifest".to_vec();
+        let chunk_hash = test_chunk_hash(&content);
+        let manifest = vec![ChunkRef {
+            chunk_hash: chunk_hash.clone(),
+            offset: 0,
+            length: content.len() as u64,
+        }];
+        let different_manifest = vec![ChunkRef {
+            chunk_hash: test_chunk_hash(b"different chunk"),
+            offset: 0,
+            length: content.len() as u64,
+        }];
+        let state = test_state_with_backend(
+            "v1",
+            manifest_content_hash(&different_manifest),
+            content.len() as u64,
+            manifest,
+            HashMap::from([(chunk_hash, content)]),
+        )
+        .await;
+        let mount = test_mount("/tmp/unused");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+
+        let error = materialize_version(&state, &mount, "n1", "v1", &path)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("content hash mismatch"));
+        assert!(!path.exists());
+        let conn = state.db.lock().await;
+        assert!(versions::get_version(&conn, "v1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn materialize_version_rejects_size_mismatch_without_writes() {
+        let content = b"hello manifest".to_vec();
+        let chunk_hash = test_chunk_hash(&content);
+        let manifest = vec![ChunkRef {
+            chunk_hash: chunk_hash.clone(),
+            offset: 0,
+            length: content.len() as u64,
+        }];
+        let state = test_state_with_backend(
+            "v1",
+            manifest_content_hash(&manifest),
+            (content.len() + 1) as u64,
+            manifest,
+            HashMap::from([(chunk_hash, content)]),
+        )
+        .await;
+        let mount = test_mount("/tmp/unused");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+
+        let error = materialize_version(&state, &mount, "n1", "v1", &path)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("content size mismatch"));
+        assert!(!path.exists());
+        let conn = state.db.lock().await;
+        assert!(versions::get_version(&conn, "v1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn background_scope_materializes_without_prior_version() {
+        let state = test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        let nodes_by_id = nodes_with_file("n1", "file.txt");
+        let pulled = pulled_new_version("n1", "v1");
+
+        let should = should_materialize_canonical(
+            &state,
+            &mount,
+            &nodes_by_id,
+            dir.path(),
+            &pulled,
+            MaterializeScope::Background,
+        )
+        .await
+        .unwrap();
+
+        assert!(should);
+    }
+
+    #[tokio::test]
+    async fn background_scope_materializes_when_path_exists() {
+        let state = test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        fs::write(dir.path().join("file.txt"), b"old").unwrap();
+        {
+            let conn = state.db.lock().await;
+            upsert_version(
+                &conn,
+                &LocalVersion {
+                    version_id: "old-v".into(),
+                    node_id: "n1".into(),
+                    folder_id: mount.folder_id.clone(),
+                    content_hash: "hash".into(),
+                    size_bytes: 3,
+                    manifest_json: "[]".into(),
+                },
+            )
+            .unwrap();
+            versions::mark_content_materialized(&conn, "old-v").unwrap();
+        }
+        let nodes_by_id = nodes_with_file("n1", "file.txt");
+        let pulled = pulled_new_version("n1", "v2");
+
+        let should = should_materialize_canonical(
+            &state,
+            &mount,
+            &nodes_by_id,
+            dir.path(),
+            &pulled,
+            MaterializeScope::Background,
+        )
+        .await
+        .unwrap();
+
+        assert!(should);
+    }
+
+    #[tokio::test]
+    async fn background_scope_materializes_with_metadata_only_version_row_and_absent_path() {
+        let state = test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        {
+            let conn = state.db.lock().await;
+            upsert_version(
+                &conn,
+                &LocalVersion {
+                    version_id: "mirrored-v".into(),
+                    node_id: "n1".into(),
+                    folder_id: mount.folder_id.clone(),
+                    content_hash: "hash".into(),
+                    size_bytes: 3,
+                    manifest_json: "[]".into(),
+                },
+            )
+            .unwrap();
+            assert!(versions::has_any_version_for_node(&conn, "n1").unwrap());
+            assert!(!versions::has_materialized_content_for_node(&conn, "n1").unwrap());
+        }
+        let nodes_by_id = nodes_with_file("n1", "file.txt");
+        let pulled = pulled_new_version("n1", "v1");
+
+        let should = should_materialize_canonical(
+            &state,
+            &mount,
+            &nodes_by_id,
+            dir.path(),
+            &pulled,
+            MaterializeScope::Background,
+        )
+        .await
+        .unwrap();
+
+        assert!(should);
+    }
+
+    #[tokio::test]
+    async fn background_scope_withholds_when_prior_version_and_path_absent() {
+        let state = test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        {
+            let conn = state.db.lock().await;
+            upsert_version(
+                &conn,
+                &LocalVersion {
+                    version_id: "old-v".into(),
+                    node_id: "n1".into(),
+                    folder_id: mount.folder_id.clone(),
+                    content_hash: "hash".into(),
+                    size_bytes: 3,
+                    manifest_json: "[]".into(),
+                },
+            )
+            .unwrap();
+            versions::mark_content_materialized(&conn, "old-v").unwrap();
+        }
+        let nodes_by_id = nodes_with_file("n1", "file.txt");
+        let pulled = pulled_new_version("n1", "v2");
+
+        let should = should_materialize_canonical(
+            &state,
+            &mount,
+            &nodes_by_id,
+            dir.path(),
+            &pulled,
+            MaterializeScope::Background,
+        )
+        .await
+        .unwrap();
+        let full_should = should_materialize_canonical(
+            &state,
+            &mount,
+            &nodes_by_id,
+            dir.path(),
+            &pulled,
+            MaterializeScope::Full,
+        )
+        .await
+        .unwrap();
+
+        assert!(!should);
+        assert!(full_should);
     }
 
     #[tokio::test]
@@ -1403,6 +1942,56 @@ mod tests {
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn local_file_node(node_id: &str, name: &str) -> LocalNode {
+        LocalNode {
+            node_id: node_id.to_owned(),
+            folder_id: "folder-1".to_owned(),
+            parent_id: Some("root".to_owned()),
+            name: name.to_owned(),
+            node_type: "file".to_owned(),
+            current_version_id: Some("old-v".to_owned()),
+            server_seq: 1,
+            deleted_at: None,
+        }
+    }
+
+    fn root_node() -> LocalNode {
+        LocalNode {
+            node_id: "root".to_owned(),
+            folder_id: "folder-1".to_owned(),
+            parent_id: None,
+            name: "Mount".to_owned(),
+            node_type: "folder".to_owned(),
+            current_version_id: None,
+            server_seq: 0,
+            deleted_at: None,
+        }
+    }
+
+    fn nodes_with_file(node_id: &str, name: &str) -> HashMap<String, LocalNode> {
+        HashMap::from([
+            ("root".to_owned(), root_node()),
+            (node_id.to_owned(), local_file_node(node_id, name)),
+        ])
+    }
+
+    fn pulled_new_version(node_id: &str, version_id: &str) -> PulledNode {
+        PulledNode {
+            node_id: node_id.to_owned(),
+            op_type: "new_version".to_owned(),
+            is_conflict_copy: false,
+            actor_device_id: "other-device".to_owned(),
+            applied_at: "2026-07-08T00:00:00Z".to_owned(),
+            old_name: Some("file.txt".to_owned()),
+            old_parent_id: None,
+            old_version_id: Some("old-v".to_owned()),
+            new_name: "file.txt".to_owned(),
+            new_parent_id: None,
+            new_version_id: Some(version_id.to_owned()),
+            node_type: "file".to_owned(),
         }
     }
 
