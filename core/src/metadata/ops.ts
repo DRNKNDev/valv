@@ -4,6 +4,7 @@ import { eq, inArray, sql } from "drizzle-orm";
 import type { CoreAuth, Principal } from "../auth/index.js";
 import { pgSchema } from "../db/schema.js";
 import { checkGrant } from "./authz.js";
+import type { ChunkRef, SubmitOpRequest, SubmitOpResponse } from "@valv/contracts-sync";
 import {
   inTransaction,
   newId,
@@ -11,23 +12,6 @@ import {
   type MetadataHub,
   type MetadataVariables,
 } from "./common.js";
-
-type ChunkRef = { chunk_hash: string; offset: number; length: number };
-type SubmitOpRequest =
-  | { op_type: "create"; payload: { node_id: string; parent_id: string; name: string; type: "file" | "folder" } }
-  | { op_type: "rename"; node_id: string; based_on_seq: number; payload: { new_name: string } }
-  | { op_type: "move"; node_id: string; based_on_seq: number; payload: { new_parent_id: string } }
-  | { op_type: "delete"; node_id: string; based_on_seq: number; payload: Record<string, never> }
-  | {
-      op_type: "new_version";
-      node_id: string;
-      based_on_seq: number;
-      payload: { version_id: string; content_hash: string; size_bytes: number; manifest: ChunkRef[] };
-    };
-type SubmitOpResponse =
-  | { result: "applied"; server_seq: number; node_id: string }
-  | { result: "conflict_copy"; server_seq: number; node_id: string; conflict_version_id: string }
-  | { result: "superseded"; current_seq: number };
 
 export type CommittedOp = {
   folderId: string;
@@ -288,7 +272,7 @@ async function insertVersionAndOp(
       authorDeviceId: actorDeviceId,
       isConflictCopy,
     });
-    const chunkHashes = [...new Set(op.payload.manifest.map((chunk: ChunkRef) => chunk.chunk_hash))];
+    const chunkHashes = [...new Set<string>(op.payload.manifest.map((chunk: ChunkRef) => chunk.chunk_hash))];
     if (chunkHashes.length > 0) {
       await tx.insert(auth.schema.versionChunks).values(
         chunkHashes.map((chunkHash) => ({
