@@ -277,15 +277,32 @@ struct MenuBarContentView: View {
     private var daemonOwnershipLine: some View {
         Group {
             if let version = store.status?.version {
-                Text(daemonManager.isManagedByValv
-                    ? "valvd \(version) - managed by Valv"
-                    : "valvd \(version) - managed externally")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(Self.daemonOwnershipText(
+                    version: version,
+                    isManagedByValv: daemonManager.isManagedByValv,
+                    updateAvailable: store.status?.updateAvailable,
+                    latestVersion: store.status?.latestVersion
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
             } else {
                 Text("Daemon not connected").font(.caption).foregroundStyle(.secondary)
             }
         }
+    }
+
+    static func daemonOwnershipText(
+        version: String,
+        isManagedByValv: Bool,
+        updateAvailable: Bool?,
+        latestVersion: String?
+    ) -> String {
+        let ownership = isManagedByValv ? "managed by Valv" : "managed externally"
+        var text = "valvd \(version) - \(ownership)"
+        if updateAvailable == true, let latestVersion {
+            text += " - Update available (\(latestVersion))"
+        }
+        return text
     }
 
     // Quit only ends the GUI process - valvd is a launchd-managed service independent
