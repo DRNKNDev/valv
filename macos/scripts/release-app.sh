@@ -37,7 +37,6 @@ crate_version() {
 usage() {
   cat >&2 <<'USAGE'
 Usage:
-  DEVELOPER_ID_APPLICATION="Developer ID Application: Name (TEAMID)" \
   APPLE_TEAM_ID="TEAMID" \
   NOTARY_PROFILE="valv-notary" \
     oss/macos/scripts/release-app.sh v0.1.0
@@ -48,20 +47,18 @@ USAGE
 }
 
 tag="${1:-}"
-identity="${DEVELOPER_ID_APPLICATION:-}"
 team_id="${APPLE_TEAM_ID:-}"
 notary_profile="${NOTARY_PROFILE:-}"
 
 [[ -n "${tag}" ]] || { usage; fail "missing tag"; }
 [[ "${tag}" == v* ]] || fail "tag must start with v (e.g. v0.1.0)"
-[[ -n "${identity}" ]] || { usage; fail "missing DEVELOPER_ID_APPLICATION"; }
 [[ -n "${team_id}" ]] || { usage; fail "missing APPLE_TEAM_ID"; }
 [[ -n "${notary_profile}" ]] || { usage; fail "missing NOTARY_PROFILE"; }
 
 need xcodebuild
 need xcrun
-need cargo
 need gh
+need tar
 need hdiutil
 need ditto
 need plutil
@@ -113,8 +110,18 @@ dmg_staging="${work_dir}/dmg"
 dmg_path="${work_dir}/Valv-${version}.dmg"
 export_plist="${work_dir}/ExportOptions.plist"
 
-echo "==> Building release valv/valvd for embedding"
-( cd "${crates_dir}" && cargo build --release -p valv-cli -p valvd )
+echo "==> Fetching signed valv/valvd from the ${tag} release for embedding"
+release_dir="${crates_dir}/target/release"
+mkdir -p "${release_dir}"
+embed_asset="valv-${version}-aarch64-apple-darwin.tar.gz"
+embed_dl="$(mktemp -d)"
+gh release download "${tag}" --repo "${repo}" --pattern "${embed_asset}" --dir "${embed_dl}"
+tar -C "${release_dir}" -xzf "${embed_dl}/${embed_asset}" valv valvd
+rm -rf "${embed_dl}"
+for embedded_bin in valvd valv; do
+  codesign -dv --verbose=2 "${release_dir}/${embedded_bin}" 2>&1 | grep -q '(runtime)' \
+    || fail "${embedded_bin} in ${embed_asset} lacks hardened runtime - run sign-cli-binaries.sh for ${tag} first"
+done
 
 echo "==> Archiving ${scheme}"
 xcodebuild archive \
@@ -123,9 +130,8 @@ xcodebuild archive \
   -configuration Release \
   -archivePath "${archive_path}" \
   -destination "generic/platform=macOS" \
-  CODE_SIGN_STYLE=Manual \
-  DEVELOPMENT_TEAM="${team_id}" \
-  "CODE_SIGN_IDENTITY=${identity}"
+  -allowProvisioningUpdates \
+  DEVELOPMENT_TEAM="${team_id}"
 
 if [[ -n "${EXPORT_OPTIONS_PLIST:-}" ]]; then
   [[ -f "${EXPORT_OPTIONS_PLIST}" ]] || fail "EXPORT_OPTIONS_PLIST not found: ${EXPORT_OPTIONS_PLIST}"
@@ -138,8 +144,7 @@ else
 <dict>
   <key>method</key><string>developer-id</string>
   <key>teamID</key><string>${team_id}</string>
-  <key>signingStyle</key><string>manual</string>
-  <key>signingCertificate</key><string>${identity}</string>
+  <key>signingStyle</key><string>automatic</string>
 </dict>
 </plist>
 PLIST
@@ -150,7 +155,8 @@ echo "==> Exporting signed app"
 xcodebuild -exportArchive \
   -archivePath "${archive_path}" \
   -exportPath "${export_dir}" \
-  -exportOptionsPlist "${export_plist}"
+  -exportOptionsPlist "${export_plist}" \
+  -allowProvisioningUpdates
 
 [[ -d "${app_path}" ]] || fail "export did not produce ${app_path}"
 
