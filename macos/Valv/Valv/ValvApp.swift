@@ -47,6 +47,7 @@ struct ValvApp: App {
     @StateObject private var store = DaemonStore.shared
     @StateObject private var daemonManager = DaemonManager.shared
     @StateObject private var domainManager = FileProviderDomainManager.shared
+    @StateObject private var updateManager = UpdateManager.shared
 
     var body: some Scene {
         MenuBarExtra {
@@ -54,6 +55,7 @@ struct ValvApp: App {
                 .environmentObject(store)
                 .environmentObject(daemonManager)
                 .environmentObject(domainManager)
+                .environmentObject(updateManager)
         } label: {
             Image(systemName: symbolName(for: store.iconState))
         }

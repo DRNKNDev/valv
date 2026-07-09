@@ -34,6 +34,7 @@ struct MenuBarContentView: View {
     @EnvironmentObject private var store: DaemonStore
     @EnvironmentObject private var daemonManager: DaemonManager
     @EnvironmentObject private var domainManager: FileProviderDomainManager
+    @EnvironmentObject private var updateManager: UpdateManager
     @State private var isConfirmingSignOut = false
     @State private var signOutError: String?
 
@@ -152,6 +153,8 @@ struct MenuBarContentView: View {
             daemonOwnershipLine
                 .padding(.horizontal, 14)
 
+            checkForUpdatesRow
+
             Divider()
 
             quitSection
@@ -177,11 +180,20 @@ struct MenuBarContentView: View {
         Self.summaryText(
             status: store.status,
             iconState: store.iconState,
-            isDisconnected: store.isDisconnected
+            isDisconnected: store.isDisconnected,
+            isRestartingDaemon: daemonManager.isRestartingDaemon
         )
     }
 
-    static func summaryText(status: DaemonStatus?, iconState: IconState, isDisconnected: Bool) -> String {
+    static func summaryText(
+        status: DaemonStatus?,
+        iconState: IconState,
+        isDisconnected: Bool,
+        isRestartingDaemon: Bool = false
+    ) -> String {
+        if isRestartingDaemon {
+            return "Restarting sync service…"
+        }
         if isDisconnected {
             return UserFacingError.connectionFailureMessage
         }
@@ -299,6 +311,25 @@ struct MenuBarContentView: View {
             text += " - Update available (\(latestVersion))"
         }
         return text
+    }
+
+    private var checkForUpdatesRow: some View {
+        Button {
+            updateManager.checkForUpdates()
+        } label: {
+            HStack {
+                Text("Check for Updates…")
+                Spacer()
+                if showsUpdateBadge {
+                    StatusBadge(color: .blue)
+                }
+            }
+        }
+        .buttonStyle(MenuItemButtonStyle())
+    }
+
+    private var showsUpdateBadge: Bool {
+        updateManager.updateAvailable || store.status?.updateRequired == true
     }
 
     private var quitSection: some View {
