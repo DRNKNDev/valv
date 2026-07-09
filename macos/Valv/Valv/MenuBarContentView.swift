@@ -1,8 +1,6 @@
 import DaemonKit
 import SwiftUI
 
-/// Mimics a native `NSMenuItem` inside `.menuBarExtraStyle(.window)`: full-width,
-/// borderless rows with an inset menu-selection highlight.
 private struct MenuItemButtonStyle: ButtonStyle {
     @State private var isHovering = false
 
@@ -62,7 +60,6 @@ struct MenuBarContentView: View {
         }
     }
 
-    // MARK: - Not signed in (collapsed state)
 
     private var notSignedInContent: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -79,7 +76,6 @@ struct MenuBarContentView: View {
         }
     }
 
-    // MARK: - Signed in
 
     private var signedInContent: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -305,8 +301,6 @@ struct MenuBarContentView: View {
         return text
     }
 
-    // Quit only ends the GUI process - valvd is a launchd-managed service independent
-    // of this app's lifecycle and keeps running/syncing after this (macos-app spec).
     private var quitSection: some View {
         VStack(alignment: .leading, spacing: 2) {
             Button("Quit Valv") {

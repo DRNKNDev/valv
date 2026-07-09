@@ -1,40 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Builds, signs, notarizes, and packages Valv.app into a Gatekeeper-clean .dmg,
-# then uploads it (plus its SHA-256) to an existing tagged GitHub Release.
-#
-# This is the macOS "app half" of the release pipeline (release-artifacts spec:
-# "The macOS app artifact is signed, notarized, and gated on first-run
-# correctness"). It is a manual/founder-run flow, NOT wired into CI, by design
-# (release-pipeline design D5): importing a Developer ID private key and a
-# notarization credential into CI carries custody risk that a scripted local
-# run avoids.
-#
-# Do not run this for a tag until `macos-first-run-fixes` has landed on that
-# tag's commit — a mis-entitled File Provider extension fails at runtime
-# regardless of notarization outcome. That change is merged as of this script
-# landing, so any tag cut from here on satisfies the gate.
-#
-# Requires (operator-held, never committed):
-#   DEVELOPER_ID_APPLICATION  "Developer ID Application: Name (TEAMID)"
-#   APPLE_TEAM_ID             the 10-char team id, e.g. ABCDE12345
-#   NOTARY_PROFILE           name of a `notarytool store-credentials` keychain
-#                            profile (App Store Connect API key or app-specific
-#                            password) — see release-pipeline task 6.1
-# Optional:
-#   VALV_GITHUB_REPO         release repo, default DRNKNDev/valv (public mirror,
-#                            where the CLI/daemon tarballs for the tag already live)
-#   EXPORT_OPTIONS_PLIST     path to your own -exportArchive options plist. The
-#                            generated default is a plain Developer ID export
-#                            (method=developer-id, manual signing). The two File
-#                            Provider extensions carry an App Group entitlement
-#                            (com.apple.security.application-groups), which is
-#                            provisioning-profile-gated even for Developer ID —
-#                            so if the export step fails matching a profile,
-#                            create Developer ID profiles for dev.drnkn.valv and
-#                            its two extension bundle ids and supply a plist with
-#                            a `provisioningProfiles` dict via this override.
 
 repo="${VALV_GITHUB_REPO:-DRNKNDev/valv}"
 scheme="Valv"
@@ -65,7 +31,6 @@ sha256_file() {
 }
 
 crate_version() {
-  # first `version = "x.y.z"` line in a Cargo.toml (the [package] version)
   awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "$1"
 }
 
@@ -105,8 +70,6 @@ need mktemp
 
 version="${tag#v}"
 
-# D6: exactly one semver across valv/valvd, and it must match the tag. Fail
-# loudly on a mismatch rather than shipping a mislabeled app.
 cli_version="$(crate_version "${crates_dir}/valv-cli/Cargo.toml")"
 daemon_version="$(crate_version "${crates_dir}/valvd/Cargo.toml")"
 [[ "${cli_version}" == "${version}" ]] ||
@@ -124,9 +87,6 @@ dmg_staging="${work_dir}/dmg"
 dmg_path="${work_dir}/Valv-${version}.dmg"
 export_plist="${work_dir}/ExportOptions.plist"
 
-# The app's "Copy Daemon Binaries" build phase embeds
-# oss/crates/target/release/{valvd,valv} at Contents/Resources/bin (the same
-# binaries the CLI/daemon tarballs ship), so build them before archiving.
 echo "==> Building release valv/valvd for embedding"
 ( cd "${crates_dir}" && cargo build --release -p valv-cli -p valvd )
 
@@ -141,12 +101,6 @@ xcodebuild archive \
   DEVELOPMENT_TEAM="${team_id}" \
   "CODE_SIGN_IDENTITY=${identity}"
 
-# Developer ID export options plist. An operator whose signing setup needs a
-# `provisioningProfiles` dict (see EXPORT_OPTIONS_PLIST note in the header, re:
-# the extensions' App Group entitlement) can supply a complete plist instead of
-# the generated default. The generated default keeps the operator's team id out
-# of the repo (matches release-pipeline task 6.2 "with a Developer ID
-# export-options plist").
 if [[ -n "${EXPORT_OPTIONS_PLIST:-}" ]]; then
   [[ -f "${EXPORT_OPTIONS_PLIST}" ]] || fail "EXPORT_OPTIONS_PLIST not found: ${EXPORT_OPTIONS_PLIST}"
   cp "${EXPORT_OPTIONS_PLIST}" "${export_plist}"
@@ -174,9 +128,6 @@ xcodebuild -exportArchive \
 
 [[ -d "${app_path}" ]] || fail "export did not produce ${app_path}"
 
-# Notarize the app (notarytool needs a container), then staple the ticket onto
-# the .app itself so it launches offline even if the enclosing dmg is not
-# stapled — release-pipeline design D5 orders this before dmg packaging.
 echo "==> Notarizing"
 ditto -c -k --keepParent "${app_path}" "${notarize_zip}"
 xcrun notarytool submit "${notarize_zip}" \
@@ -199,7 +150,6 @@ hdiutil create \
   -ov \
   "${dmg_path}"
 
-# Sanity: Gatekeeper's own assessment of the stapled app.
 spctl --assess --type execute --verbose=4 "${app_path}" 2>&1 || true
 
 digest="$(sha256_file "${dmg_path}")"
