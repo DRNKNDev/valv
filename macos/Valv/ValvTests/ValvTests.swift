@@ -1,8 +1,14 @@
 
+import Combine
 import Foundation
 import Testing
 import DaemonKit
 @testable import Valv
+
+private final class CallCounter {
+    private(set) var count = 0
+    func increment() { count += 1 }
+}
 
 struct ValvTests {
     @Test func signedInFlagRoundTripsThroughUserDefaults() throws {
@@ -124,6 +130,40 @@ struct ValvTests {
         #expect(Set([IconState.notSetUp, .error, .paused, .syncing, .synced]).count == 5)
     }
 
+    @Test func restartingDaemonCaptionTakesPrecedenceOverDisconnectedAndUpdateRequired() throws {
+        let decoder = JSONDecoder()
+        let updateRequiredStatus = try decoder.decode(DaemonStatus.self, from: Data("""
+        {
+          "paused": false,
+          "backend_connected": true,
+          "version": "0.1.0",
+          "update_required": true,
+          "mounts": []
+        }
+        """.utf8))
+
+        #expect(MenuBarContentView.summaryText(
+            status: nil,
+            iconState: .notSetUp,
+            isDisconnected: true,
+            isRestartingDaemon: true
+        ) == "Restarting sync service…")
+
+        #expect(MenuBarContentView.summaryText(
+            status: updateRequiredStatus,
+            iconState: .syncing,
+            isDisconnected: false,
+            isRestartingDaemon: true
+        ) == "Restarting sync service…")
+
+        #expect(MenuBarContentView.summaryText(
+            status: nil,
+            iconState: .notSetUp,
+            isDisconnected: true,
+            isRestartingDaemon: false
+        ) == UserFacingError.connectionFailureMessage)
+    }
+
     @Test func daemonOwnershipTextShowsUpdateAvailableIndicatorWithVersion() {
         let text = MenuBarContentView.daemonOwnershipText(
             version: "0.2.0",
@@ -178,6 +218,238 @@ struct ValvTests {
         #expect(manager.installError == "Injected install failure")
         #expect(manager.hasReconciled)
         #expect(!manager.isManagedByValv)
+    }
+
+
+    @Test func refreshStableCopyRecopiesWhenBundledIsLexicallySmallerButNewer() async throws {
+        let fixture = try makeManagedDaemonFixture(bundledVersion: "0.10.0", stableVersion: "0.9.0")
+        defer { fixture.cleanup() }
+
+        await fixture.manager.reconcileOnLaunch()
+
+        #expect(fixture.kickstartCounter.count == 1)
+        #expect(try String(contentsOf: fixture.registeredValvdURL, encoding: .utf8)
+            == String(contentsOf: fixture.bundledValvdURL, encoding: .utf8))
+    }
+
+    @Test func refreshStableCopyDoesNotRecopyWhenBundledIsLexicallyLargerButOlder() async throws {
+        let fixture = try makeManagedDaemonFixture(bundledVersion: "0.9.0", stableVersion: "0.10.0")
+        defer { fixture.cleanup() }
+        let originalStableContents = try String(contentsOf: fixture.registeredValvdURL, encoding: .utf8)
+
+        await fixture.manager.reconcileOnLaunch()
+
+        #expect(fixture.kickstartCounter.count == 0)
+        #expect(try String(contentsOf: fixture.registeredValvdURL, encoding: .utf8) == originalStableContents)
+    }
+
+    @Test func refreshStableCopyDoesNotRecopyWhenVersionsAreEqual() async throws {
+        let fixture = try makeManagedDaemonFixture(bundledVersion: "0.9.0", stableVersion: "0.9.0")
+        defer { fixture.cleanup() }
+        let originalStableContents = try String(contentsOf: fixture.registeredValvdURL, encoding: .utf8)
+
+        await fixture.manager.reconcileOnLaunch()
+
+        #expect(fixture.kickstartCounter.count == 0)
+        #expect(try String(contentsOf: fixture.registeredValvdURL, encoding: .utf8) == originalStableContents)
+    }
+
+    @Test func refreshStableCopyDoesNotRecopyWhenBundledVersionIsUnparseable() async throws {
+        let fixture = try makeManagedDaemonFixture(bundledVersion: "not-a-version", stableVersion: "0.9.0")
+        defer { fixture.cleanup() }
+        let originalStableContents = try String(contentsOf: fixture.registeredValvdURL, encoding: .utf8)
+
+        await fixture.manager.reconcileOnLaunch()
+
+        #expect(fixture.kickstartCounter.count == 0)
+        #expect(try String(contentsOf: fixture.registeredValvdURL, encoding: .utf8) == originalStableContents)
+    }
+
+
+    @Test func postLaunchReconciliationKickstartsWithoutRecopyOnRunningVersionMismatch() async throws {
+        let fixture = try makeManagedDaemonFixture(
+            bundledVersion: "0.9.0",
+            stableVersion: "0.9.0",
+            runningDaemonVersionProvider: { "0.5.0" }
+        )
+        defer { fixture.cleanup() }
+        let originalStableContents = try String(contentsOf: fixture.registeredValvdURL, encoding: .utf8)
+
+        await fixture.manager.reconcileOnLaunch()
+
+        #expect(fixture.kickstartCounter.count == 1)
+        #expect(try String(contentsOf: fixture.registeredValvdURL, encoding: .utf8) == originalStableContents)
+    }
+
+    @Test func postLaunchReconciliationDoesNothingForExternallyManagedDaemon() async throws {
+        let fixture = try makeManagedDaemonFixture(
+            bundledVersion: "0.9.0",
+            stableVersion: "0.9.0",
+            runningDaemonVersionProvider: { "0.5.0" },
+            externallyManaged: true
+        )
+        defer { fixture.cleanup() }
+
+        await fixture.manager.reconcileOnLaunch()
+
+        #expect(!fixture.manager.isManagedByValv)
+        #expect(fixture.kickstartCounter.count == 0)
+    }
+
+    private struct ManagedDaemonFixture {
+        let manager: DaemonManager
+        let homeDirectory: URL
+        let registeredValvdURL: URL
+        let bundledValvdURL: URL
+        let kickstartCounter: CallCounter
+
+        func cleanup() {
+            try? FileManager.default.removeItem(at: homeDirectory)
+        }
+    }
+
+    private func makeManagedDaemonFixture(
+        bundledVersion: String,
+        stableVersion: String,
+        runningDaemonVersionProvider: (() async -> String?)? = nil,
+        externallyManaged: Bool = false
+    ) throws -> ManagedDaemonFixture {
+        let homeDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ValvDaemonManagerVersionTests-\(UUID().uuidString)", isDirectory: true)
+
+        let bundledBinDirectory = homeDirectory.appendingPathComponent("bundled-bin", isDirectory: true)
+        let stableBinDirectory = homeDirectory
+            .appendingPathComponent("Library/Application Support/Valv/bin", isDirectory: true)
+        let launchAgentURL = homeDirectory
+            .appendingPathComponent("Library/LaunchAgents/dev.drnkn.valvd.plist")
+        let configFileURL = homeDirectory.appendingPathComponent(".config/valv/config.toml")
+
+        try FileManager.default.createDirectory(at: bundledBinDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: stableBinDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: launchAgentURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: configFileURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try "".write(to: configFileURL, atomically: true, encoding: .utf8)
+
+        let bundledValvdURL = bundledBinDirectory.appendingPathComponent("valvd")
+        let bundledValvURL = bundledBinDirectory.appendingPathComponent("valv")
+        try writeVersionScript(at: bundledValvdURL, version: bundledVersion)
+        try writeVersionScript(at: bundledValvURL, version: bundledVersion)
+
+        let registeredDirectory = externallyManaged
+            ? homeDirectory.appendingPathComponent("external-bin", isDirectory: true)
+            : stableBinDirectory
+        if externallyManaged {
+            try FileManager.default.createDirectory(at: registeredDirectory, withIntermediateDirectories: true)
+        }
+        let registeredValvdURL = registeredDirectory.appendingPathComponent("valvd")
+        try writeVersionScript(at: registeredValvdURL, version: stableVersion)
+
+        let plist: [String: Any] = ["ProgramArguments": [registeredValvdURL.path]]
+        let plistData = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try plistData.write(to: launchAgentURL)
+
+        let kickstartCounter = CallCounter()
+        let manager = DaemonManager(
+            homeDirectory: homeDirectory,
+            bundledBinDirectory: bundledBinDirectory,
+            startOnLaunch: false,
+            kickstartOperation: { kickstartCounter.increment() },
+            runningDaemonVersionProvider: runningDaemonVersionProvider ?? { nil }
+        )
+
+        return ManagedDaemonFixture(
+            manager: manager,
+            homeDirectory: homeDirectory,
+            registeredValvdURL: registeredValvdURL,
+            bundledValvdURL: bundledValvdURL,
+            kickstartCounter: kickstartCounter
+        )
+    }
+
+    private func writeVersionScript(at url: URL, version: String) throws {
+        let script = "#!/bin/sh\necho \"valvd \(version)\"\n"
+        try script.write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
+
+    @MainActor
+    @Test func updateManagerBadgeStateTransitionsFollowSparkleCallbacks() {
+        let manager = UpdateManager(updateRequiredPublisher: Empty<Bool, Never>().eraseToAnyPublisher())
+
+        #expect(!manager.isChecking)
+        manager.handleCheckStarted()
+        #expect(manager.isChecking)
+
+        manager.handleValidUpdateFound(version: "0.3.0")
+        #expect(manager.updateAvailable)
+        #expect(!manager.isChecking)
+
+        manager.handleNoUpdateFound()
+        #expect(!manager.updateAvailable)
+        #expect(!manager.isChecking)
+
+        manager.handleValidUpdateFound(version: "0.4.0")
+        #expect(manager.updateAvailable)
+    }
+
+    @MainActor
+    @Test func updateRequiredTransitionTriggersImmediateCheckExactlyOncePerRise() {
+        let triggerCounter = CallCounter()
+        let manager = UpdateManager(
+            updateRequiredPublisher: Empty<Bool, Never>().eraseToAnyPublisher(),
+            immediateCheckOperation: { triggerCounter.increment() }
+        )
+
+        manager.handleUpdateRequiredTransition(to: true)
+        #expect(triggerCounter.count == 1)
+
+        manager.handleUpdateRequiredTransition(to: true)
+        manager.handleUpdateRequiredTransition(to: true)
+        #expect(triggerCounter.count == 1)
+
+        manager.handleUpdateRequiredTransition(to: false)
+        #expect(triggerCounter.count == 1)
+
+        manager.handleUpdateRequiredTransition(to: true)
+        #expect(triggerCounter.count == 2)
+    }
+
+
+    @Test func sparkleUpdateErrorClassifiesOnlyTheExactSignatureErrorDomainAndCode() {
+        #expect(SparkleUpdateError.isSignatureVerificationFailure(
+            NSError(domain: "SUSparkleErrorDomain", code: 3001)
+        ))
+
+        #expect(!SparkleUpdateError.isSignatureVerificationFailure(
+            NSError(domain: "SUSparkleErrorDomain", code: 3000)
+        ))
+
+        #expect(!SparkleUpdateError.isSignatureVerificationFailure(
+            NSError(domain: "SUSparkleErrorDomain", code: 3002)
+        ))
+
+        #expect(!SparkleUpdateError.isSignatureVerificationFailure(
+            NSError(domain: "NSURLErrorDomain", code: 3001)
+        ))
+    }
+
+    @MainActor
+    @Test func updateManagerReactsToSignatureVerificationAbortWithoutClearingUpdateAvailable() {
+        let manager = UpdateManager(updateRequiredPublisher: Empty<Bool, Never>().eraseToAnyPublisher())
+        manager.handleValidUpdateFound(version: "0.3.0")
+        #expect(manager.updateAvailable)
+
+        manager.handleAbort(error: NSError(domain: "SUSparkleErrorDomain", code: 3001))
+        #expect(manager.verificationFailed)
+        #expect(manager.updateAvailable)
+
+        manager.handleAbort(error: NSError(domain: "NSURLErrorDomain", code: -1001))
+        #expect(!manager.verificationFailed)
     }
 
     @MainActor
