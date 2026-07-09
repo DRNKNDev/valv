@@ -46,13 +46,21 @@ fn write_launch_agent_plist(plist_path: &Path, valvd_path: &Path) -> Result<()> 
     if let Some(parent) = plist_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let contents = launch_agent_plist(valvd_path);
+    let log_dir = config::log_dir()?;
+    fs::create_dir_all(&log_dir)?;
+    let contents = launch_agent_plist(
+        valvd_path,
+        &log_dir.join("valvd.stdout.log"),
+        &log_dir.join("valvd.stderr.log"),
+    );
     fs::write(plist_path, contents)?;
     Ok(())
 }
 
-fn launch_agent_plist(valvd_path: &Path) -> String {
+fn launch_agent_plist(valvd_path: &Path, stdout_path: &Path, stderr_path: &Path) -> String {
     let valvd_path = xml_escape(&valvd_path.display().to_string());
+    let stdout_path = xml_escape(&stdout_path.display().to_string());
+    let stderr_path = xml_escape(&stderr_path.display().to_string());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -70,9 +78,9 @@ fn launch_agent_plist(valvd_path: &Path) -> String {
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/tmp/valvd.log</string>
+  <string>{stdout_path}</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/valvd.log</string>
+  <string>{stderr_path}</string>
 </dict>
 </plist>
 "#
@@ -120,10 +128,27 @@ mod tests {
 
     #[test]
     fn launch_agent_plist_contains_label_and_valvd_path() {
-        let plist = launch_agent_plist(Path::new("/tmp/valvd"));
+        let plist = launch_agent_plist(
+            Path::new("/usr/local/bin/valvd"),
+            Path::new("/Users/tester/Library/Logs/Valv/valvd.stdout.log"),
+            Path::new("/Users/tester/Library/Logs/Valv/valvd.stderr.log"),
+        );
 
         assert!(plist.contains("dev.drnkn.valvd"));
-        assert!(plist.contains("<string>/tmp/valvd</string>"));
+        assert!(plist.contains("<string>/usr/local/bin/valvd</string>"));
         assert!(plist.contains("<string>run</string>"));
+    }
+
+    #[test]
+    fn launch_agent_plist_uses_user_log_dir_not_tmp() {
+        let plist = launch_agent_plist(
+            Path::new("/usr/local/bin/valvd"),
+            Path::new("/Users/tester/Library/Logs/Valv/valvd.stdout.log"),
+            Path::new("/Users/tester/Library/Logs/Valv/valvd.stderr.log"),
+        );
+
+        assert!(plist.contains("<string>/Users/tester/Library/Logs/Valv/valvd.stdout.log</string>"));
+        assert!(plist.contains("<string>/Users/tester/Library/Logs/Valv/valvd.stderr.log</string>"));
+        assert!(!plist.contains("/tmp"));
     }
 }

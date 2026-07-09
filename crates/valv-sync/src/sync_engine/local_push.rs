@@ -30,6 +30,7 @@ use crate::{
 pub struct PushSummary {
     pub creates_submitted: u64,
     pub versions_submitted: u64,
+    pub deletes_submitted: u64,
     pub skipped: u64,
     pub errors: u64,
 }
@@ -566,7 +567,7 @@ async fn submit_deletes_for_missing(
                 Ok(SubmitOpResponse::Applied { server_seq, .. }) => {
                     let conn = db.lock().await;
                     nodes::mark_deleted(&conn, &node.node_id, server_seq)?;
-                    summary.creates_submitted += 1;
+                    summary.deletes_submitted += 1;
                 }
                 Ok(SubmitOpResponse::Superseded { .. } | SubmitOpResponse::ConflictCopy { .. }) => {
                     summary.skipped += 1;
@@ -1280,6 +1281,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.errors, 0);
+        assert_eq!(summary.creates_submitted, 0);
+        assert_eq!(summary.deletes_submitted, 1);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["op_type"], "delete");
         assert_eq!(requests[0]["node_id"], "file-node");
@@ -1333,6 +1336,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.errors, 0);
+        assert_eq!(summary.creates_submitted, 0);
+        assert_eq!(summary.deletes_submitted, 2);
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0]["node_id"], "folder-node");
         assert_eq!(requests[1]["node_id"], "nested-file");
@@ -1367,7 +1372,7 @@ mod tests {
         ])
         .await;
 
-        push_local(
+        let summary = push_local(
             dir.path(),
             "folder-1",
             None,
@@ -1384,6 +1389,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        assert_eq!(summary.creates_submitted, 0);
+        assert_eq!(summary.deletes_submitted, 2);
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0]["node_id"], "parent-folder");
         assert_eq!(requests[1]["node_id"], "child-file");
@@ -1474,6 +1481,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.errors, 0);
+        assert_eq!(summary.creates_submitted, 0);
+        assert_eq!(summary.deletes_submitted, 1);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["node_id"], "file-a");
         assert!(node(&db, "file-a").await.deleted_at.is_some());
@@ -1616,6 +1625,8 @@ mod tests {
         assert_eq!(requests[1]["node_id"], "nested-file");
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.errors, 0);
+        assert_eq!(summary.creates_submitted, 0);
+        assert_eq!(summary.deletes_submitted, 1);
         assert!(node(&db, "folder-node").await.deleted_at.is_none());
         assert!(node(&db, "nested-file").await.deleted_at.is_some());
     }
@@ -1697,6 +1708,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.errors, 1);
+        assert_eq!(summary.deletes_submitted, 1);
         assert_eq!(
             requests
                 .iter()

@@ -9,6 +9,10 @@
     "sourceMap": true,
     "rootDir": "src",
     "outDir": "dist",
+    "baseUrl": ".",
+    "paths": {
+      "@valv/contracts-sync": ["contracts/sync/src/index.ts"]
+    },
     "skipLibCheck": true
   }
 }

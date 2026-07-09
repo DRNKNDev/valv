@@ -61,7 +61,7 @@ pub async fn fs_watch_task(
     token: String,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(256);
-    watch_mount(&mount.path, tx, paused.clone(), fs_events_paused.clone())?;
+    let _watcher = watch_mount(&mount.path, tx, paused.clone(), fs_events_paused.clone())?;
     let mut dropped_paused_events = false;
 
     loop {
@@ -105,7 +105,7 @@ pub fn watch_mount(
     tx: mpsc::Sender<FsEvent>,
     paused: Arc<AtomicBool>,
     fs_events_paused: Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<RecommendedWatcher> {
     let sender = tx.clone();
     let mut watcher = RecommendedWatcher::new(
         move |result: notify::Result<Event>| {
@@ -122,11 +122,7 @@ pub fn watch_mount(
         Config::default(),
     )?;
     watcher.watch(path, RecursiveMode::Recursive)?;
-
-    // notify drops its OS watcher when the Rust watcher is dropped. The daemon
-    // owns watcher lifetime at process scope, so intentionally keep it alive.
-    Box::leak(Box::new(watcher));
-    Ok(())
+    Ok(watcher)
 }
 
 pub async fn debounce_next_batch(rx: &mut mpsc::Receiver<FsEvent>) -> Option<Vec<FsEvent>> {
@@ -750,6 +746,28 @@ mod tests {
             Event::new(EventKind::Remove(notify::event::RemoveKind::File)).add_path(path.clone());
 
         assert_eq!(map_notify_event(event), Some(FsEvent::Delete(path)));
+    }
+
+    #[tokio::test]
+    async fn fs_watch_task_aborts_cleanly_and_drops_owned_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = tokio::spawn(fs_watch_task(
+            watch_mount(dir.path()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            seeded_db(),
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".into(),
+            "token".into(),
+        ));
+
+        // notify's platform watcher handles are opaque, so the portable assertion
+        // is that aborting the task drops its future state, including `_watcher`.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let error = task.await.unwrap_err();
+
+        assert!(error.is_cancelled());
     }
 
     #[test]

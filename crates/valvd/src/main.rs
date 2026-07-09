@@ -27,7 +27,7 @@ use tokio::{
     sync::{Mutex, Notify},
     task::JoinHandle,
 };
-use tracing_subscriber::{filter::LevelFilter, EnvFilter};
+use tracing_subscriber::{filter::LevelFilter, prelude::*, EnvFilter};
 use valv_sync::{
     persistence::{mounts as mount_store, open_db},
     protocol::ipc::{AccountStatus, MountStatus},
@@ -173,7 +173,47 @@ fn init_tracing() {
     let filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    #[cfg(target_os = "macos")]
+    {
+        let stdout_layer = tracing_subscriber::fmt::layer();
+        let log_dir = match config::log_dir() {
+            Ok(log_dir) => log_dir,
+            Err(error) => {
+                eprintln!("failed to resolve valvd log directory: {error}");
+                tracing_subscriber::registry()
+                    .with(filter)
+                    .with(stdout_layer)
+                    .init();
+                return;
+            }
+        };
+        if let Err(error) = fs::create_dir_all(&log_dir)
+            .and_then(|_| config::prune_old_logs(&log_dir).map_err(std::io::Error::other))
+        {
+            eprintln!("failed to prepare valvd log directory: {error}");
+        }
+        let file_appender = tracing_appender::rolling::daily(&log_dir, "valvd.log");
+        let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+        Box::leak(Box::new(guard));
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(file_writer);
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(stdout_layer)
+            .with(file_layer)
+            .init();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux intentionally keeps journald as the only persistent log store for
+        // systemd user units; adding a second in-process file sink would duplicate
+        // journal capture and rotation rather than solve the macOS launchd gap.
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
 }
 
 async fn run() -> Result<()> {
