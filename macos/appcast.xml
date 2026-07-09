@@ -1,9 +1,14 @@
-<?xml version="1.0" encoding="utf-8"?>
-<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
-  <channel>
-    <title>Valv</title>
-    <link>https://valvsync.com/appcast.xml</link>
-    <description>Valv.app updates.</description>
-    <language>en</language>
-  </channel>
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Valv</title>
+        <item>
+            <title>0.2.0</title>
+            <pubDate>Thu, 09 Jul 2026 21:47:39 +0700</pubDate>
+            <sparkle:version>1</sparkle:version>
+            <sparkle:shortVersionString>0.2.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.2</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/DRNKNDev/valv/releases/download/v0.2.0/Valv-0.2.0.dmg" length="15726868" type="application/octet-stream" sparkle:edSignature="TKGLJXokWZm6/FVUPpXVke+n2i+eEOdiDX0pTq0x7eJ+k4cxoSJ8lse0znwu1rs0CaPkRvCgHQI2rtPbrW3/Cw=="/>
+        </item>
+    </channel>
 </rss>
