@@ -444,6 +444,50 @@ struct ValvTests {
         #expect(triggerCounter.count == 2)
     }
 
+    @MainActor
+    @Test func updateRequiredPublisherWiringTriggersImmediateCheck() async {
+        let triggerCounter = CallCounter()
+        let subject = PassthroughSubject<Bool, Never>()
+        let manager = UpdateManager(
+            updateRequiredPublisher: subject.eraseToAnyPublisher(),
+            immediateCheckOperation: { triggerCounter.increment() }
+        )
+
+        subject.send(false)
+        #expect(triggerCounter.count == 0)
+
+        subject.send(true)
+        #expect(triggerCounter.count == 1)
+        #expect(manager.updateRequired)
+
+        subject.send(true)
+        #expect(triggerCounter.count == 1)
+        subject.send(false)
+        subject.send(true)
+        #expect(triggerCounter.count == 2)
+    }
+
+    @MainActor
+    @Test func manualCheckForUpdatesFiresSeamAndFlipsIsChecking() {
+        let manualCounter = CallCounter()
+        let manager = UpdateManager(
+            updateRequiredPublisher: Empty<Bool, Never>().eraseToAnyPublisher(),
+            manualCheckOperation: { manualCounter.increment() }
+        )
+
+        #expect(!manager.isChecking)
+        manager.checkForUpdates()
+        #expect(manualCounter.count == 1)
+        #expect(manager.isChecking)
+    }
+
+    @Test func updateBadgeShowsWhenEitherUpdateAvailableOrUpdateRequired() {
+        #expect(!MenuBarContentView.showsUpdateBadge(updateAvailable: false, updateRequired: false))
+        #expect(MenuBarContentView.showsUpdateBadge(updateAvailable: true, updateRequired: false))
+        #expect(MenuBarContentView.showsUpdateBadge(updateAvailable: false, updateRequired: true))
+        #expect(MenuBarContentView.showsUpdateBadge(updateAvailable: true, updateRequired: true))
+    }
+
 
     @Test func sparkleUpdateErrorClassifiesOnlyTheExactSignatureErrorDomainAndCode() {
         #expect(SparkleUpdateError.isSignatureVerificationFailure(

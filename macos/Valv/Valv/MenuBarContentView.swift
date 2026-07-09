@@ -329,7 +329,14 @@ struct MenuBarContentView: View {
     }
 
     private var showsUpdateBadge: Bool {
-        updateManager.updateAvailable || store.status?.updateRequired == true
+        Self.showsUpdateBadge(
+            updateAvailable: updateManager.updateAvailable,
+            updateRequired: store.status?.updateRequired == true
+        )
+    }
+
+    static func showsUpdateBadge(updateAvailable: Bool, updateRequired: Bool) -> Bool {
+        updateAvailable || updateRequired
     }
 
     private var quitSection: some View {
