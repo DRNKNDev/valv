@@ -110,18 +110,18 @@ dmg_staging="${work_dir}/dmg"
 dmg_path="${work_dir}/Valv-${version}.dmg"
 export_plist="${work_dir}/ExportOptions.plist"
 
-echo "==> Fetching signed valv/valvd from the ${tag} release for embedding"
+echo "==> Embedding signed valv/valvd left by sign-cli-binaries.sh"
 release_dir="${crates_dir}/target/release"
-mkdir -p "${release_dir}"
-embed_asset="valv-${version}-aarch64-apple-darwin.tar.gz"
-embed_dl="$(mktemp -d)"
-gh release download "${tag}" --repo "${repo}" --pattern "${embed_asset}" --dir "${embed_dl}"
-tar -C "${release_dir}" -xzf "${embed_dl}/${embed_asset}" valv valvd
-rm -rf "${embed_dl}"
+signed_dir="${crates_dir}/target/signed-cli"
 for embedded_bin in valvd valv; do
-  codesign -dv --verbose=2 "${release_dir}/${embedded_bin}" 2>&1 | grep -q '(runtime)' \
-    || fail "${embedded_bin} in ${embed_asset} lacks hardened runtime - run sign-cli-binaries.sh for ${tag} first"
+  [[ -x "${signed_dir}/${embedded_bin}" ]] \
+    || fail "${signed_dir}/${embedded_bin} not found - run sign-cli-binaries.sh for ${tag} first"
+  sig="$(codesign -dv --verbose=2 "${signed_dir}/${embedded_bin}" 2>&1 || true)"
+  [[ "${sig}" == *"(runtime)"* ]] \
+    || fail "${signed_dir}/${embedded_bin} lacks hardened runtime - re-run sign-cli-binaries.sh for ${tag}"
 done
+mkdir -p "${release_dir}"
+cp "${signed_dir}/valv" "${signed_dir}/valvd" "${release_dir}/"
 
 echo "==> Archiving ${scheme}"
 xcodebuild archive \
