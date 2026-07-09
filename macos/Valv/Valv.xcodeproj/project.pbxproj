@@ -13,6 +13,7 @@
 		FB5243C32FF7B11700C299B8 /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FB5243C22FF7B11700C299B8 /* UniformTypeIdentifiers.framework */; };
 		FB5243CF2FF7B11700C299B8 /* ValvFileProvider.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = FB5243C02FF7B11700C299B8 /* ValvFileProvider.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		FB5243E72FF7B24600C299B8 /* ValvFileProviderUI.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = FB5243D92FF7B24600C299B8 /* ValvFileProviderUI.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		FBE3EF312FFFC87700888CD6 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = FBE3EF302FFFC87700888CD6 /* Sparkle */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -137,6 +138,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				8495E49467511E5F9F6B7CC5 /* DaemonKit in Frameworks */,
+				FBE3EF312FFFC87700888CD6 /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -232,6 +234,7 @@
 			name = Valv;
 			packageProductDependencies = (
 				218055D4D13F74307806BF25 /* DaemonKit */,
+				FBE3EF302FFFC87700888CD6 /* Sparkle */,
 			);
 			productName = Valv;
 			productReference = FB5243902FF7B09900C299B8 /* Valv.app */;
@@ -369,6 +372,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				8BD78AFBF91251ED3D7BCB30 /* XCLocalSwiftPackageReference "../DaemonKit" */,
+				FBE3EF2F2FFFC87700888CD6 /* XCRemoteSwiftPackageReference "Sparkle" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = FB5243912FF7B09900C299B8 /* Products */;
@@ -969,6 +973,17 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		FBE3EF2F2FFFC87700888CD6 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.9.4;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		1725C69B19D99BAD576DFB24 /* DaemonKit */ = {
 			isa = XCSwiftPackageProductDependency;
@@ -984,6 +999,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 8BD78AFBF91251ED3D7BCB30 /* XCLocalSwiftPackageReference "../DaemonKit" */;
 			productName = DaemonKit;
+		};
+		FBE3EF302FFFC87700888CD6 /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = FBE3EF2F2FFFC87700888CD6 /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
