@@ -13,5 +13,11 @@
 			</array>
 		</dict>
 	</array>
+	<key>SUFeedURL</key>
+	<string>https://valvsync.com/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>FcdndgsVICc2oaKuK6GvV7TmKnlNbTUrn2jrc6Ftyl0=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
 </dict>
 </plist>
