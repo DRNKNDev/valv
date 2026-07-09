@@ -10,11 +10,13 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+hex = "0.4"
 hyper-util = { version = "0.1", features = ["tokio", "client", "http1"] }
 indicatif = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "macos-system-configuration"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 toml = "1.1.2"
 tracing = "0.1"
@@ -22,3 +24,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 valv-sync = { version = "0.0.0", path = "../valv-sync" }
+
+[dev-dependencies]
+tempfile = "3"

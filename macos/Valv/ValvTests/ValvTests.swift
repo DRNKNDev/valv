@@ -130,6 +130,36 @@ struct ValvTests {
         #expect(Set([IconState.notSetUp, .error, .paused, .syncing, .synced]).count == 5)
     }
 
+    @Test func daemonOwnershipTextShowsUpdateAvailableIndicatorWithVersion() {
+        let text = MenuBarContentView.daemonOwnershipText(
+            version: "0.2.0",
+            isManagedByValv: true,
+            updateAvailable: true,
+            latestVersion: "0.3.0"
+        )
+        #expect(text == "valvd 0.2.0 - managed by Valv - Update available (0.3.0)")
+    }
+
+    @Test func daemonOwnershipTextOmitsIndicatorWhenUpdateAvailableIsFalse() {
+        let text = MenuBarContentView.daemonOwnershipText(
+            version: "0.2.0",
+            isManagedByValv: true,
+            updateAvailable: false,
+            latestVersion: "0.2.0"
+        )
+        #expect(text == "valvd 0.2.0 - managed by Valv")
+    }
+
+    @Test func daemonOwnershipTextOmitsIndicatorWhenFieldsAreAbsent() {
+        let text = MenuBarContentView.daemonOwnershipText(
+            version: "0.2.0",
+            isManagedByValv: false,
+            updateAvailable: nil,
+            latestVersion: nil
+        )
+        #expect(text == "valvd 0.2.0 - managed externally")
+    }
+
     @Test func cleanInstallFailureSetsInstallErrorAndReconcileStillSettles() async {
         let homeDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ValvDaemonManagerTests-\(UUID().uuidString)", isDirectory: true)

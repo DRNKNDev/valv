@@ -11,6 +11,8 @@ SMOKE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SMOKE_DIR}/../../.." && pwd)
 REAL_HOME=${HOME:-}
 
+export VALV_NO_UPDATE_CHECK=1
+
 source "${SMOKE_DIR}/helpers.sh"
 
 find_tool() {

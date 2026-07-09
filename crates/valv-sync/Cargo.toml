@@ -10,6 +10,7 @@ chrono = { version = "0.4", features = ["serde"] }
 fastcdc = "3"
 futures-util = { version = "0.3", features = ["sink"] }
 hex = "0.4"
+minisign-verify = "0.2"
 notify = "6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }

@@ -97,10 +97,26 @@ pub(crate) fn socket_path() -> Result<PathBuf> {
         .join("valvd.sock"))
 }
 
-fn home_dir() -> Result<PathBuf> {
+pub(crate) fn local_state_dir() -> Result<PathBuf> {
+    Ok(home_dir()
+        .context("failed to determine home directory for local state path")?
+        .join(".local/share/valv"))
+}
+
+pub(crate) fn home_dir() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("HOME is not set"))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn app_managed_bin_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join("Library/Application Support/Valv/bin"))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn launch_agent_plist_path() -> Result<PathBuf> {
+    Ok(home_dir()?.join("Library/LaunchAgents/dev.drnkn.valvd.plist"))
 }
 
 #[cfg(test)]
