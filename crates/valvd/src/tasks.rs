@@ -176,6 +176,10 @@ pub(crate) fn spawn_update_check_task(state: &DaemonState) -> tokio::task::JoinH
     })
 }
 
+pub(crate) fn should_spawn_update_check(no_update_check_env: Option<&str>) -> bool {
+    no_update_check_env != Some("1")
+}
+
 async fn update_check_loop(state: DaemonState) {
     let jitter = random_jitter(UPDATE_CHECK_JITTER);
     let period = UPDATE_CHECK_BASE_PERIOD + jitter;
@@ -1557,6 +1561,27 @@ mod tests {
         let (latest_version, update_available) = state.update_status.lock().await.as_status_fields();
         assert_eq!(latest_version.as_deref(), Some("42.0.0"));
         assert_eq!(update_available, Some(true));
+    }
+
+    #[test]
+    fn should_spawn_update_check_only_suppresses_on_exactly_one() {
+        assert!(should_spawn_update_check(None));
+        assert!(should_spawn_update_check(Some("0")));
+        assert!(should_spawn_update_check(Some("true")));
+        assert!(!should_spawn_update_check(Some("1")));
+    }
+
+    #[test]
+    fn random_jitter_stays_within_bounds() {
+        let max = Duration::from_secs(100);
+        for _ in 0..1000 {
+            assert!(random_jitter(max) < max);
+        }
+    }
+
+    #[test]
+    fn random_jitter_of_zero_max_is_zero() {
+        assert_eq!(random_jitter(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]

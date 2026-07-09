@@ -267,7 +267,8 @@ async fn run() -> Result<()> {
     // VALV_NO_UPDATE_CHECK=1 disables this task entirely at startup (checked
     // once here, not a live toggle) so smoke/e2e runs never make a live
     // GitHub API call (daemon-lifecycle capability).
-    let _update_check_task = if std::env::var("VALV_NO_UPDATE_CHECK").as_deref() != Ok("1") {
+    let no_update_check = std::env::var("VALV_NO_UPDATE_CHECK").ok();
+    let _update_check_task = if tasks::should_spawn_update_check(no_update_check.as_deref()) {
         Some(spawn_update_check_task(&state))
     } else {
         None
