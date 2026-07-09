@@ -296,6 +296,25 @@ struct ValvTests {
         #expect(fixture.kickstartCounter.count == 0)
     }
 
+    @Test func kickstartBoundedTimeoutClearsFlagEvenWhenKickstartHangs() async throws {
+        let slowKickstartNanoseconds: UInt64 = 5_000_000_000
+        let boundedTimeoutNanoseconds: UInt64 = 50_000_000
+        let fixture = try makeManagedDaemonFixture(
+            bundledVersion: "0.10.0",
+            stableVersion: "0.9.0",
+            kickstartOperation: { try? await Task.sleep(nanoseconds: slowKickstartNanoseconds) },
+            kickstartTimeoutNanoseconds: boundedTimeoutNanoseconds
+        )
+        defer { fixture.cleanup() }
+
+        let start = DispatchTime.now()
+        await fixture.manager.reconcileOnLaunch()
+        let elapsedNanoseconds = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
+
+        #expect(elapsedNanoseconds < 1_000_000_000)
+        #expect(!fixture.manager.isRestartingDaemon)
+    }
+
     private struct ManagedDaemonFixture {
         let manager: DaemonManager
         let homeDirectory: URL
@@ -312,7 +331,9 @@ struct ValvTests {
         bundledVersion: String,
         stableVersion: String,
         runningDaemonVersionProvider: (() async -> String?)? = nil,
-        externallyManaged: Bool = false
+        externallyManaged: Bool = false,
+        kickstartOperation: (() async throws -> Void)? = nil,
+        kickstartTimeoutNanoseconds: UInt64 = DaemonManager.defaultKickstartTimeoutNanoseconds
     ) throws -> ManagedDaemonFixture {
         let homeDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ValvDaemonManagerVersionTests-\(UUID().uuidString)", isDirectory: true)
@@ -357,8 +378,12 @@ struct ValvTests {
             homeDirectory: homeDirectory,
             bundledBinDirectory: bundledBinDirectory,
             startOnLaunch: false,
-            kickstartOperation: { kickstartCounter.increment() },
-            runningDaemonVersionProvider: runningDaemonVersionProvider ?? { nil }
+            kickstartOperation: {
+                kickstartCounter.increment()
+                try await kickstartOperation?()
+            },
+            runningDaemonVersionProvider: runningDaemonVersionProvider ?? { nil },
+            kickstartTimeoutNanoseconds: kickstartTimeoutNanoseconds
         )
 
         return ManagedDaemonFixture(

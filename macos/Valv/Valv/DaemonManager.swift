@@ -43,7 +43,7 @@ final class DaemonManager: ObservableObject {
     @Published private(set) var hasReconciled = false
     @Published private(set) var isRestartingDaemon = false
 
-    private static let kickstartBoundedTimeoutNanoseconds: UInt64 = 5_000_000_000
+    static let defaultKickstartTimeoutNanoseconds: UInt64 = 5_000_000_000
 
     private let fileManager: FileManager
     private let homeDirectory: URL
@@ -51,6 +51,7 @@ final class DaemonManager: ObservableObject {
     private let cleanInstallOperation: ((Bool) async throws -> Void)?
     private let kickstartOperation: (() async throws -> Void)?
     private let runningDaemonVersionProvider: (() async -> String?)?
+    private let kickstartTimeoutNanoseconds: UInt64
     private let client: DaemonClient
 
     init(
@@ -61,7 +62,8 @@ final class DaemonManager: ObservableObject {
         startOnLaunch: Bool = true,
         cleanInstallOperation: ((Bool) async throws -> Void)? = nil,
         kickstartOperation: (() async throws -> Void)? = nil,
-        runningDaemonVersionProvider: (() async -> String?)? = nil
+        runningDaemonVersionProvider: (() async -> String?)? = nil,
+        kickstartTimeoutNanoseconds: UInt64 = DaemonManager.defaultKickstartTimeoutNanoseconds
     ) {
         self.client = client
         self.fileManager = fileManager
@@ -70,6 +72,7 @@ final class DaemonManager: ObservableObject {
         self.cleanInstallOperation = cleanInstallOperation
         self.kickstartOperation = kickstartOperation
         self.runningDaemonVersionProvider = runningDaemonVersionProvider
+        self.kickstartTimeoutNanoseconds = kickstartTimeoutNanoseconds
         if startOnLaunch {
             Task { [weak self] in
                 await self?.reconcileOnLaunch()
@@ -192,22 +195,42 @@ final class DaemonManager: ObservableObject {
     // launchctl waitUntilExit is not cancellable; bound it with a detached timeout race.
     private func kickstartDaemonBounded() async {
         isRestartingDaemon = true
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { [weak self] in
-                guard let self else { return }
-                do {
-                    try await self.performKickstart()
-                } catch {
-                    NSLog("DaemonManager: kickstart failed: %@", error.localizedDescription)
-                }
+
+        let kickstartTask = Task { [weak self] in
+            do {
+                try await self?.performKickstart()
+            } catch {
+                NSLog("DaemonManager: kickstart failed: %@", error.localizedDescription)
             }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: Self.kickstartBoundedTimeoutNanoseconds)
-            }
-            _ = await group.next()
-            group.cancelAll()
         }
+
+        let timeoutNanoseconds = kickstartTimeoutNanoseconds
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let once = KickstartResumeOnce()
+            Task {
+                _ = await kickstartTask.value
+                if once.fireIfFirst() { continuation.resume() }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                if once.fireIfFirst() { continuation.resume() }
+            }
+        }
+
         isRestartingDaemon = false
+    }
+
+    private final class KickstartResumeOnce: @unchecked Sendable {
+        private let lock = NSLock()
+        private var hasFired = false
+
+        func fireIfFirst() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if hasFired { return false }
+            hasFired = true
+            return true
+        }
     }
 
     private func performKickstart() async throws {
