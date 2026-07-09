@@ -479,6 +479,8 @@ mod tests {
                 error: None,
             }],
             account: None,
+            latest_version: None,
+            update_available: None,
         };
 
         let output = status_json(&status).unwrap();

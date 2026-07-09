@@ -155,11 +155,6 @@ public struct FpItem: Codable, Hashable, Sendable {
 
     public let nodeId: String
     public let parentId: String?
-    /// Which mount this node belongs to. Lets callers resolve "which mount is this
-    /// item under" directly from the item, without a separate lookup or a
-    /// client-maintained cache - needed since `GET /fp/items`/`GET /fp/anchor`/etc.
-    /// all require `folder_id` explicitly once more than one folder is mounted (always
-    /// true for `ValvFileProvider`'s synthetic multi-mount root, design.md D11).
     public let folderId: String
     public let name: String
     public let type: ItemType

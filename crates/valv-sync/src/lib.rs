@@ -6,6 +6,7 @@ pub mod persistence;
 pub mod protocol;
 pub mod storage;
 pub mod sync_engine;
+pub mod update;
 pub mod watch;
 
 pub fn api_base(backend_url: &str) -> String {

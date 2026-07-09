@@ -9,9 +9,6 @@ pub struct MountStatus {
     pub scope_node_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grant_id: Option<String>,
-    // Was already tracked internally on MountState (used by GET /fp/items, GET
-    // /fp/anchor) but never surfaced here - needed so a client (the macOS menu bar,
-    // phase-5-macos-gui) can badge a read-only mount without a per-mount extra call.
     pub can_write: bool,
     pub syncing: bool,
     pub pending_ops: u64,
@@ -39,6 +36,10 @@ pub struct DaemonStatus {
     pub mounts: Vec<MountStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<AccountStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_available: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
