@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use bytes::{Bytes, BytesMut};
 use reqwest::header::{HeaderName, HeaderValue};
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
 use crate::{
     chunking::Chunk,
@@ -132,6 +133,15 @@ pub async fn download_chunks(
             .error_for_status()?
             .bytes()
             .await?;
+        let actual_hash = hex::encode(Sha256::digest(&chunk_bytes));
+        if actual_hash != chunk_ref.chunk_hash {
+            return Err(anyhow!(
+                "chunk hash mismatch for {}: expected {}, got {}",
+                object.oid,
+                chunk_ref.chunk_hash,
+                actual_hash
+            ));
+        }
         bytes.extend_from_slice(&chunk_bytes);
     }
 
@@ -222,12 +232,101 @@ mod tests {
         assert!(!crate::persistence::chunks::is_uploaded(&conn, "dedup").unwrap());
     }
 
+    #[tokio::test]
+    async fn download_rejects_chunk_hash_mismatch() {
+        let state = Arc::new(Mutex::new(MockDownloadState {
+            chunks: HashMap::from([("expected".to_owned(), Bytes::from_static(b"wrong"))]),
+            get_count: 0,
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let server_state = state.clone();
+        let server_url = base_url.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                handle_download_connection(stream, server_state.clone(), server_url.clone()).await;
+            }
+        });
+
+        let error = download_chunks(
+            &reqwest::Client::new(),
+            &base_url,
+            "token",
+            &[ChunkRef {
+                chunk_hash: "expected".into(),
+                offset: 0,
+                length: 5,
+            }],
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.to_string().contains("chunk hash mismatch"));
+        assert_eq!(state.lock().await.get_count, 1);
+    }
+
+    #[tokio::test]
+    async fn download_reassembles_matching_hashes_in_offset_order() {
+        let first_hash = hex::encode(Sha256::digest(b"first"));
+        let second_hash = hex::encode(Sha256::digest(b"second"));
+        let state = Arc::new(Mutex::new(MockDownloadState {
+            chunks: HashMap::from([
+                (first_hash.clone(), Bytes::from_static(b"first")),
+                (second_hash.clone(), Bytes::from_static(b"second")),
+            ]),
+            get_count: 0,
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let server_state = state.clone();
+        let server_url = base_url.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                handle_download_connection(stream, server_state.clone(), server_url.clone()).await;
+            }
+        });
+
+        let bytes = download_chunks(
+            &reqwest::Client::new(),
+            &base_url,
+            "token",
+            &[
+                ChunkRef {
+                    chunk_hash: second_hash,
+                    offset: 5,
+                    length: 6,
+                },
+                ChunkRef {
+                    chunk_hash: first_hash,
+                    offset: 0,
+                    length: 5,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(&bytes[..], b"firstsecond");
+        assert_eq!(state.lock().await.get_count, 2);
+    }
+
     #[derive(Default)]
     struct MockState {
         batch_transfer: Option<String>,
         put_count: usize,
         put_headers: HashMap<String, String>,
         put_body: Vec<u8>,
+    }
+
+    struct MockDownloadState {
+        chunks: HashMap<String, Bytes>,
+        get_count: usize,
     }
 
     async fn handle_connection(
@@ -249,6 +348,42 @@ mod tests {
             state.put_headers = headers;
             state.put_body = body;
             write_response(&mut stream, "204 No Content", b"").await;
+        } else {
+            write_response(&mut stream, "404 Not Found", b"").await;
+        }
+    }
+
+    async fn handle_download_connection(
+        mut stream: TcpStream,
+        state: Arc<Mutex<MockDownloadState>>,
+        base_url: String,
+    ) {
+        let (method, path, _headers, _body) = read_request(&mut stream).await;
+        if method == "POST" && path == "/api/objects/batch" {
+            let chunks = state
+                .lock()
+                .await
+                .chunks
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            let objects = chunks
+                .iter()
+                .map(|hash| {
+                    format!(
+                        r#"{{"oid":"{hash}","size":0,"actions":{{"download":{{"href":"{base_url}/download/{hash}"}}}}}}"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let response = format!(r#"{{"transfer":"basic","objects":[{objects}]}}"#);
+            write_response(&mut stream, "200 OK", response.as_bytes()).await;
+        } else if method == "GET" && path.starts_with("/download/") {
+            let hash = path.trim_start_matches("/download/");
+            let mut state = state.lock().await;
+            state.get_count += 1;
+            let bytes = state.chunks.get(hash).cloned().unwrap_or_default();
+            write_response(&mut stream, "200 OK", &bytes).await;
         } else {
             write_response(&mut stream, "404 Not Found", b"").await;
         }

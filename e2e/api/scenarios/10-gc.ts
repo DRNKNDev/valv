@@ -32,7 +32,12 @@ export function gcScenarios(harness: SeededHarness): void {
         based_on_seq: file.server_seq,
         payload: {},
       });
-      vi.useFakeTimers();
+      // Scoped to setInterval/clearInterval/Date only - startGc only ever uses setInterval, and
+      // the Postgres Pool driver (@neondatabase/serverless) schedules its own connection-idle/
+      // timeout bookkeeping via real setTimeout calls. Faking setTimeout globally here would trap
+      // those in fake-timer land, so pool.end() in this file's afterAll hangs waiting on a timeout
+      // callback that never fires once vi.useRealTimers() restores the real (but now stale) clock.
+      vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
       vi.setSystemTime(Date.now() + 1_000);
 
       stopGc = startGc(ctx.db as Parameters<typeof startGc>[0], ctx.s3 as Parameters<typeof startGc>[1], ctx.bucket, undefined, {

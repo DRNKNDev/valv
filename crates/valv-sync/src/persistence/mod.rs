@@ -6,6 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 
 use crate::protocol::sync::{FolderTreeResponse, NodeSnapshot, NodeType, OpLogEntry};
+use crate::sync_engine::update_required::UpdateRequired;
 
 pub mod chunks;
 pub mod mounts;
@@ -30,26 +31,18 @@ pub fn open_db(path: &Path) -> Result<Connection> {
         Connection::open(path).with_context(|| format!("open sqlite db {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(schema_sql())?;
-    add_column_if_missing(&conn, "mounts", "scope_node_id", "TEXT")?;
-    add_column_if_missing(&conn, "mounts", "mount_token", "TEXT")?;
-    add_column_if_missing(&conn, "mounts", "can_write", "INTEGER NOT NULL DEFAULT 1")?;
-    add_column_if_missing(&conn, "mounts", "name", "TEXT")?;
     Ok(conn)
-}
-
-fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ty: &str) -> Result<()> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if !columns.iter().any(|name| name == column) {
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"), [])?;
-    }
-    Ok(())
 }
 
 pub fn apply_op_log_entry(conn: &Connection, entry: &OpLogEntry) -> Result<Option<LocalNode>> {
     let pre_op = nodes::get_node(conn, &entry.node_id)?;
+    if entry.op_type != "create"
+        && pre_op
+            .as_ref()
+            .is_some_and(|node| node.server_seq >= entry.server_seq)
+    {
+        return Ok(pre_op);
+    }
     match entry.op_type.as_str() {
         "create" => apply_create(conn, entry)?,
         "rename" => {
@@ -74,7 +67,7 @@ pub fn apply_op_log_entry(conn: &Connection, entry: &OpLogEntry) -> Result<Optio
             )?;
         }
         "new_version" => apply_new_version(conn, entry)?,
-        other => return Err(anyhow!("unsupported op_type `{other}`")),
+        other => return Err(anyhow!(UpdateRequired::unrecognized_op_type(other))),
     };
     Ok(pre_op)
 }
@@ -231,11 +224,41 @@ mod tests {
 
     use super::*;
     use crate::protocol::sync::{FolderTreeResponse, NodeSnapshot};
+    use crate::sync_engine::update_required::is_update_required;
 
     fn memory_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("schema.sql")).unwrap();
         conn
+    }
+
+    #[test]
+    fn fresh_database_has_full_mounts_schema() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let conn = open_db(file.path()).unwrap();
+
+        let mut stmt = conn.prepare("PRAGMA table_info(mounts)").unwrap();
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|result| result.unwrap())
+            .collect();
+
+        for column in [
+            "path",
+            "folder_id",
+            "grant_id",
+            "scope_node_id",
+            "mount_token",
+            "cursor",
+            "can_write",
+            "name",
+        ] {
+            assert!(
+                columns.iter().any(|name| name == column),
+                "expected mounts.{column} to exist, got columns {columns:?}"
+            );
+        }
     }
 
     #[test]
@@ -297,6 +320,7 @@ mod tests {
         assert_eq!(node.server_seq, 5);
         assert!(node.deleted_at.is_some());
         assert!(versions::get_version(&conn, "v1").unwrap().is_some());
+        assert!(!versions::has_materialized_content_for_node(&conn, "n1").unwrap());
     }
 
     #[test]
@@ -334,6 +358,173 @@ mod tests {
         assert_eq!(node.current_version_id.as_deref(), Some("winner"));
         assert_eq!(node.server_seq, 11);
         assert!(versions::get_version(&conn, "loser").unwrap().is_some());
+    }
+
+    #[test]
+    fn unrecognized_op_type_returns_update_required() {
+        let conn = memory_db();
+        let error = apply_op_log_entry(
+            &conn,
+            &OpLogEntry {
+                server_seq: 1,
+                node_id: "n1".into(),
+                op_type: "future_op".into(),
+                op_payload: json!({}),
+                actor_device_id: "d1".into(),
+                applied_at: "2026-07-08T00:00:00Z".into(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(is_update_required(&error).is_some());
+    }
+
+    #[test]
+    fn stale_unrecognized_op_type_is_noop_not_update_required() {
+        let conn = memory_db();
+        nodes::upsert_node(
+            &conn,
+            &nodes::LocalNode {
+                node_id: "n1".into(),
+                folder_id: "folder-1".into(),
+                parent_id: None,
+                name: "current.txt".into(),
+                node_type: "file".into(),
+                current_version_id: None,
+                server_seq: 10,
+                deleted_at: None,
+            },
+        )
+        .unwrap();
+
+        let pre_op = apply_op_log_entry(
+            &conn,
+            &OpLogEntry {
+                server_seq: 8,
+                node_id: "n1".into(),
+                op_type: "future_op".into(),
+                op_payload: json!({}),
+                actor_device_id: "d1".into(),
+                applied_at: "2026-07-08T00:00:00Z".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let node = nodes::get_node(&conn, "n1").unwrap().unwrap();
+
+        assert_eq!(pre_op.server_seq, 10);
+        assert_eq!(node.server_seq, 10);
+        assert_eq!(node.name, "current.txt");
+    }
+
+    #[test]
+    fn out_of_order_non_create_ops_do_not_mutate_node() {
+        for (op_type, payload) in [
+            ("rename", json!({"new_name":"stale.txt"})),
+            ("move", json!({"new_parent_id":"stale-parent"})),
+            ("delete", json!({})),
+            (
+                "new_version",
+                json!({"version_id":"stale-v","content_hash":"hash","size_bytes":3,"manifest":[{"chunk_hash":"c1","offset":0,"length":3}]}),
+            ),
+        ] {
+            let conn = memory_db();
+            nodes::upsert_node(
+                &conn,
+                &nodes::LocalNode {
+                    node_id: "n1".into(),
+                    folder_id: "folder-1".into(),
+                    parent_id: Some("parent".into()),
+                    name: "current.txt".into(),
+                    node_type: "file".into(),
+                    current_version_id: Some("current-v".into()),
+                    server_seq: 10,
+                    deleted_at: None,
+                },
+            )
+            .unwrap();
+
+            let pre_op = apply_op_log_entry(
+                &conn,
+                &OpLogEntry {
+                    server_seq: 8,
+                    node_id: "n1".into(),
+                    op_type: op_type.into(),
+                    op_payload: payload,
+                    actor_device_id: "d1".into(),
+                    applied_at: "2026-07-08T00:00:00Z".into(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            let node = nodes::get_node(&conn, "n1").unwrap().unwrap();
+
+            assert_eq!(pre_op.server_seq, 10);
+            assert_eq!(node.name, "current.txt");
+            assert_eq!(node.parent_id.as_deref(), Some("parent"));
+            assert_eq!(node.current_version_id.as_deref(), Some("current-v"));
+            assert_eq!(node.server_seq, 10);
+            assert!(node.deleted_at.is_none());
+            assert!(versions::get_version(&conn, "stale-v").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn duplicate_server_seq_is_not_reapplied() {
+        let conn = memory_db();
+        nodes::upsert_node(
+            &conn,
+            &nodes::LocalNode {
+                node_id: "n1".into(),
+                folder_id: "folder-1".into(),
+                parent_id: None,
+                name: "current.txt".into(),
+                node_type: "file".into(),
+                current_version_id: None,
+                server_seq: 10,
+                deleted_at: None,
+            },
+        )
+        .unwrap();
+
+        apply_op_log_entry(
+            &conn,
+            &OpLogEntry {
+                server_seq: 10,
+                node_id: "n1".into(),
+                op_type: "rename".into(),
+                op_payload: json!({"new_name":"duplicate.txt"}),
+                actor_device_id: "d1".into(),
+                applied_at: "2026-07-08T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let node = nodes::get_node(&conn, "n1").unwrap().unwrap();
+
+        assert_eq!(node.name, "current.txt");
+        assert_eq!(node.server_seq, 10);
+    }
+
+    #[test]
+    fn create_op_is_exempt_from_monotonicity_guard() {
+        let conn = memory_db();
+
+        apply_op_log_entry(
+            &conn,
+            &OpLogEntry {
+                server_seq: 1,
+                node_id: "n1".into(),
+                op_type: "create".into(),
+                op_payload: json!({"node_id":"n1","folder_id":"folder-1","parent_id":"root","name":"created.txt","type":"file"}),
+                actor_device_id: "d1".into(),
+                applied_at: "2026-07-08T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let node = nodes::get_node(&conn, "n1").unwrap().unwrap();
+
+        assert_eq!(node.name, "created.txt");
+        assert_eq!(node.server_seq, 1);
     }
 
     #[test]

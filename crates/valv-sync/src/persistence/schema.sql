@@ -32,11 +32,15 @@ CREATE TABLE IF NOT EXISTS versions (
     folder_id TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
-    manifest_json TEXT NOT NULL
+    manifest_json TEXT NOT NULL,
+    content_materialized_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_versions_folder
 ON versions(folder_id);
+
+CREATE INDEX IF NOT EXISTS idx_versions_node_materialized
+ON versions(node_id, content_materialized_at);
 
 CREATE TABLE IF NOT EXISTS uploaded_chunks (
     chunk_hash TEXT PRIMARY KEY,

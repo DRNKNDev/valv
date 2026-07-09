@@ -6,6 +6,7 @@ export default defineConfig({
   resolve: {
     alias: [
       { find: "@valv/core", replacement: path.resolve("../core/src/index.ts") },
+      { find: "@valv/contracts-sync", replacement: path.resolve("../contracts/sync/src/index.ts") },
       { find: /^@hono\/(.*)$/, replacement: path.resolve("../core/node_modules/@hono") + "/$1" },
       { find: "aws4fetch", replacement: path.resolve("../core/node_modules/aws4fetch/dist/aws4fetch.esm.mjs") },
       { find: "better-auth/adapters/drizzle", replacement: path.resolve("../core/node_modules/better-auth/dist/adapters/drizzle-adapter/index.mjs") },

@@ -178,11 +178,22 @@ struct MenuBarContentView: View {
     }
 
     private var summaryText: String {
-        if store.isDisconnected {
+        Self.summaryText(
+            status: store.status,
+            iconState: store.iconState,
+            isDisconnected: store.isDisconnected
+        )
+    }
+
+    static func summaryText(status: DaemonStatus?, iconState: IconState, isDisconnected: Bool) -> String {
+        if isDisconnected {
             return UserFacingError.connectionFailureMessage
         }
+        if status?.updateRequired == true || status?.mounts.contains(where: { $0.updateRequired }) == true {
+            return "Update Valv to keep syncing"
+        }
 
-        switch store.iconState {
+        switch iconState {
         case .notSetUp: return "Not connected"
         case .error: return "Sync error"
         case .paused: return "Paused"
@@ -331,7 +342,12 @@ private struct MountRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if let error = mount.error {
+                    if mount.updateRequired {
+                        Text("Update Valv to keep syncing")
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                            .lineLimit(1)
+                    } else if let error = mount.error {
                         Text(error)
                             .font(.caption2)
                             .foregroundStyle(.red)
@@ -353,11 +369,13 @@ private struct MountRow: View {
     }
 
     private var statusColor: Color {
+        if mount.updateRequired { return .red }
         if mount.error != nil { return .red }
         return mount.syncing ? .blue : .green
     }
 
     private var statusDescription: String {
+        if mount.updateRequired { return "Update required" }
         if mount.error != nil { return "Sync error" }
         if mount.syncing { return "Syncing" }
         return "Up to date"

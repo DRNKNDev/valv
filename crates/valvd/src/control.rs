@@ -15,13 +15,15 @@ pub(crate) async fn get_status(
         .await
         .iter()
         .map(|mount| mount.status())
-        .collect();
+        .collect::<Vec<_>>();
+    let update_required = mounts.iter().any(|mount| mount.update_required);
     let backend_connected = state.backend_health.is_connected();
     let account = state.account.lock().await.clone();
     Ok(Json(DaemonStatus {
         paused: state.paused.load(Ordering::Acquire),
         backend_connected,
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        update_required,
         mounts,
         account,
     }))
@@ -64,8 +66,10 @@ mod tests {
 
     use rusqlite::Connection;
     use tokio::sync::Mutex;
+    use tokio::sync::Notify;
 
     use crate::config::DaemonConfig;
+    use crate::MountState;
 
     use super::*;
 
@@ -80,6 +84,8 @@ mod tests {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
             backend_health: Arc::new(crate::BackendHealth::default()),
+            pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_deletes: Arc::new(Mutex::new(HashMap::new())),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config,
@@ -104,6 +110,7 @@ mod tests {
 
         assert!(response.0.backend_connected);
         assert!(!response.0.paused);
+        assert!(!response.0.update_required);
     }
 
     #[tokio::test]
@@ -114,6 +121,18 @@ mod tests {
         let response = get_status(State(state)).await.unwrap();
 
         assert!(!response.0.backend_connected);
+    }
+
+    #[tokio::test]
+    async fn get_status_aggregates_update_required_from_mounts() {
+        let state = test_state(connected_config());
+        *state.mounts.lock().await = vec![test_mount(true)];
+
+        let response = get_status(State(state)).await.unwrap().0;
+
+        assert!(response.backend_connected);
+        assert!(response.update_required);
+        assert!(response.mounts[0].update_required);
     }
 
     #[tokio::test]
@@ -130,5 +149,26 @@ mod tests {
             axum::http::StatusCode::NO_CONTENT
         );
         assert!(!state.paused.load(Ordering::Acquire));
+    }
+
+    fn test_mount(update_required: bool) -> MountState {
+        let update_required_flag = Arc::new(AtomicBool::new(update_required));
+        MountState {
+            path: "/sync".to_owned(),
+            folder_id: "folder-1".to_owned(),
+            grant_id: None,
+            scope_node_id: None,
+            mount_token: None,
+            can_write: true,
+            name: "Test Folder".to_owned(),
+            active_syncs: 0,
+            pending_ops: 0,
+            last_synced_at: None,
+            update_required,
+            update_required_flag,
+            error: None,
+            sync_lock: Arc::new(Mutex::new(())),
+            cursor_notify: Arc::new(Notify::new()),
+        }
     }
 }

@@ -11,6 +11,7 @@ export interface MountStatus {
   syncing: boolean;
   pending_ops: number;
   last_synced_at: string | null;
+  update_required: boolean;
   error?: string;
 }
 
@@ -26,6 +27,7 @@ export interface DaemonStatus {
   paused: boolean;
   backend_connected: boolean;
   version: string;
+  update_required: boolean;
   mounts: MountStatus[];
   account?: AccountStatus;
 }

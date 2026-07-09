@@ -28,7 +28,7 @@ type BatchResponseObject = {
 
 export type QuotaPrincipal = { type: "device"; id: string } | { type: "user"; id: string };
 export type QuotaInfo = {
-  quota_bytes: number;
+  quota_bytes: number | null;
   usage_bytes: number;
   subscription_status: string;
   current_period_end: string | Date | null;
@@ -40,6 +40,8 @@ export type CreateBlobstoreRouterOptions = {
   s3: AwsClient;
   bucketEndpoint?: string;
   bucketName: string;
+  chunkKeyForPrincipal?: (oid: string, principal: Principal) => string | Promise<string>;
+  getExistingChunkForPrincipal?: (oid: string, principal: Principal) => Promise<{ refcount: number } | undefined>;
   getQuota?: (principal: QuotaPrincipal) => Promise<QuotaInfo | null>;
   pastDueGraceDays?: number;
 };
@@ -63,7 +65,10 @@ export function createBlobstoreRouter(opts: CreateBlobstoreRouterOptions): Hono<
     const body = (await ctx.req.json()) as BatchRequest;
     if (body.operation === "upload") {
       const uploadPlans = await Promise.all(
-        body.objects.map(async (object) => ({ object, existing: await getExistingChunk(opts, object.oid) })),
+        body.objects.map(async (object) => ({
+          object,
+          existing: await getExistingChunkForBatch(opts, object.oid, principal),
+        })),
       );
       if (opts.getQuota) {
         const quota = await opts.getQuota(quotaPrincipal(principal));
@@ -74,13 +79,13 @@ export function createBlobstoreRouter(opts: CreateBlobstoreRouterOptions): Hono<
           const newBytes = uploadPlans
             .filter((plan) => !plan.existing)
             .reduce((sum, plan) => sum + plan.object.size, 0);
-          if (quota.usage_bytes + newBytes > quota.quota_bytes) {
+          if (quota.quota_bytes !== null && quota.usage_bytes + newBytes > quota.quota_bytes) {
             return ctx.json({ error: "over_quota", usage_bytes: quota.usage_bytes, quota_bytes: quota.quota_bytes }, 402);
           }
         }
       }
       const objects = await Promise.all(
-        uploadPlans.map((plan) => handleUploadObject(opts, plan.object.oid, plan.object.size, plan.existing)),
+        uploadPlans.map((plan) => handleUploadObject(opts, principal, plan.object.oid, plan.object.size, plan.existing)),
       );
       return ctx.json({ transfer: "basic", objects });
     }
@@ -98,6 +103,7 @@ export function createBlobstoreRouter(opts: CreateBlobstoreRouterOptions): Hono<
 
 async function handleUploadObject(
   opts: CreateBlobstoreRouterOptions,
+  principal: Principal,
   oid: string,
   size: number,
   existing: { refcount: number } | undefined,
@@ -106,13 +112,16 @@ async function handleUploadObject(
     return { oid, size, already_exists: true };
   }
 
-  if (!existing) {
+  if (opts.getExistingChunkForPrincipal) {
+    await insertChunkIfAbsent(opts, oid, size);
+  } else if (!existing) {
     const inserted = await insertChunkIfAbsent(opts, oid, size);
     if (!inserted) {
       return { oid, size, already_exists: true };
     }
   }
-  const href = await presignS3(opts, chunkKey(oid), "PUT", { "Content-Type": "application/octet-stream" });
+  const uploadHeaders = { "Content-Type": "application/octet-stream", "Content-Length": String(size) };
+  const href = await presignS3(opts, await resolveChunkKey(opts, oid, principal), "PUT", uploadHeaders);
 
   return {
     oid,
@@ -121,7 +130,7 @@ async function handleUploadObject(
     actions: {
       upload: {
         href,
-        header: { "Content-Type": "application/octet-stream" },
+        header: uploadHeaders,
         expires_in: 900,
       },
     },
@@ -181,8 +190,22 @@ async function handleDownloadObject(
     return { oid, size, error: { code: 403, message: "no grant" } };
   }
 
-  const href = await presignS3(opts, chunkKey(oid), "GET");
+  const href = await presignS3(opts, await resolveChunkKey(opts, oid, principal), "GET");
   return { oid, size, actions: { download: { href, expires_in: 900 } } };
+}
+
+async function resolveChunkKey(opts: CreateBlobstoreRouterOptions, oid: string, principal: Principal): Promise<string> {
+  return opts.chunkKeyForPrincipal ? opts.chunkKeyForPrincipal(oid, principal) : chunkKey(oid);
+}
+
+async function getExistingChunkForBatch(
+  opts: CreateBlobstoreRouterOptions,
+  oid: string,
+  principal: Principal,
+): Promise<{ refcount: number } | undefined> {
+  return opts.getExistingChunkForPrincipal
+    ? opts.getExistingChunkForPrincipal(oid, principal)
+    : getExistingChunk(opts, oid);
 }
 
 async function getExistingChunk(
@@ -206,7 +229,7 @@ async function presignS3(
   const request = await opts.s3.sign(objectUrl(opts, key), {
     method,
     headers,
-    aws: { signQuery: true },
+    aws: { signQuery: true, allHeaders: true },
   });
   return request.url;
 }

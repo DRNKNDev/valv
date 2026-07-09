@@ -1,5 +1,8 @@
 import type { ChunkRef } from './manifest';
 
+export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_HEADER = 'X-Valv-Protocol';
+
 export type OpType = 'create' | 'rename' | 'move' | 'delete' | 'new_version';
 
 export interface CreatePayload {

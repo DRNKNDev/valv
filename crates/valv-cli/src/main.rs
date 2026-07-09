@@ -10,6 +10,9 @@ use anyhow::Error;
 use std::process::ExitCode;
 use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 
+#[cfg(test)]
+static LOOPBACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();

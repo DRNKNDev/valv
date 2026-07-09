@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::Path,
     sync::{
@@ -88,6 +88,8 @@ struct DaemonState {
     tasks: Arc<Mutex<HashMap<String, Vec<JoinHandle<()>>>>>,
     account: Arc<Mutex<Option<AccountStatus>>>,
     backend_health: Arc<BackendHealth>,
+    pending_uploads: Arc<Mutex<HashSet<String>>>,
+    deferred_deletes: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     db: Arc<Mutex<Connection>>,
     client: reqwest::Client,
     config: DaemonConfig,
@@ -138,6 +140,8 @@ struct MountState {
     active_syncs: u32,
     pending_ops: u64,
     last_synced_at: Option<String>,
+    update_required: bool,
+    update_required_flag: Arc<AtomicBool>,
     error: Option<String>,
     // Serializes pull_mount_once/full_sync_mount for this mount so a background
     // pull can't mutate the local mirror mid-flight through an explicit sync's
@@ -235,6 +239,8 @@ async fn run() -> Result<()> {
             active_syncs: 0,
             pending_ops: 0,
             last_synced_at: None,
+            update_required: false,
+            update_required_flag: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
@@ -248,6 +254,8 @@ async fn run() -> Result<()> {
         tasks: Arc::new(Mutex::new(HashMap::new())),
         account: Arc::new(Mutex::new(None)),
         backend_health: Arc::new(BackendHealth::default()),
+        pending_uploads: Arc::new(Mutex::new(HashSet::new())),
+        deferred_deletes: Arc::new(Mutex::new(HashMap::new())),
         db: Arc::new(Mutex::new(conn)),
         client: reqwest::Client::new(),
         config,
@@ -431,6 +439,8 @@ impl MountState {
             syncing: self.active_syncs > 0,
             pending_ops: self.pending_ops,
             last_synced_at: self.last_synced_at.clone(),
+            update_required: self.update_required
+                || self.update_required_flag.load(Ordering::Acquire),
             error: self.error.clone(),
         }
     }
@@ -466,6 +476,8 @@ mod tests {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
             backend_health: Arc::new(BackendHealth::default()),
+            pending_uploads: Arc::new(Mutex::new(HashSet::new())),
+            deferred_deletes: Arc::new(Mutex::new(HashMap::new())),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: DaemonConfig {

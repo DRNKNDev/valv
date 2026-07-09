@@ -256,6 +256,8 @@ mod tests {
             active_syncs: 0,
             pending_ops: 0,
             last_synced_at: None,
+            update_required: false,
+            update_required_flag: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
@@ -273,6 +275,8 @@ mod tests {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
             backend_health: Arc::new(crate::BackendHealth::default()),
+            pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_deletes: Arc::new(Mutex::new(HashMap::new())),
             db: Arc::new(Mutex::new(conn)),
             client: reqwest::Client::new(),
             config: DaemonConfig {

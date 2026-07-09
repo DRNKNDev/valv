@@ -20,7 +20,7 @@ manifest=$(api GET "/api/folders/${folder_id}/versions/${node_id}" | json_eval '
 chunk_count=$(printf '%s' "$manifest" | json_eval 'process.stdout.write(String(data.length))')
 [ "$chunk_count" -ge 2 ] || fail "expected multiple chunks, got ${chunk_count}"
 printf '%s' "$manifest" | json_eval 'for (const c of data) console.log(c.chunk_hash)' | while read -r hash; do
-  assert_bucket_key "chunks/${hash}"
+  assert_bucket_key "$(expected_chunk_key "$hash")"
 done
 
 start_daemon HOME_B DAEMON_PID_B

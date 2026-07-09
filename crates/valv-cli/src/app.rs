@@ -350,7 +350,9 @@ async fn cmd_status(json: bool) -> Result<()> {
         println!("{}", status_json(&status)?);
         return Ok(());
     }
-    if status.paused {
+    if status.update_required {
+        println!("Update required");
+    } else if status.paused {
         println!("Paused");
     } else if status.backend_connected {
         println!("Connected");
@@ -366,12 +368,20 @@ async fn cmd_status(json: bool) -> Result<()> {
                 mount.syncing.to_string(),
                 mount.pending_ops.to_string(),
                 mount.last_synced_at.unwrap_or_else(|| "-".into()),
+                mount.update_required.to_string(),
                 mount.error.unwrap_or_else(|| "-".into()),
             ]
         })
         .collect::<Vec<_>>();
     print_table(
-        &["path", "syncing", "pending_ops", "last_synced_at", "error"],
+        &[
+            "path",
+            "syncing",
+            "pending_ops",
+            "last_synced_at",
+            "update_required",
+            "error",
+        ],
         &rows,
     );
     Ok(())
@@ -454,6 +464,7 @@ mod tests {
             paused: false,
             backend_connected: true,
             version: "0.1.0".into(),
+            update_required: false,
             mounts: vec![MountStatus {
                 path: "/tmp/valv".into(),
                 folder_id: "folder-1".into(),
@@ -464,6 +475,7 @@ mod tests {
                 syncing: false,
                 pending_ops: 0,
                 last_synced_at: None,
+                update_required: false,
                 error: None,
             }],
             account: None,

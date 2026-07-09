@@ -25,7 +25,19 @@ type GrantRouteStore = {
   deleteGrantForRoute?: (grantId: string) => Promise<void>;
 };
 
-export function registerGrantRoutes(router: Hono<{ Variables: MetadataVariables }>, auth: CoreAuth): void {
+export type OnGrantCreated = (info: { folderId: string; grantId: string; deviceId: string }) => Promise<void>;
+
+export type GrantRouteOptions = {
+  onGrantCreated?: OnGrantCreated;
+  onGrantDeviceCreated?: (info: { folderId: string; scopeNodeId: string; deviceId: string; grantId: string }) => Promise<void>;
+  checkPlan?: (folderId: string) => Promise<{ allowed: boolean; status?: string } | null>;
+};
+
+export function registerGrantRoutes(
+  router: Hono<{ Variables: MetadataVariables }>,
+  auth: CoreAuth,
+  opts: GrantRouteOptions = {},
+): void {
   router.post("/folders/:id/grants", async (ctx) => {
     const principal = requirePrincipal(ctx);
     const folderId = ctx.req.param("id");
@@ -41,6 +53,15 @@ export function registerGrantRoutes(router: Hono<{ Variables: MetadataVariables 
     const grant = await checkGrant(auth.db, scopeNodeId, principal, "write", auth.schema);
     if (!grant.granted) {
       return ctx.json({ error: grant.reason }, 403);
+    }
+
+    const plan = opts.checkPlan ? await opts.checkPlan(folderId) : null;
+    if (plan?.allowed === false) {
+      const responseBody: { error: "subscription_inactive"; status?: string } = { error: "subscription_inactive" };
+      if (plan.status !== undefined) {
+        responseBody.status = plan.status;
+      }
+      return ctx.json(responseBody, 402);
     }
 
     const rawToken = generateDeviceToken();
@@ -77,6 +98,22 @@ export function registerGrantRoutes(router: Hono<{ Variables: MetadataVariables 
         canWrite: body.can_write !== false,
       });
       });
+    }
+
+    if (opts.onGrantCreated) {
+      try {
+        await opts.onGrantCreated({ folderId, grantId, deviceId });
+      } catch (error) {
+        console.error("onGrantCreated hook failed", error);
+      }
+    }
+
+    if (opts.onGrantDeviceCreated) {
+      try {
+        await opts.onGrantDeviceCreated({ folderId, scopeNodeId, deviceId, grantId });
+      } catch (error) {
+        console.error("onGrantDeviceCreated hook failed", error);
+      }
     }
 
     return ctx.json({ grant_id: grantId, device_id: deviceId, token: rawToken });

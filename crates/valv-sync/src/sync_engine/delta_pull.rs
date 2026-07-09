@@ -4,7 +4,10 @@ use rusqlite::Connection;
 
 use crate::{
     persistence::{apply_op_log_entry, apply_tree_snapshot, mounts, nodes, LocalNode},
-    protocol::sync::{DeltaPullResponse, FolderTreeResponse, OpLogEntry},
+    protocol::sync::{
+        DeltaPullResponse, FolderTreeResponse, OpLogEntry, PROTOCOL_HEADER, PROTOCOL_VERSION,
+    },
+    sync_engine::update_required::update_required_from_response,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +43,15 @@ pub async fn pull_delta(
             folder_id,
             cursor
         );
-        let response = client.get(url).bearer_auth(token).send().await?;
+        let response = client
+            .get(url)
+            .bearer_auth(token)
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+            .send()
+            .await?;
+        if response.status() == StatusCode::UPGRADE_REQUIRED {
+            return Err(update_required_from_response(response).await);
+        }
         if response.status() == StatusCode::GONE {
             return tree_resync(client, backend_url, token, folder_id, conn).await;
         }
@@ -49,6 +60,13 @@ pub async fn pull_delta(
             .error_for_status()?
             .json::<DeltaPullResponse>()
             .await?;
+        if delta.up_to_seq < cursor {
+            return Err(anyhow!(
+                "delta up_to_seq {} regressed below local cursor {}",
+                delta.up_to_seq,
+                cursor
+            ));
+        }
         for op in &delta.ops {
             let pre_op = apply_op_log_entry(conn, op)?;
             pulled.push(build_pulled_node(conn, op, pre_op)?);
@@ -74,11 +92,16 @@ pub async fn tree_resync(
         crate::api_base(backend_url),
         folder_id
     );
-    let tree = client
+    let response = client
         .get(url)
         .bearer_auth(token)
+        .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
         .send()
-        .await?
+        .await?;
+    if response.status() == StatusCode::UPGRADE_REQUIRED {
+        return Err(update_required_from_response(response).await);
+    }
+    let tree = response
         .error_for_status()?
         .json::<FolderTreeResponse>()
         .await?;
@@ -165,6 +188,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::sync_engine::update_required::is_update_required;
 
     #[tokio::test]
     async fn http_410_falls_back_to_tree_resync() {
@@ -200,6 +224,154 @@ mod tests {
         assert!(pulled.is_empty());
         assert!(saw_tree.load(Ordering::Acquire));
         assert_eq!(mounts::get_cursor(&conn, "folder-1").unwrap(), 123);
+    }
+
+    #[tokio::test]
+    async fn pull_delta_unknown_op_type_is_update_required_and_cursor_unchanged() {
+        let (base_url, server) = single_response_server(
+            "200 OK",
+            br#"{"ops":[{"server_seq":6,"node_id":"n1","op_type":"future_op","op_payload":{},"actor_device_id":"d1","applied_at":"2026-07-08T00:00:00Z"}],"up_to_seq":9}"#,
+        )
+        .await;
+        let mut conn = memory_db_with_mount();
+        mounts::set_cursor(&conn, "folder-1", 5).unwrap();
+
+        let error = pull_delta(
+            &reqwest::Client::new(),
+            &base_url,
+            "token",
+            "folder-1",
+            &mut conn,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(is_update_required(&error).is_some());
+        assert_eq!(mounts::get_cursor(&conn, "folder-1").unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn pull_delta_rejects_regressing_up_to_seq_without_applying_ops() {
+        let (base_url, server) = single_response_server(
+            "200 OK",
+            br#"{"ops":[{"server_seq":51,"node_id":"n1","op_type":"create","op_payload":{"node_id":"n1","folder_id":"folder-1","parent_id":"root","name":"a.txt","type":"file"},"actor_device_id":"d1","applied_at":"2026-07-08T00:00:00Z"}],"up_to_seq":30}"#,
+        )
+        .await;
+        let mut conn = memory_db_with_mount();
+        mounts::set_cursor(&conn, "folder-1", 50).unwrap();
+
+        let error = pull_delta(
+            &reqwest::Client::new(),
+            &base_url,
+            "token",
+            "folder-1",
+            &mut conn,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.to_string().contains("regressed"));
+        assert_eq!(mounts::get_cursor(&conn, "folder-1").unwrap(), 50);
+        assert!(nodes::get_node(&conn, "n1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pull_delta_applies_equal_up_to_seq_with_non_empty_ops() {
+        let (base_url, server) = single_response_server(
+            "200 OK",
+            br#"{"ops":[{"server_seq":50,"node_id":"n1","op_type":"create","op_payload":{"node_id":"n1","folder_id":"folder-1","parent_id":"root","name":"a.txt","type":"file"},"actor_device_id":"d1","applied_at":"2026-07-08T00:00:00Z"}],"up_to_seq":50}"#,
+        )
+        .await;
+        let mut conn = memory_db_with_mount();
+        mounts::set_cursor(&conn, "folder-1", 50).unwrap();
+
+        let (cursor, pulled) = pull_delta(
+            &reqwest::Client::new(),
+            &base_url,
+            "token",
+            "folder-1",
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(cursor, 50);
+        assert_eq!(pulled.len(), 1);
+        assert!(nodes::get_node(&conn, "n1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn pull_delta_426_is_update_required_with_min_protocol() {
+        let (base_url, server) = single_response_server(
+            "426 Upgrade Required",
+            br#"{"error":"protocol_too_old","min_protocol":2,"message":"Update Valv"}"#,
+        )
+        .await;
+        let mut conn = memory_db_with_mount();
+
+        let error = pull_delta(
+            &reqwest::Client::new(),
+            &base_url,
+            "token",
+            "folder-1",
+            &mut conn,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        let update_required = is_update_required(&error).unwrap();
+
+        assert_eq!(update_required.min_protocol, Some(2));
+    }
+
+    #[tokio::test]
+    async fn tree_resync_426_is_update_required_with_min_protocol() {
+        let (base_url, server) = single_response_server(
+            "426 Upgrade Required",
+            br#"{"error":"protocol_too_old","min_protocol":3,"message":"Update Valv"}"#,
+        )
+        .await;
+        let mut conn = memory_db_with_mount();
+
+        let error = tree_resync(
+            &reqwest::Client::new(),
+            &base_url,
+            "token",
+            "folder-1",
+            &mut conn,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        let update_required = is_update_required(&error).unwrap();
+
+        assert_eq!(update_required.min_protocol, Some(3));
+    }
+
+    fn memory_db_with_mount() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::persistence::schema_sql())
+            .unwrap();
+        mounts::upsert_mount(&conn, "/sync", "folder-1", None, None, None, true).unwrap();
+        conn
+    }
+
+    async fn single_response_server(
+        status: &'static str,
+        body: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let path = read_path(&mut stream).await;
+            write_response(&mut stream, status, body).await;
+            path
+        });
+        (format!("http://{addr}"), server)
     }
 
     async fn handle_connection(mut stream: TcpStream, saw_tree: Arc<AtomicBool>) {
