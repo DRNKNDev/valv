@@ -21,4 +21,4 @@ node_id=$(node_id_at_path "$folder_id" "/notes.txt")
 versions=$(api GET "/api/folders/${folder_id}/versions/${node_id}")
 printf '%s' "$versions" | json_eval "if (!Array.isArray(data) || data.length !== 2) process.exit(1)"
 chunk_hash=$(first_chunk_hash_for_path "$folder_id" "/notes.txt")
-assert_bucket_key "chunks/${chunk_hash}"
+assert_bucket_key "$(expected_chunk_key "$chunk_hash")"
