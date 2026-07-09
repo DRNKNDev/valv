@@ -172,14 +172,26 @@ async function deleteChunkTargets(
   result: GcPassResult,
 ): Promise<void> {
   const targets = await (args.resolveChunkDeletionTargets?.(chunkHash) ?? [{ key: chunkKey(chunkHash) }]);
+
+  if (targets.length === 0) {
+    result.errorCount += 1;
+    console.error("gc_chunk_no_deletion_targets", { chunkHash });
+    return;
+  }
+
   for (const target of targets) {
     let deleted = false;
     try {
-      await args.s3.fetch(
+      const response = await args.s3.fetch(
         objectUrl({ bucketEndpoint: args.bucketEndpoint, bucketName: args.bucketName }, target.key),
         { method: "DELETE" },
       );
-      deleted = true;
+      // R2 fetch resolves on 4xx/5xx, so check response.ok.
+      deleted = response.ok;
+      if (!deleted) {
+        result.errorCount += 1;
+        console.error("Chunk GC failed", { chunkHash, key: target.key, status: response.status });
+      }
     } catch (error) {
       result.errorCount += 1;
       console.error("Chunk GC failed", { chunkHash, key: target.key, error });
@@ -276,8 +288,14 @@ async function runIdBatchPass(db: CoreDb, config: IdBatchPassConfig): Promise<Gc
   return result;
 }
 
-function withLimit(query: SQL, batchSize: number): SQL {
-  return Number.isFinite(batchSize) ? sql`${query} LIMIT ${batchSize}` : query;
+export function withLimit(query: SQL, batchSize: number): SQL {
+  if (!Number.isFinite(batchSize)) {
+    return query;
+  }
+  if (batchSize <= 0) {
+    throw new Error(`GC batchSize must be a positive number or the unbounded sentinel; got ${batchSize}`);
+  }
+  return sql`${query} LIMIT ${batchSize}`;
 }
 
 async function countRows(db: CoreDb, query: SQL, fallback: number): Promise<number> {

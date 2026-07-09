@@ -4,11 +4,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CoreDb } from "../auth/index.js";
 import {
   DEFAULT_CHUNK_GC_BATCH_SIZE,
+  UNBOUNDED_BATCH_SIZE,
   runChunkGcOnce,
   runOpLogTruncationOnce,
   runTombstonePurgeOnce,
   startGc,
+  withLimit,
 } from "./index.js";
+import { sql } from "drizzle-orm";
 
 const dialect = new PgDialect();
 
@@ -210,15 +213,43 @@ describe("GC service - one-shot pass functions", () => {
     const db = new GcTestDb({ tombstoneNodeIds: ["n1", "n2", "n3"], opLogIds: [1, 2, 3] });
 
     const first = await runTombstonePurgeOnce({ db, mode: "delete", batchSize: 2 });
-    expect(first).toMatchObject({ eligibleCount: 2, totalEligibleCount: 3, deletedCount: 2 });
+    expect(first).toEqual({
+      pass: "tombstone_purge",
+      mode: "delete",
+      eligibleCount: 2,
+      totalEligibleCount: 3,
+      deletedCount: 2,
+      errorCount: 0,
+    });
     const second = await runTombstonePurgeOnce({ db, mode: "delete", batchSize: 2 });
-    expect(second).toMatchObject({ eligibleCount: 1, totalEligibleCount: 1, deletedCount: 1 });
+    expect(second).toEqual({
+      pass: "tombstone_purge",
+      mode: "delete",
+      eligibleCount: 1,
+      totalEligibleCount: 1,
+      deletedCount: 1,
+      errorCount: 0,
+    });
     expect(db.deletedTombstoneIds).toEqual(["n1", "n2", "n3"]);
 
     const opFirst = await runOpLogTruncationOnce({ db, mode: "delete", batchSize: 2 });
-    expect(opFirst).toMatchObject({ eligibleCount: 2, totalEligibleCount: 3, deletedCount: 2 });
+    expect(opFirst).toEqual({
+      pass: "oplog_truncation",
+      mode: "delete",
+      eligibleCount: 2,
+      totalEligibleCount: 3,
+      deletedCount: 2,
+      errorCount: 0,
+    });
     const opSecond = await runOpLogTruncationOnce({ db, mode: "delete", batchSize: 2 });
-    expect(opSecond).toMatchObject({ eligibleCount: 1, totalEligibleCount: 1, deletedCount: 1 });
+    expect(opSecond).toEqual({
+      pass: "oplog_truncation",
+      mode: "delete",
+      eligibleCount: 1,
+      totalEligibleCount: 1,
+      deletedCount: 1,
+      errorCount: 0,
+    });
     expect(db.deletedOpLogIds).toEqual([1, 2, 3]);
   });
 
@@ -241,7 +272,7 @@ describe("GC service - one-shot pass functions", () => {
     const s3Client = s3For(db);
     db.onBeforeChunkDeleteAttempt = (chunkHash) => {
       if (chunkHash === "live") {
-        db.chunks.set("live", 1);
+        db.chunks.set("live", { refcount: 1, createdAt: 0 });
       }
     };
 
@@ -249,7 +280,7 @@ describe("GC service - one-shot pass functions", () => {
 
     expect(result).toMatchObject({ eligibleCount: 1, deletedCount: 0, errorCount: 0 });
     expect(s3Client.fetch).not.toHaveBeenCalled();
-    expect(db.chunks.get("live")).toBe(1);
+    expect(db.chunks.get("live")?.refcount).toBe(1);
   });
 
   it("R2 delete failure after a successful DB delete is counted as an error and does not un-delete the row", async () => {
@@ -281,6 +312,14 @@ describe("GC service - one-shot pass functions", () => {
 
     expect(result).toMatchObject({ deletedCount: 1, errorCount: 0 });
     expect(s3Client.fetch).toHaveBeenCalledTimes(2);
+    expect(s3Client.fetch).toHaveBeenCalledWith(
+      "https://bucket.s3.amazonaws.com/bucket/chunks/tenant-a/shared",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(s3Client.fetch).toHaveBeenCalledWith(
+      "https://bucket.s3.amazonaws.com/bucket/chunks/tenant-b/shared",
+      expect.objectContaining({ method: "DELETE" }),
+    );
     expect(onDeletedA).toHaveBeenCalledTimes(1);
     expect(onDeletedB).toHaveBeenCalledTimes(1);
   });
@@ -319,9 +358,167 @@ describe("GC service - one-shot pass functions", () => {
       expect.objectContaining({ chunkHash: "shared", key: "chunks/tenant-a/shared" }),
     );
   });
+
+  it("excludes a chunk newer than the grace cutoff from eligibility and never deletes it", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-27T00:00:00.000Z"));
+    const now = Date.now();
+    const db = new GcTestDb({
+      chunks: {
+        old: { refcount: 0, createdAt: now - 48 * 60 * 60 * 1000 },
+        fresh: { refcount: 0, createdAt: now },
+      },
+    });
+    const s3Client = s3For(db);
+
+    const result = await runChunkGcOnce({ db, s3: s3Client, bucketName: "bucket", mode: "delete" });
+
+    expect(result.eligibleCount).toBe(1);
+    expect(result.totalEligibleCount).toBe(1);
+    expect(result.deletedCount).toBe(1);
+    expect(db.chunkDeletes).toEqual(["old"]);
+    expect(db.chunks.has("fresh")).toBe(true);
+    expect(s3Client.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("excludes a chunk that starts with refcount > 0 and never touches it", async () => {
+    const db = new GcTestDb({ chunks: { live: 1, dead: 0 } });
+    const s3Client = s3For(db);
+
+    const result = await runChunkGcOnce({ db, s3: s3Client, bucketName: "bucket", mode: "delete" });
+
+    expect(result.eligibleCount).toBe(1);
+    expect(result.totalEligibleCount).toBe(1);
+    expect(result.deletedCount).toBe(1);
+    expect(db.chunkDeletes).toEqual(["dead"]);
+    expect(db.chunks.has("live")).toBe(true);
+    expect(s3Client.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("processes the remaining chunks when one chunk's R2 delete throws, counting exactly the failures", async () => {
+    const db = new GcTestDb({ chunks: { a: 0, b: 0, c: 0 } });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const s3Client = {
+      fetch: vi.fn(async (url: string) => {
+        if (url.includes("chunks/b")) {
+          throw new Error("r2 unavailable for b");
+        }
+        return new Response(null, { status: 204 });
+      }),
+    } as any;
+
+    const result = await runChunkGcOnce({ db, s3: s3Client, bucketName: "bucket", mode: "delete" });
+
+    expect(result.eligibleCount).toBe(3);
+    expect(result.deletedCount).toBe(3);
+    expect(result.errorCount).toBe(1);
+    expect(new Set(db.chunkDeletes)).toEqual(new Set(["a", "b", "c"]));
+    expect(s3Client.fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("treats a non-ok R2 response as an error: onDeleted is NOT called and errorCount is incremented", async () => {
+    const db = new GcTestDb({ chunks: { shared: 0 } });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const onDeleted = vi.fn(async () => undefined);
+    const s3Client = s3ReturningStatus(db, 500);
+
+    const result = await runChunkGcOnce({
+      db,
+      s3: s3Client,
+      bucketName: "bucket",
+      mode: "delete",
+      resolveChunkDeletionTargets: () => [{ key: "chunks/tenant-a/shared", onDeleted }],
+    });
+
+    expect(result.deletedCount).toBe(1);
+    expect(result.errorCount).toBe(1);
+    expect(onDeleted).not.toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalledWith(
+      "Chunk GC failed",
+      expect.objectContaining({ chunkHash: "shared", key: "chunks/tenant-a/shared", status: 500 }),
+    );
+  });
+
+  it("signals an error when a just-deleted chunk resolves to zero deletion targets", async () => {
+    const db = new GcTestDb({ chunks: { orphan: 0 } });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const s3Client = s3For(db);
+
+    const result = await runChunkGcOnce({
+      db,
+      s3: s3Client,
+      bucketName: "bucket",
+      mode: "delete",
+      resolveChunkDeletionTargets: () => [],
+    });
+
+    expect(result.deletedCount).toBe(1);
+    expect(result.errorCount).toBe(1);
+    expect(s3Client.fetch).not.toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalledWith(
+      "gc_chunk_no_deletion_targets",
+      expect.objectContaining({ chunkHash: "orphan" }),
+    );
+  });
+
+  it("returns an all-zero, error-free result for empty eligible sets across all three passes", async () => {
+    const db = new GcTestDb();
+    const s3Client = s3For(db);
+
+    const chunkResult = await runChunkGcOnce({ db, s3: s3Client, bucketName: "bucket", mode: "delete" });
+    const tombstoneResult = await runTombstonePurgeOnce({ db, mode: "delete" });
+    const opLogResult = await runOpLogTruncationOnce({ db, mode: "delete" });
+
+    expect(chunkResult).toEqual({
+      pass: "chunk_gc",
+      mode: "delete",
+      eligibleCount: 0,
+      totalEligibleCount: 0,
+      deletedCount: 0,
+      errorCount: 0,
+    });
+    expect(tombstoneResult).toEqual({
+      pass: "tombstone_purge",
+      mode: "delete",
+      eligibleCount: 0,
+      totalEligibleCount: 0,
+      deletedCount: 0,
+      errorCount: 0,
+    });
+    expect(opLogResult).toEqual({
+      pass: "oplog_truncation",
+      mode: "delete",
+      eligibleCount: 0,
+      totalEligibleCount: 0,
+      deletedCount: 0,
+      errorCount: 0,
+    });
+    expect(s3Client.fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("GC service - withLimit", () => {
+  const base = sql`SELECT chunk_hash FROM chunks WHERE refcount = 0`;
+
+  it("appends a LIMIT for a finite positive batch size", () => {
+    const { sql: text, params } = dialect.sqlToQuery(withLimit(base, 5));
+    expect(text).toContain("LIMIT");
+    expect(params).toContain(5);
+  });
+
+  it("omits the LIMIT for the unbounded sentinel", () => {
+    const { sql: text } = dialect.sqlToQuery(withLimit(base, UNBOUNDED_BATCH_SIZE));
+    expect(text).not.toContain("LIMIT");
+  });
+
+  it("throws for a finite non-positive batch size", () => {
+    expect(() => withLimit(base, 0)).toThrow(/positive number or the unbounded sentinel/);
+    expect(() => withLimit(base, -5)).toThrow(/positive number or the unbounded sentinel/);
+  });
 });
 
 class GcTestDb implements CoreDb {
+  select: CoreDb["select"];
   select: CoreDb["select"];
   insert: CoreDb["insert"];
   update: CoreDb["update"];
@@ -332,7 +529,7 @@ class GcTestDb implements CoreDb {
   deletedOpLogIds: unknown[] = [];
   tombstoneCutoff?: Date;
   opLogCutoff?: Date;
-  chunks: Map<string, number>;
+  chunks: Map<string, { refcount: number; createdAt: number }>;
   onBeforeChunkDeleteAttempt?: (chunkHash: string) => void;
   private tombstoneNodeIds: string[];
   private opLogIds: unknown[];
@@ -340,16 +537,30 @@ class GcTestDb implements CoreDb {
 
   constructor(
     opts: {
-      chunks?: Record<string, number>;
+      chunks?: Record<string, number | { refcount?: number; createdAt?: number }>;
       tombstoneNodeIds?: string[];
       opLogIds?: unknown[];
       failChunkSelect?: boolean;
     } = {},
   ) {
-    this.chunks = new Map(Object.entries(opts.chunks ?? {}));
+    this.chunks = new Map(
+      Object.entries(opts.chunks ?? {}).map(([hash, value]) => [
+        hash,
+        typeof value === "number"
+          ? { refcount: value, createdAt: 0 }
+          : { refcount: value.refcount ?? 0, createdAt: value.createdAt ?? 0 },
+      ]),
+    );
     this.tombstoneNodeIds = [...(opts.tombstoneNodeIds ?? [])];
     this.opLogIds = [...(opts.opLogIds ?? [])];
     this.failChunkSelect = opts.failChunkSelect ?? false;
+  }
+
+  private eligibleChunkHashes(cutoff: Date): string[] {
+    const cutoffMs = cutoff.getTime();
+    return [...this.chunks.entries()]
+      .filter(([, chunk]) => chunk.refcount === 0 && chunk.createdAt < cutoffMs)
+      .map(([hash]) => hash);
   }
 
   async execute(query: unknown): Promise<Array<Record<string, unknown>>> {
@@ -361,18 +572,17 @@ class GcTestDb implements CoreDb {
         throw new Error("select failed");
       }
       const limit = text.includes("LIMIT") ? Number(params[1]) : Number.POSITIVE_INFINITY;
-      const eligible = [...this.chunks.entries()].filter(([, refcount]) => refcount === 0).map(([hash]) => hash);
+      const eligible = this.eligibleChunkHashes(params[0] as Date);
       return eligible.slice(0, limit).map((chunkHash) => ({ chunk_hash: chunkHash }));
     }
     if (text.startsWith("SELECT COUNT(*) AS count FROM chunks")) {
-      const eligible = [...this.chunks.entries()].filter(([, refcount]) => refcount === 0);
-      return [{ count: eligible.length }];
+      return [{ count: this.eligibleChunkHashes(params[0] as Date).length }];
     }
     if (text.startsWith("DELETE FROM chunks") && text.includes("RETURNING chunk_hash")) {
       const chunkHash = String(params[0]);
       this.onBeforeChunkDeleteAttempt?.(chunkHash);
-      const refcount = this.chunks.get(chunkHash);
-      if (refcount !== 0) {
+      const chunk = this.chunks.get(chunkHash);
+      if (!chunk || chunk.refcount !== 0) {
         return [];
       }
       this.chunks.delete(chunkHash);
@@ -423,10 +633,12 @@ class GcSqliteTestDb implements CoreDb {
   delete: CoreDb["delete"];
   events: string[] = [];
   chunkDeletes: string[] = [];
-  chunks: Map<string, number>;
+  chunks: Map<string, { refcount: number; createdAt: number }>;
 
   constructor(opts: { chunks?: Record<string, number> } = {}) {
-    this.chunks = new Map(Object.entries(opts.chunks ?? {}));
+    this.chunks = new Map(
+      Object.entries(opts.chunks ?? {}).map(([hash, refcount]) => [hash, { refcount, createdAt: 0 }]),
+    );
   }
 
   async all(query: unknown): Promise<Array<Record<string, unknown>>> {
@@ -435,17 +647,23 @@ class GcSqliteTestDb implements CoreDb {
     if (text.startsWith("SELECT chunk_hash FROM chunks")) {
       this.events.push("db:chunk-select");
       const limit = text.includes("LIMIT") ? Number(params[1]) : Number.POSITIVE_INFINITY;
-      const eligible = [...this.chunks.entries()].filter(([, refcount]) => refcount === 0).map(([hash]) => hash);
+      const cutoffMs = (params[0] as Date).getTime();
+      const eligible = [...this.chunks.entries()]
+        .filter(([, chunk]) => chunk.refcount === 0 && chunk.createdAt < cutoffMs)
+        .map(([hash]) => hash);
       return eligible.slice(0, limit).map((chunkHash) => ({ chunk_hash: chunkHash }));
     }
     if (text.startsWith("SELECT COUNT(*) AS count FROM chunks")) {
-      const eligible = [...this.chunks.entries()].filter(([, refcount]) => refcount === 0);
+      const cutoffMs = (params[0] as Date).getTime();
+      const eligible = [...this.chunks.entries()].filter(
+        ([, chunk]) => chunk.refcount === 0 && chunk.createdAt < cutoffMs,
+      );
       return [{ count: eligible.length }];
     }
     if (text.startsWith("DELETE FROM chunks") && text.includes("RETURNING chunk_hash")) {
       const chunkHash = String(params[0]);
-      const refcount = this.chunks.get(chunkHash);
-      if (refcount !== 0) {
+      const chunk = this.chunks.get(chunkHash);
+      if (!chunk || chunk.refcount !== 0) {
         return [];
       }
       this.chunks.delete(chunkHash);
@@ -472,6 +690,16 @@ function s3For(db: { events: string[] }, error?: Error) {
         throw error;
       }
       return new Response(null, { status: 204 });
+    }),
+  } as any;
+}
+
+function s3ReturningStatus(db: { events: string[] }, status: number) {
+  return {
+    fetch: vi.fn(async (url: string) => {
+      const key = new URL(url).pathname.split("/").slice(-2).join("/");
+      db.events.push(`s3:${key}`);
+      return new Response(null, { status });
     }),
   } as any;
 }
