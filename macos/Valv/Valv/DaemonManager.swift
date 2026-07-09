@@ -2,21 +2,7 @@ import Combine
 import DaemonKit
 import Foundation
 
-/// Manages the relationship between `Valv.app` and whatever `valvd` LaunchAgent may or
-/// may not already be registered on this Mac - bundling, stable-copy installation,
-/// version-aware reconciliation, and CLI-on-PATH installation (macos-app spec,
-/// "Valv bundles valvd and valv..." through "...without shadowing an existing install").
-///
-/// Deliberately runs unsandboxed (see design.md D3-2 and `Valv.entitlements`) - every
-/// path this type touches (`~/Library/LaunchAgents/`, `~/Library/Application
-/// Support/Valv/`, `/usr/local/bin/`) is outside what App Sandbox permits without an
-/// entitlement, and there is no Apple policy requiring the *host app* (as opposed to
-/// its two File Provider extensions) to be sandboxed.
-// No explicit @MainActor - see DaemonStore.swift's comment on the same pattern.
 final class DaemonManager: ObservableObject {
-    // Matches `DaemonStore.shared`'s convention - lets `AppDelegate` reach this
-    // instance to auto-present onboarding at launch, without threading it through
-    // a separate initializer path.
     static let shared = DaemonManager()
 
     enum CLIInstallStatus {
@@ -48,26 +34,24 @@ final class DaemonManager: ObservableObject {
     }
 
     private static let launchAgentLabel = "dev.drnkn.valvd"
-    // valvd 0.1.0 is the first distributable version after the daemon shipped the
-    // routes/transports this app requires: /fp/share and /fp/watch in c60f7ba, plus
-    // TCP-loopback support for sandboxed macOS clients in fdc38e5. Version reporting
-    // itself was wired in 4de6ea9 when the crate version moved to 0.1.0.
     private static let minimumRequiredVersion = "0.1.0"
 
     @Published private(set) var isManagedByValv = false
     @Published private(set) var cliInstallStatus: CLIInstallStatus = .notChecked
     @Published var pendingDecision: ReconciliationOutcome?
     @Published var installError: String?
-    /// Set once `reconcileOnLaunch()` has run to completion (success, clean install, or
-    /// a pending decision) - lets the onboarding daemon-setup page distinguish "still
-    /// checking" from "checked, nothing needs the user" without inferring it from
-    /// unrelated state.
     @Published private(set) var hasReconciled = false
+    @Published private(set) var isRestartingDaemon = false
+
+    static let defaultKickstartTimeoutNanoseconds: UInt64 = 5_000_000_000
 
     private let fileManager: FileManager
     private let homeDirectory: URL
     private let bundledBinDirectoryOverride: URL?
     private let cleanInstallOperation: ((Bool) async throws -> Void)?
+    private let kickstartOperation: (() async throws -> Void)?
+    private let runningDaemonVersionProvider: (() async -> String?)?
+    private let kickstartTimeoutNanoseconds: UInt64
     private let client: DaemonClient
 
     init(
@@ -76,13 +60,19 @@ final class DaemonManager: ObservableObject {
         homeDirectory: URL? = nil,
         bundledBinDirectory: URL? = nil,
         startOnLaunch: Bool = true,
-        cleanInstallOperation: ((Bool) async throws -> Void)? = nil
+        cleanInstallOperation: ((Bool) async throws -> Void)? = nil,
+        kickstartOperation: (() async throws -> Void)? = nil,
+        runningDaemonVersionProvider: (() async -> String?)? = nil,
+        kickstartTimeoutNanoseconds: UInt64 = DaemonManager.defaultKickstartTimeoutNanoseconds
     ) {
         self.client = client
         self.fileManager = fileManager
         self.homeDirectory = homeDirectory ?? fileManager.homeDirectoryForCurrentUser
         self.bundledBinDirectoryOverride = bundledBinDirectory
         self.cleanInstallOperation = cleanInstallOperation
+        self.kickstartOperation = kickstartOperation
+        self.runningDaemonVersionProvider = runningDaemonVersionProvider
+        self.kickstartTimeoutNanoseconds = kickstartTimeoutNanoseconds
         if startOnLaunch {
             Task { [weak self] in
                 await self?.reconcileOnLaunch()
@@ -111,11 +101,7 @@ final class DaemonManager: ObservableObject {
         bundledBinDirectoryOverride ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/bin")
     }
 
-    // MARK: - Reconciliation (task 9's core flow)
 
-    /// Runs on launch, before any installation action. Mirrors the `macos-app` spec's
-    /// "An existing daemon registration is reconciled by version, never silently
-    /// overwritten" requirement.
     func reconcileOnLaunch() async {
         defer { hasReconciled = true }
 
@@ -130,13 +116,6 @@ final class DaemonManager: ObservableObject {
         }
 
         guard fileManager.fileExists(atPath: registeredPath) else {
-            // The plist is registered but the binary it points at is gone (e.g. the
-            // whole stable install directory was removed out-of-band while the
-            // launchd job itself was left behind). There's no real external install
-            // to reconcile against here, so treat it like a fresh install rather
-            // than asking the user to decide about a phantom "incompatible" one -
-            // `resolveVersion` below can't distinguish "genuinely incompatible" from
-            // "nothing there to run" and would otherwise show the wrong decision UI.
             await performCleanInstall(overwriteExisting: true)
             return
         }
@@ -146,15 +125,11 @@ final class DaemonManager: ObservableObject {
             isManagedByValv = registeredPath.hasPrefix(stableBinDirectory.path)
             if isManagedByValv {
                 if !fileManager.fileExists(atPath: configFileURL.path) {
-                    // The launchd job is registered but config.toml is gone (e.g.
-                    // removed out-of-band while the job itself was left in place) -
-                    // valvd exits immediately on every KeepAlive restart without it,
-                    // crash-looping forever with no way for this app to notice unless
-                    // it checks. Repair by reinstalling, which recreates the template.
                     await performCleanInstall(overwriteExisting: true)
                     return
                 }
                 await refreshStableCopyIfBundledIsNewer()
+                await reconcileRunningDaemonAgainstStableCopy()
             }
             return
         }
@@ -162,39 +137,108 @@ final class DaemonManager: ObservableObject {
         pendingDecision = .incompatibleNeedsDecision(existingPath: registeredPath, existingVersion: existingVersion ?? "unknown")
     }
 
-    /// Called when the user picks "Let Valv.app manage it" in response to
-    /// `pendingDecision`.
     func consentToTakeover() async {
         pendingDecision = nil
         await performCleanInstall(overwriteExisting: true)
     }
 
-    /// Called when the user picks "I'll update it myself".
     func declineTakeover() {
         pendingDecision = nil
         isManagedByValv = false
     }
 
-    /// "On each launch, if the app's bundled binaries are newer than the stable copy,
-    /// Valv SHALL re-copy them and, if it owns the current daemon registration,
-    /// restart the daemon to pick them up" (macos-app spec, "App update refreshes the
-    /// stable copy"). Only called when `isManagedByValv` is already true - an
-    /// externally-managed daemon's stable copy (if any) is never touched here.
     private func refreshStableCopyIfBundledIsNewer() async {
         let bundledValvd = bundledBinDirectory.appendingPathComponent("valvd").path
         let stableValvd = stableBinDirectory.appendingPathComponent("valvd").path
-        guard let bundledVersion = try? await runCapturingOutput(executable: bundledValvd, arguments: ["--version"]),
-              let stableVersion = try? await runCapturingOutput(executable: stableValvd, arguments: ["--version"]),
-              bundledVersion != stableVersion
+        guard let bundledRaw = try? await runCapturingOutput(executable: bundledValvd, arguments: ["--version"]),
+              let stableRaw = try? await runCapturingOutput(executable: stableValvd, arguments: ["--version"])
+        else {
+            return
+        }
+        // Strip clap's "valvd " prefix before semver comparison.
+        let bundledVersion = Self.lastVersionToken(from: bundledRaw)
+        let stableVersion = Self.lastVersionToken(from: stableRaw)
+        guard Self.isVersion(bundledVersion, atLeast: stableVersion),
+              !Self.isVersion(stableVersion, atLeast: bundledVersion)
         else {
             return
         }
         do {
             try copyBundledBinariesToStableLocation()
-            try await run(executable: "/bin/launchctl", arguments: ["kickstart", "-k", "gui/\(getuid())/\(Self.launchAgentLabel)"])
         } catch {
             NSLog("DaemonManager: stable copy refresh failed: %@", error.localizedDescription)
+            return
         }
+        await kickstartDaemonBounded()
+    }
+
+    private func reconcileRunningDaemonAgainstStableCopy() async {
+        guard isManagedByValv else { return }
+        guard let runningVersion = await currentRunningDaemonVersion() else { return }
+        let stableValvd = stableBinDirectory.appendingPathComponent("valvd").path
+        guard let stableRaw = try? await runCapturingOutput(executable: stableValvd, arguments: ["--version"]) else {
+            return
+        }
+        let stableVersion = Self.lastVersionToken(from: stableRaw)
+        guard runningVersion != stableVersion else { return }
+        await kickstartDaemonBounded()
+    }
+
+    private func currentRunningDaemonVersion() async -> String? {
+        if let runningDaemonVersionProvider {
+            return await runningDaemonVersionProvider()
+        }
+        guard let status = try? await client.status() else { return nil }
+        return status.version
+    }
+
+    // launchctl waitUntilExit is not cancellable; bound it with a detached timeout race.
+    private func kickstartDaemonBounded() async {
+        isRestartingDaemon = true
+
+        let kickstartTask = Task { [weak self] in
+            do {
+                try await self?.performKickstart()
+            } catch {
+                NSLog("DaemonManager: kickstart failed: %@", error.localizedDescription)
+            }
+        }
+
+        let timeoutNanoseconds = kickstartTimeoutNanoseconds
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let once = KickstartResumeOnce()
+            Task {
+                _ = await kickstartTask.value
+                if once.fireIfFirst() { continuation.resume() }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                if once.fireIfFirst() { continuation.resume() }
+            }
+        }
+
+        isRestartingDaemon = false
+    }
+
+    private final class KickstartResumeOnce: @unchecked Sendable {
+        private let lock = NSLock()
+        private var hasFired = false
+
+        func fireIfFirst() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if hasFired { return false }
+            hasFired = true
+            return true
+        }
+    }
+
+    private func performKickstart() async throws {
+        if let kickstartOperation {
+            try await kickstartOperation()
+            return
+        }
+        try await run(executable: "/bin/launchctl", arguments: ["kickstart", "-k", "gui/\(getuid())/\(Self.launchAgentLabel)"])
     }
 
     func performCleanInstall(overwriteExisting: Bool = false) async {
@@ -244,13 +288,14 @@ final class DaemonManager: ObservableObject {
         if let status = try? await client.status() {
             return status.version
         }
-        // clap's default `--version` output is "<bin-name> <version>" (e.g.
-        // "valvd 0.1.0"), not a bare semver - take the last whitespace-separated
-        // token so `parseVersion` gets "0.1.0", not the whole string.
         guard let output = try? await runCapturingOutput(executable: path, arguments: ["--version"]) else {
             return nil
         }
-        return output.split(separator: " ").last.map(String.init)
+        return Self.lastVersionToken(from: output)
+    }
+
+    private static func lastVersionToken(from rawVersionOutput: String) -> String {
+        rawVersionOutput.split(separator: " ").last.map(String.init) ?? rawVersionOutput
     }
 
     private func isVersionCompatible(_ version: String?) -> Bool {
@@ -286,7 +331,6 @@ final class DaemonManager: ObservableObject {
         return components
     }
 
-    // MARK: - CLI install (task 9's PATH action)
 
     func checkCLIInstallStatus() {
         let wellKnownPaths = ["/opt/homebrew/bin/valv", "/usr/local/bin/valv", "\(homeURL.path)/.local/bin/valv"]
@@ -328,23 +372,16 @@ final class DaemonManager: ObservableObject {
             }
             try fileManager.copyItem(atPath: source, toPath: destination)
         } catch {
-            // /usr/local/bin often isn't user-writable - fall back to an
-            // authorization-prompting shell command rather than failing silently.
             try? await runWithAdministratorPrivileges(command: "cp '\(source)' '\(destination)'")
         }
         checkCLIInstallStatus()
     }
 
-    // MARK: - Process helpers
 
     private func run(executable: String, arguments: [String]) async throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
-        // Without this, Process leaves stdin unset and the child inherits ours -
-        // under Xcode that's a live PTY that never delivers EOF, so any prompt the
-        // child reads from stdin (e.g. valvd's `ensure_config_template`) blocks
-        // forever instead of hitting a closed/empty stream and moving on.
         process.standardInput = FileHandle.nullDevice
         try process.run()
         process.waitUntilExit()
