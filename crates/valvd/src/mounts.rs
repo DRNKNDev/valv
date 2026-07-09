@@ -1,4 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{atomic::AtomicBool, Arc},
+};
 
 use anyhow::Result;
 use axum::{extract::State, http::StatusCode, Json};
@@ -91,6 +94,8 @@ pub(crate) async fn post_mount(
         active_syncs: 0,
         pending_ops: 0,
         last_synced_at: None,
+        update_required: false,
+        update_required_flag: Arc::new(AtomicBool::new(false)),
         error: None,
         sync_lock: Arc::new(Mutex::new(())),
         cursor_notify: Arc::new(tokio::sync::Notify::new()),
@@ -395,6 +400,8 @@ mod tests {
             active_syncs: 0,
             pending_ops: 0,
             last_synced_at: None,
+            update_required: false,
+            update_required_flag: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(tokio::sync::Notify::new()),

@@ -44,11 +44,12 @@ pub enum FsEvent {
     Rename { from: PathBuf, to: PathBuf },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct WatchMount {
     pub path: PathBuf,
     pub folder_id: String,
     pub device_name: String,
+    pub update_required: Arc<AtomicBool>,
 }
 
 pub async fn fs_watch_task(
@@ -65,6 +66,12 @@ pub async fn fs_watch_task(
     let mut dropped_paused_events = false;
 
     loop {
+        if mount.update_required.load(Ordering::Acquire) {
+            drain_pending_events(&mut rx);
+            sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+
         if paused.load(Ordering::Acquire) || fs_events_paused.load(Ordering::Acquire) {
             drain_pending_events(&mut rx);
             dropped_paused_events = true;
@@ -88,8 +95,8 @@ pub async fn fs_watch_task(
             continue;
         }
 
-        for event in events {
-            handle_fs_event(&mount, &db, &client, &backend_url, &token, event).await?;
+        if !handle_fs_events(&mount, &db, &client, &backend_url, &token, events).await? {
+            drain_pending_events(&mut rx);
         }
     }
 
@@ -239,6 +246,32 @@ async fn handle_fs_event(
             handle_rename(mount, db, client, backend_url, token, &from, &to).await
         }
     }
+}
+
+async fn handle_fs_events(
+    mount: &WatchMount,
+    db: &Arc<Mutex<Connection>>,
+    client: &reqwest::Client,
+    backend_url: &str,
+    token: &str,
+    events: Vec<FsEvent>,
+) -> Result<bool> {
+    if mount.update_required.load(Ordering::Acquire) {
+        return Ok(false);
+    }
+    for event in events {
+        match handle_fs_event(mount, db, client, backend_url, token, event).await {
+            Ok(()) => {}
+            Err(error)
+                if crate::sync_engine::update_required::is_update_required(&error).is_some() =>
+            {
+                mount.update_required.store(true, Ordering::Release);
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
 }
 
 async fn handle_create(
@@ -1166,6 +1199,53 @@ mod tests {
         assert_eq!(new.name, "recreated.txt");
     }
 
+    #[tokio::test]
+    async fn update_required_submit_response_halts_watcher_submissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.txt");
+        fs::write(&path, b"hello").unwrap();
+        let db = seeded_db();
+        let mount = watch_mount(dir.path());
+        let client = reqwest::Client::new();
+        let (backend_url, server) = raw_submit_server(
+            "200 OK",
+            br#"{"result":"future","server_seq":2,"node_id":"future"}"#,
+        )
+        .await;
+
+        let continued = handle_fs_events(
+            &mount,
+            &db,
+            &client,
+            &backend_url,
+            "token",
+            vec![FsEvent::Create(path.clone())],
+        )
+        .await
+        .unwrap();
+        let requests = timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(!continued);
+        assert!(mount.update_required.load(Ordering::Acquire));
+        assert_eq!(requests.len(), 1);
+
+        let continued = handle_fs_events(
+            &mount,
+            &db,
+            &client,
+            &backend_url,
+            "token",
+            vec![FsEvent::Modify(path)],
+        )
+        .await
+        .unwrap();
+
+        assert!(!continued);
+    }
+
     fn seeded_db() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(schema_sql()).unwrap();
@@ -1209,6 +1289,7 @@ mod tests {
             path: path.to_path_buf(),
             folder_id: "folder-1".into(),
             device_name: "Test Device".into(),
+            update_required: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1317,6 +1398,22 @@ mod tests {
                 write_response(&mut stream, "200 OK", &body).await;
             }
             requests
+        });
+        (base_url, server)
+    }
+
+    async fn raw_submit_server(
+        status: &'static str,
+        body: &'static [u8],
+    ) -> (String, JoinHandle<Vec<serde_json::Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request_json(&mut stream).await;
+            write_response(&mut stream, status, body).await;
+            vec![request]
         });
         (base_url, server)
     }

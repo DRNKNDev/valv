@@ -28,6 +28,7 @@ loadDotEnv(".env");
 const databaseUrl = requiredEnv("VALV_DATABASE_URL");
 const port = Number(process.env.VALV_PORT ?? 4747);
 const appBaseUrl = process.env.VALV_BASE_URL ?? `http://localhost:${port}`;
+const minProtocolVersion = parseOptionalNonNegativeInt(process.env.VALV_MIN_PROTOCOL, "VALV_MIN_PROTOCOL");
 const bucketName = requiredEnv("BUCKET_NAME");
 const bucketEndpoint = requiredEnv("BUCKET_ENDPOINT");
 
@@ -52,7 +53,7 @@ const app = new Hono();
 
 app.on(["POST", "GET"], "/api/auth/*", (ctx) => auth.handler(ctx.req.raw));
 app.route("/auth", createDeviceAuthRouter(auth));
-app.route("/api", createMetadataRouter({ auth, hub, sendInviteEmail }));
+app.route("/api", createMetadataRouter({ auth, hub, sendInviteEmail, minProtocolVersion }));
 app.route("/api", createBlobstoreRouter({ auth, s3, bucketName, bucketEndpoint }));
 app.route("/ws", createRealtimeRouter({ auth, hub }));
 app.get("/health", (c) => c.json({ ok: true }));
@@ -106,6 +107,18 @@ function requiredEnv(name: string): string {
     throw new Error(`Missing required environment variable: ${name}`);
   }
   return value;
+}
+
+function parseOptionalNonNegativeInt(value: string | undefined, name: string): number | undefined {
+  if (value === undefined || value.trim() === "") {
+    return undefined;
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    console.warn(`${name} must be a non-negative integer; ignoring.`);
+    return undefined;
+  }
+  return parsed;
 }
 
 function loadDotEnv(path: string): void {

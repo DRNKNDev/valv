@@ -256,6 +256,8 @@ mod tests {
             active_syncs: 0,
             pending_ops: 0,
             last_synced_at: None,
+            update_required: false,
+            update_required_flag: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),

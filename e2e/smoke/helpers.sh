@@ -196,6 +196,15 @@ assert_bucket_key() {
   mc stat "local/${BUCKET_NAME}/${key}" >/dev/null 2>&1 || fail "MinIO key not found: ${key}"
 }
 
+expected_chunk_key() {
+  local chunk_hash="$1"
+  if [ -n "${VALV_SMOKE_TENANT_ID:-}" ]; then
+    printf 'chunks/%s/%s\n' "$VALV_SMOKE_TENANT_ID" "$chunk_hash"
+  else
+    printf 'chunks/%s\n' "$chunk_hash"
+  fi
+}
+
 tree_json() {
   local folder_id="$1"
   api GET "/api/folders/${folder_id}/tree"

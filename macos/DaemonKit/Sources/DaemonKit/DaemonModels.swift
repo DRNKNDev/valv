@@ -17,6 +17,7 @@ public struct MountStatus: Codable, Hashable, Sendable {
     public let syncing: Bool
     public let pendingOps: Int
     public let lastSyncedAt: String?
+    public let updateRequired: Bool
     public let error: String?
 
     enum CodingKeys: String, CodingKey {
@@ -29,6 +30,7 @@ public struct MountStatus: Codable, Hashable, Sendable {
         case syncing
         case pendingOps = "pending_ops"
         case lastSyncedAt = "last_synced_at"
+        case updateRequired = "update_required"
         case error
     }
 }
@@ -37,6 +39,7 @@ public struct DaemonStatus: Codable, Hashable, Sendable {
     public let paused: Bool
     public let backendConnected: Bool
     public let version: String
+    public let updateRequired: Bool
     public let mounts: [MountStatus]
     public let account: AccountStatus?
 
@@ -44,6 +47,7 @@ public struct DaemonStatus: Codable, Hashable, Sendable {
         case paused
         case backendConnected = "backend_connected"
         case version
+        case updateRequired = "update_required"
         case mounts
         case account
     }

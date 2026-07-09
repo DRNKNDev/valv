@@ -47,6 +47,76 @@ describe("device auth routes", () => {
     expect(onDeviceCreated).toHaveBeenCalledWith({ deviceId: body.device_id, userId: "user-1" });
   });
 
+  it("uses createDeviceForRoute instead of the default insert when provided", async () => {
+    const db = new DeviceTestDb();
+    const createDeviceForRoute = vi.fn(async () => undefined);
+    const app = createDeviceAuthRouter(authFor(db, { userId: "user-1" }), { createDeviceForRoute });
+
+    const response = await app.request("/device", {
+      method: "POST",
+      body: JSON.stringify({ name: "MacBook" }),
+      headers: { "content-type": "application/json" },
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(db.insertedDevices).toHaveLength(0);
+    expect(createDeviceForRoute).toHaveBeenCalledWith({
+      deviceId: body.device_id,
+      userId: "user-1",
+      name: "MacBook",
+      tokenHash: sha256Hex(body.token),
+    });
+  });
+
+  it("propagates createDeviceForRoute failures without creating a default row", async () => {
+    const db = new DeviceTestDb();
+    const app = createDeviceAuthRouter(authFor(db, { userId: "user-1" }), {
+      createDeviceForRoute: vi.fn(async () => {
+        throw new Error("tenant missing");
+      }),
+    });
+
+    const response = await app.request("/device", { method: "POST" });
+
+    expect(response.status).toBe(500);
+    expect(db.insertedDevices).toHaveLength(0);
+  });
+
+  it("runs checkPlan before createDeviceForRoute", async () => {
+    const db = new DeviceTestDb();
+    const createDeviceForRoute = vi.fn(async () => undefined);
+    const onDeviceCreated = vi.fn(async () => undefined);
+    const app = createDeviceAuthRouter(authFor(db, { userId: "user-1" }), {
+      checkPlan: vi.fn(async () => ({ allowed: false, status: "none" })),
+      createDeviceForRoute,
+      onDeviceCreated,
+    });
+
+    const response = await app.request("/device", { method: "POST" });
+
+    expect(response.status).toBe(402);
+    expect(createDeviceForRoute).not.toHaveBeenCalled();
+    expect(onDeviceCreated).not.toHaveBeenCalled();
+    expect(db.insertedDevices).toHaveLength(0);
+  });
+
+  it("still swallows onDeviceCreated failures after createDeviceForRoute succeeds", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const app = createDeviceAuthRouter(authFor(new DeviceTestDb(), { userId: "user-1" }), {
+      createDeviceForRoute: vi.fn(async () => undefined),
+      onDeviceCreated: vi.fn(async () => {
+        throw new Error("side effect failed");
+      }),
+    });
+
+    const response = await app.request("/device", { method: "POST" });
+
+    expect(response.status).toBe(200);
+    expect(consoleError).toHaveBeenCalledWith("onDeviceCreated hook failed", expect.any(Error));
+    consoleError.mockRestore();
+  });
+
   it("does not fail registration when onDeviceCreated rejects", async () => {
     const db = new DeviceTestDb();
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);

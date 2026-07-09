@@ -26,7 +26,8 @@ use valv_sync::{
     storage::download_chunks,
     sync_engine::{
         delta_pull::{pull_delta, PulledNode},
-        local_push::{push_local, PushSummary},
+        local_push::{push_local_with_update_required, PushSummary},
+        update_required::is_update_required,
         ws_client::ws_push_loop,
     },
     watch::{fs_watch_task, WatchMount},
@@ -196,6 +197,7 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
             path: PathBuf::from(&mount.path),
             folder_id: mount.folder_id.clone(),
             device_name,
+            update_required: mount.update_required_flag.clone(),
         };
         async move {
             if let Err(error) = fs_watch_task(
@@ -294,7 +296,12 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
             apply_error.or(cleanup_error)
         }
         Err(err) => {
-            state.backend_health.record_failure();
+            if is_update_required(&err).is_some() {
+                state.backend_health.record_success();
+                mark_mount_update_required(state, &mount.folder_id).await;
+            } else {
+                state.backend_health.record_failure();
+            }
             Some(err.to_string())
         }
     };
@@ -308,9 +315,12 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
 async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary {
     let _sync_guard = mount.sync_lock.lock().await;
     begin_mount_sync(state, &mount.folder_id).await;
+    if mount.update_required {
+        mount.update_required_flag.store(true, Ordering::Release);
+    }
 
     let mut summary = SyncSummary::default();
-    let push_result = push_local(
+    let push_result = push_local_with_update_required(
         PathBuf::from(&mount.path).as_path(),
         &mount.folder_id,
         mount.scope_node_id.as_deref(),
@@ -319,6 +329,7 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
         &state.config.backend_url,
         mount.effective_token(&state.config),
         &state.config.device_name,
+        &mount.update_required_flag,
     )
     .await;
     match push_result {
@@ -332,6 +343,19 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
             .await;
         }
         Err(error) => {
+            if is_update_required(&error).is_some() {
+                state.backend_health.record_success();
+                mark_mount_update_required(state, &mount.folder_id).await;
+                tracing::error!(
+                    folder_id = %mount.folder_id,
+                    error = %error,
+                    "push_local halted because an update is required"
+                );
+                summary.errors += 1;
+                set_mount_pending_ops(state, &mount.folder_id, 0).await;
+                end_mount_sync(state, &mount.folder_id, Some(error.to_string())).await;
+                return summary;
+            }
             tracing::error!(
                 folder_id = %mount.folder_id,
                 error = %error,
@@ -378,7 +402,12 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
             None
         }
         Err(error) => {
-            state.backend_health.record_failure();
+            if is_update_required(&error).is_some() {
+                state.backend_health.record_success();
+                mark_mount_update_required(state, &mount.folder_id).await;
+            } else {
+                state.backend_health.record_failure();
+            }
             summary.errors += 1;
             Some(error.to_string())
         }
@@ -990,7 +1019,9 @@ async fn begin_mount_sync(state: &DaemonState, folder_id: &str) {
     let mut mounts = state.mounts.lock().await;
     if let Some(mount) = mounts.iter_mut().find(|mount| mount.folder_id == folder_id) {
         mount.active_syncs = mount.active_syncs.saturating_add(1);
-        mount.error = None;
+        if !mount.update_required && !mount.update_required_flag.load(Ordering::Acquire) {
+            mount.error = None;
+        }
     }
 }
 
@@ -1002,6 +1033,14 @@ pub(crate) async fn end_mount_sync(state: &DaemonState, folder_id: &str, error: 
         if mount.active_syncs == 0 && mount.error.is_none() {
             mount.last_synced_at = Some(Utc::now().to_rfc3339());
         }
+    }
+}
+
+pub(crate) async fn mark_mount_update_required(state: &DaemonState, folder_id: &str) {
+    let mut mounts = state.mounts.lock().await;
+    if let Some(mount) = mounts.iter_mut().find(|mount| mount.folder_id == folder_id) {
+        mount.update_required = true;
+        mount.update_required_flag.store(true, Ordering::Release);
     }
 }
 
@@ -1039,6 +1078,7 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
         sync::Mutex,
+        time::{timeout, Duration},
     };
     use valv_sync::{
         persistence::{
@@ -1240,6 +1280,112 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn update_required_pull_sets_mount_and_daemon_status_without_backend_disconnect() {
+        let mut state = test_state();
+        let mount = test_mount("/sync");
+        {
+            let conn = state.db.lock().await;
+            mounts::upsert_mount(&conn, &mount.path, &mount.folder_id, None, None, None, true)
+                .unwrap();
+        }
+        *state.mounts.lock().await = vec![mount.clone()];
+        state.config.backend_url = delta_server(vec![
+            r#"{"ops":[{"server_seq":1,"node_id":"future-node","op_type":"future_op","op_payload":{},"actor_device_id":"other-device","applied_at":"2026-07-08T00:00:00Z"}],"up_to_seq":1}"#,
+        ])
+        .await;
+
+        pull_mount_once(&state, &mount).await;
+        let status = crate::control::get_status(State(state)).await.unwrap().0;
+
+        assert!(status.backend_connected);
+        assert!(status.update_required);
+        assert_eq!(status.mounts.len(), 1);
+        assert!(status.mounts[0].update_required);
+    }
+
+    #[tokio::test]
+    async fn update_required_push_sets_mount_and_stops_further_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"alpha").unwrap();
+        fs::write(dir.path().join("b.txt"), b"bravo").unwrap();
+        let mut state = test_state();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        {
+            let conn = state.db.lock().await;
+            mounts::upsert_mount(&conn, &mount.path, &mount.folder_id, None, None, None, true)
+                .unwrap();
+            nodes::upsert_node(
+                &conn,
+                &LocalNode {
+                    node_id: "root-node".into(),
+                    folder_id: mount.folder_id.clone(),
+                    parent_id: None,
+                    name: "Mount".into(),
+                    node_type: "folder".into(),
+                    current_version_id: None,
+                    server_seq: 0,
+                    deleted_at: None,
+                },
+            )
+            .unwrap();
+        }
+        *state.mounts.lock().await = vec![mount.clone()];
+        let (backend_url, server) = push_update_required_server().await;
+        state.config.backend_url = backend_url;
+
+        let summary = full_sync_mount(&state, &mount).await;
+        let requests = server.await.unwrap();
+        let status = crate::control::get_status(State(state)).await.unwrap().0;
+
+        assert_eq!(summary.errors, 1);
+        assert_eq!(requests, vec!["POST /api/folders/folder-1/ops"]);
+        assert!(status.backend_connected);
+        assert!(status.update_required);
+        assert_eq!(status.mounts.len(), 1);
+        assert!(status.mounts[0].update_required);
+    }
+
+    #[tokio::test]
+    async fn update_required_push_short_circuits_when_mount_already_halted() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"alpha").unwrap();
+        let mut state = test_state();
+        let mut mount = test_mount(dir.path().to_string_lossy().as_ref());
+        mount.update_required = true;
+        {
+            let conn = state.db.lock().await;
+            mounts::upsert_mount(&conn, &mount.path, &mount.folder_id, None, None, None, true)
+                .unwrap();
+            nodes::upsert_node(
+                &conn,
+                &LocalNode {
+                    node_id: "root-node".into(),
+                    folder_id: mount.folder_id.clone(),
+                    parent_id: None,
+                    name: "Mount".into(),
+                    node_type: "folder".into(),
+                    current_version_id: None,
+                    server_seq: 0,
+                    deleted_at: None,
+                },
+            )
+            .unwrap();
+        }
+        *state.mounts.lock().await = vec![mount.clone()];
+        let (backend_url, server) = push_update_required_server().await;
+        state.config.backend_url = backend_url;
+
+        let summary = full_sync_mount(&state, &mount).await;
+        let requests = server.await.unwrap();
+        let status = crate::control::get_status(State(state)).await.unwrap().0;
+
+        assert_eq!(summary.errors, 1);
+        assert!(requests.is_empty());
+        assert!(status.update_required);
+        assert!(status.mounts[0].update_required);
+    }
+
     fn test_mount(path: &str) -> MountState {
         MountState {
             path: path.to_owned(),
@@ -1252,6 +1398,8 @@ mod tests {
             active_syncs: 0,
             pending_ops: 0,
             last_synced_at: None,
+            update_required: false,
+            update_required_flag: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(tokio::sync::Notify::new()),
@@ -1275,5 +1423,83 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    async fn push_update_required_server() -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            while let Ok(Ok((mut stream, _))) =
+                timeout(Duration::from_millis(200), listener.accept()).await
+            {
+                let (request_line, _body) = read_http_request(&mut stream).await;
+                requests.push(request_line.clone());
+                if request_line == "POST /api/folders/folder-1/ops" {
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        br#"{"result":"future","server_seq":7,"node_id":"future-node"}"#,
+                    )
+                    .await;
+                } else if request_line == "GET /api/folders/folder-1/ops?since=0" {
+                    write_http_response(&mut stream, "200 OK", br#"{"ops":[],"up_to_seq":0}"#)
+                        .await;
+                } else {
+                    write_http_response(&mut stream, "404 Not Found", b"{}").await;
+                }
+            }
+            requests
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let header_end;
+        loop {
+            let n = stream.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "connection closed before headers");
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+        let headers = String::from_utf8_lossy(&buf[..header_end]);
+        let request_line = headers.lines().next().unwrap();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap();
+        let path = parts.next().unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .or_else(|| line.strip_prefix("content-length: "))
+            })
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = buf[header_end..].to_vec();
+        while body.len() < content_length {
+            let n = stream.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "connection closed before body");
+            body.extend_from_slice(&tmp[..n]);
+        }
+        body.truncate(content_length);
+        (format!("{method} {path}"), body)
+    }
+
+    async fn write_http_response(
+        stream: &mut tokio::net::TcpStream,
+        status_line: &str,
+        body: &[u8],
+    ) {
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
     }
 }

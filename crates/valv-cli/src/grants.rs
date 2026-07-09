@@ -319,7 +319,14 @@ mod tests {
 
     #[tokio::test]
     async fn structured_backend_error_body_renders_readably() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let _guard = crate::LOOPBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let listener = match TcpListener::bind(("127.0.0.1", 0)).await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to bind loopback test listener: {error}"),
+        };
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();

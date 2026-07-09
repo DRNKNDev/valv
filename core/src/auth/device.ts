@@ -12,6 +12,7 @@ import {
 
 export type DeviceAuthRouterOptions = {
   checkPlan?: (userId: string) => Promise<{ allowed: boolean; status?: string } | null>;
+  createDeviceForRoute?: (opts: { deviceId: string; userId: string; name: string; tokenHash: string }) => Promise<void>;
   onDeviceCreated?: (info: { deviceId: string; userId: string }) => Promise<void>;
 };
 
@@ -35,12 +36,17 @@ export function createDeviceAuthRouter(auth: CoreAuth, opts: DeviceAuthRouterOpt
       return ctx.json({ error: "subscription_inactive", status: plan.status }, 402);
     }
 
-    await auth.db.insert(auth.schema.devices).values({
-      deviceId,
-      userId: principal.userId,
-      name,
-      tokenHash: sha256Hex(token),
-    });
+    const tokenHash = sha256Hex(token);
+    if (opts.createDeviceForRoute) {
+      await opts.createDeviceForRoute({ deviceId, userId: principal.userId, name, tokenHash });
+    } else {
+      await auth.db.insert(auth.schema.devices).values({
+        deviceId,
+        userId: principal.userId,
+        name,
+        tokenHash,
+      });
+    }
 
     if (opts.onDeviceCreated) {
       try {

@@ -138,6 +138,8 @@ struct MountState {
     active_syncs: u32,
     pending_ops: u64,
     last_synced_at: Option<String>,
+    update_required: bool,
+    update_required_flag: Arc<AtomicBool>,
     error: Option<String>,
     // Serializes pull_mount_once/full_sync_mount for this mount so a background
     // pull can't mutate the local mirror mid-flight through an explicit sync's
@@ -235,6 +237,8 @@ async fn run() -> Result<()> {
             active_syncs: 0,
             pending_ops: 0,
             last_synced_at: None,
+            update_required: false,
+            update_required_flag: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
@@ -431,6 +435,8 @@ impl MountState {
             syncing: self.active_syncs > 0,
             pending_ops: self.pending_ops,
             last_synced_at: self.last_synced_at.clone(),
+            update_required: self.update_required
+                || self.update_required_flag.load(Ordering::Acquire),
             error: self.error.clone(),
         }
     }

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { sha256Hex } from "../auth/index.js";
 import { grant, LifecycleDb, metadataAppFor } from "../../tests/support.js";
@@ -118,6 +118,187 @@ describe("grant routes", () => {
     expect(db.devices[0]).toMatchObject({ userId: null, name: "Agent" });
     expect(db.devices[0]?.tokenHash).toBe(sha256Hex(body.token));
     expect(db.folderGrants[0]).toMatchObject({ deviceId: body.device_id, userId: null, canWrite: false });
+  });
+
+  it("fires onGrantCreated with the new folder, grant, and device ids", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("root");
+    const onGrantCreated = vi.fn(async () => undefined);
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" }, { onGrantCreated });
+
+    const response = await app.request("/folders/folder-1/grants", {
+      method: "POST",
+      body: JSON.stringify({ name: "Agent", can_read: true, can_write: false }),
+      headers: { "content-type": "application/json" },
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(onGrantCreated).toHaveBeenCalledWith({
+      folderId: "folder-1",
+      grantId: body.grant_id,
+      deviceId: body.device_id,
+    });
+  });
+
+  it("does not fail grant creation when onGrantCreated rejects", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("root");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" }, {
+      onGrantCreated: vi.fn(async () => {
+        throw new Error("boom");
+      }),
+    });
+
+    const response = await app.request("/folders/folder-1/grants", {
+      method: "POST",
+      body: JSON.stringify({ name: "Agent" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(consoleError).toHaveBeenCalledWith("onGrantCreated hook failed", expect.any(Error));
+    consoleError.mockRestore();
+  });
+
+  it("fires onGrantDeviceCreated after provisioning through the route-store branch", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("work");
+    const onGrantDeviceCreated = vi.fn(async () => undefined);
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" }, { onGrantDeviceCreated });
+
+    const response = await app.request("/folders/folder-1/grants", {
+      method: "POST",
+      body: JSON.stringify({ scope_node_id: "work", name: "Agent" }),
+      headers: { "content-type": "application/json" },
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(onGrantDeviceCreated).toHaveBeenCalledWith({
+      folderId: "folder-1",
+      scopeNodeId: "work",
+      deviceId: body.device_id,
+      grantId: body.grant_id,
+    });
+  });
+
+  it("fires onGrantDeviceCreated after provisioning through the fallback branch", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("work");
+    (db as Partial<LifecycleDb>).createAgentGrantForRoute = undefined;
+    const onGrantDeviceCreated = vi.fn(async () => undefined);
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" }, { onGrantDeviceCreated });
+
+    const response = await app.request("/folders/folder-1/grants", {
+      method: "POST",
+      body: JSON.stringify({ scope_node_id: "work", name: "Agent" }),
+      headers: { "content-type": "application/json" },
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(onGrantDeviceCreated).toHaveBeenCalledWith({
+      folderId: "folder-1",
+      scopeNodeId: "work",
+      deviceId: body.device_id,
+      grantId: body.grant_id,
+    });
+  });
+
+  it("does not fail provisioning when onGrantDeviceCreated rejects", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("work");
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" }, {
+      onGrantDeviceCreated: vi.fn(async () => {
+        throw new Error("side effect failed");
+      }),
+    });
+
+    const response = await app.request("/folders/folder-1/grants", {
+      method: "POST",
+      body: JSON.stringify({ scope_node_id: "work", name: "Agent" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.devices).toHaveLength(1);
+    expect(db.folderGrants).toHaveLength(1);
+    expect(consoleError).toHaveBeenCalledWith("onGrantDeviceCreated hook failed", expect.any(Error));
+    consoleError.mockRestore();
+  });
+
+  it("blocks provisioning when checkPlanForGrant denies the folder", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("work");
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" }, {
+      checkPlanForGrant: vi.fn(async () => ({ allowed: false, status: "canceled" })),
+    });
+
+    const response = await app.request("/folders/folder-1/grants", {
+      method: "POST",
+      body: JSON.stringify({ scope_node_id: "work", name: "Agent" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(402);
+    await expect(response.json()).resolves.toEqual({ error: "subscription_inactive", status: "canceled" });
+    expect(db.devices).toHaveLength(0);
+    expect(db.folderGrants).toHaveLength(0);
+  });
+
+  it("allows provisioning when checkPlanForGrant approves the folder", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("work");
+    const checkPlanForGrant = vi.fn(async () => ({ allowed: true }));
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" }, { checkPlanForGrant });
+
+    const response = await app.request("/folders/folder-1/grants", {
+      method: "POST",
+      body: JSON.stringify({ scope_node_id: "work", name: "Agent" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(200);
+    expect(checkPlanForGrant).toHaveBeenCalledWith("folder-1");
+    expect(db.devices).toHaveLength(1);
+    expect(db.folderGrants).toHaveLength(1);
+  });
+
+  it("does not call checkPlanForGrant when authorization fails", async () => {
+    const db = new LifecycleDb();
+    const checkPlanForGrant = vi.fn(async () => ({ allowed: true }));
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" }, { checkPlanForGrant });
+
+    const response = await app.request("/folders/folder-1/grants", {
+      method: "POST",
+      body: JSON.stringify({ scope_node_id: "work", name: "Agent" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(403);
+    expect(checkPlanForGrant).not.toHaveBeenCalled();
+  });
+
+  it("propagates createAgentGrantForRoute failures", async () => {
+    const db = new LifecycleDb();
+    db.authorizedScopes.add("work");
+    db.createAgentGrantForRoute = async () => {
+      throw new Error("tenant missing");
+    };
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" });
+
+    const response = await app.request("/folders/folder-1/grants", {
+      method: "POST",
+      body: JSON.stringify({ scope_node_id: "work", name: "Agent" }),
+      headers: { "content-type": "application/json" },
+    });
+
+    expect(response.status).toBe(500);
+    expect(db.devices).toHaveLength(0);
+    expect(db.folderGrants).toHaveLength(0);
   });
 
   it("revokes device tokens when deleting through the full route-store hooks", async () => {

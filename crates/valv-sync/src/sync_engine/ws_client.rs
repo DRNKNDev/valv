@@ -77,6 +77,8 @@ async fn connect_and_forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{net::TcpListener, time::timeout};
+    use tokio_tungstenite::accept_async;
 
     #[test]
     fn https_backend_derives_wss_url() {
@@ -91,6 +93,51 @@ mod tests {
         assert_eq!(
             derive_ws_url("http://localhost:3000", "secret").unwrap(),
             "ws://localhost:3000/ws?token=secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn future_shaped_json_message_is_ignored_without_disconnect() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _subscribe = socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::Text(
+                    r#"{"type":"future","payload":{"folder_id":"f1"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    r#"{"folder_id":"f1","server_seq":77}"#.into(),
+                ))
+                .await
+                .unwrap();
+            socket.close(None).await.unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let ws_url = format!("ws://{addr}/ws?token=secret");
+        let folder_ids = vec!["f1".to_owned()];
+        let client =
+            tokio::spawn(async move { connect_and_forward(&ws_url, &folder_ids, tx).await });
+        let notification = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(rx);
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            notification,
+            WsPushNotification {
+                folder_id: "f1".into(),
+                server_seq: 77
+            }
         );
     }
 }

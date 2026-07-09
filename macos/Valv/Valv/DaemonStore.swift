@@ -5,7 +5,7 @@ import Foundation
 /// One of the five states the menu-bar icon and dropdown summary reflect, in the
 /// precedence order the `macos-app` spec defines: not-set-up > error > paused >
 /// syncing > synced.
-enum IconState {
+enum IconState: Hashable {
     case notSetUp
     case error
     case paused

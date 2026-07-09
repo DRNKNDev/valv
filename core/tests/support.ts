@@ -3,7 +3,7 @@ import type { Hono } from "hono";
 import type { CoreAuth, CoreDb, Principal } from "../src/auth/index.js";
 import { pgSchema } from "../src/db/schema.js";
 import type { SendInviteEmail } from "../src/email/index.js";
-import { createMetadataRouter, type MetadataHub } from "../src/metadata/index.js";
+import { createMetadataRouter, type MetadataHub, type OnGrantCreated } from "../src/metadata/index.js";
 
 export type FolderGrant = {
   grantId: string;
@@ -28,7 +28,50 @@ export type FolderInvite = {
 };
 
 export class LifecycleDb implements CoreDb {
-  insert: CoreDb["insert"];
+  insert: CoreDb["insert"] = (table: unknown) => ({
+    values: async (value: Record<string, unknown>) => {
+      if (table === pgSchema.devices) {
+        this.devices.push({
+          deviceId: String(value.deviceId),
+          userId: value.userId === null ? null : String(value.userId),
+          name: String(value.name),
+          tokenHash: String(value.tokenHash),
+        });
+        return;
+      }
+      if (table === pgSchema.sharedFolders) {
+        this.sharedFolders.push({
+          folderId: String(value.folderId),
+          name: String(value.name),
+          ownerUserId: String(value.ownerUserId),
+        });
+        return;
+      }
+      if (table === pgSchema.nodes) {
+        this.nodes.push({
+          nodeId: String(value.nodeId),
+          folderId: String(value.folderId),
+          parentId: value.parentId === null ? null : String(value.parentId),
+          name: String(value.name),
+          type: String(value.type),
+        });
+        return;
+      }
+      if (table === pgSchema.folderGrants) {
+        this.folderGrants.push(
+          grant(String(value.grantId), {
+            folderId: String(value.folderId),
+            scopeNodeId: String(value.scopeNodeId),
+            userId: value.userId === null || value.userId === undefined ? undefined : String(value.userId),
+            deviceId: value.deviceId === null || value.deviceId === undefined ? undefined : String(value.deviceId),
+            role: value.role as "owner" | "collaborator" | undefined,
+            canRead: Boolean(value.canRead),
+            canWrite: Boolean(value.canWrite),
+          }),
+        );
+      }
+    },
+  });
   update: CoreDb["update"] = () => ({
     set: (values: Partial<{ tokenHash: string }>) => ({
       where: async () => {
@@ -249,6 +292,10 @@ export function metadataAppFor(
     hub?: MetadataHub;
     sendInviteEmail?: SendInviteEmail;
     onFolderCreated?: (info: { folderId: string; ownerUserId: string; grantId: string }) => Promise<void>;
+    minProtocolVersion?: number;
+    onGrantCreated?: OnGrantCreated;
+    onGrantDeviceCreated?: (info: { folderId: string; scopeNodeId: string; deviceId: string; grantId: string }) => Promise<void>;
+    checkPlanForGrant?: (folderId: string) => Promise<{ allowed: boolean; status?: string } | null>;
   } = {},
 ): Hono {
   if (principal.type === "device" && "setDevicePrincipal" in db && typeof db.setDevicePrincipal === "function") {
@@ -266,6 +313,10 @@ export function metadataAppFor(
     hub: opts.hub ?? { notify: () => undefined },
     sendInviteEmail: opts.sendInviteEmail,
     onFolderCreated: opts.onFolderCreated,
+    minProtocolVersion: opts.minProtocolVersion,
+    onGrantCreated: opts.onGrantCreated,
+    onGrantDeviceCreated: opts.onGrantDeviceCreated,
+    checkPlanForGrant: opts.checkPlanForGrant,
   }) as Hono;
 }
 

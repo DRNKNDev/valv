@@ -8,9 +8,6 @@ mod tests {
 
     #[test]
     fn toml_escape_escapes_backslashes_and_quotes() {
-        assert_eq!(
-            toml_escape(r#"path\with"quote"#),
-            r#"path\\with\"quote"#
-        );
+        assert_eq!(toml_escape(r#"path\with"quote"#), r#"path\\with\"quote"#);
     }
 }
