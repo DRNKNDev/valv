@@ -274,6 +274,7 @@ mod tests {
             mounts: Arc::new(Mutex::new(vec![mount])),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            update_status: Arc::new(Mutex::new(Default::default())),
             backend_health: Arc::new(crate::BackendHealth::default()),
             pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
             deferred_deletes: Arc::new(Mutex::new(HashMap::new())),

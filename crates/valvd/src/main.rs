@@ -54,7 +54,7 @@ use config::{
 use launchd::{install_daemon, uninstall_daemon};
 #[cfg(target_os = "linux")]
 use systemd::{install_daemon, uninstall_daemon};
-use tasks::{cancel_mount_tasks, spawn_account_status_task, spawn_mount_tasks};
+use tasks::{cancel_mount_tasks, spawn_account_status_task, spawn_mount_tasks, spawn_update_check_task, UpdateStatus};
 
 #[derive(Parser)]
 #[command(name = "valvd", about = "Valv sync daemon", version)]
@@ -87,6 +87,7 @@ struct DaemonState {
     // respawns that mount's own tasks instead of every persisted mount's.
     tasks: Arc<Mutex<HashMap<String, Vec<JoinHandle<()>>>>>,
     account: Arc<Mutex<Option<AccountStatus>>>,
+    update_status: Arc<Mutex<UpdateStatus>>,
     backend_health: Arc<BackendHealth>,
     pending_uploads: Arc<Mutex<HashSet<String>>>,
     deferred_deletes: Arc<Mutex<HashMap<String, HashSet<String>>>>,
@@ -253,6 +254,7 @@ async fn run() -> Result<()> {
         mounts: Arc::new(Mutex::new(mount_states)),
         tasks: Arc::new(Mutex::new(HashMap::new())),
         account: Arc::new(Mutex::new(None)),
+        update_status: Arc::new(Mutex::new(UpdateStatus::default())),
         backend_health: Arc::new(BackendHealth::default()),
         pending_uploads: Arc::new(Mutex::new(HashSet::new())),
         deferred_deletes: Arc::new(Mutex::new(HashMap::new())),
@@ -262,6 +264,14 @@ async fn run() -> Result<()> {
     };
     spawn_mount_tasks(&state).await;
     let _account_status_task = spawn_account_status_task(&state);
+    // VALV_NO_UPDATE_CHECK=1 disables this task entirely at startup (checked
+    // once here, not a live toggle) so smoke/e2e runs never make a live
+    // GitHub API call (daemon-lifecycle capability).
+    let _update_check_task = if std::env::var("VALV_NO_UPDATE_CHECK").as_deref() != Ok("1") {
+        Some(spawn_update_check_task(&state))
+    } else {
+        None
+    };
 
     serve_socket(state, &socket_path()?, &config_file, mount_count).await
 }
@@ -475,6 +485,7 @@ mod tests {
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            update_status: Arc::new(Mutex::new(Default::default())),
             backend_health: Arc::new(BackendHealth::default()),
             pending_uploads: Arc::new(Mutex::new(HashSet::new())),
             deferred_deletes: Arc::new(Mutex::new(HashMap::new())),

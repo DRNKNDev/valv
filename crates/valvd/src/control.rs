@@ -19,6 +19,7 @@ pub(crate) async fn get_status(
     let update_required = mounts.iter().any(|mount| mount.update_required);
     let backend_connected = state.backend_health.is_connected();
     let account = state.account.lock().await.clone();
+    let (latest_version, update_available) = state.update_status.lock().await.as_status_fields();
     Ok(Json(DaemonStatus {
         paused: state.paused.load(Ordering::Acquire),
         backend_connected,
@@ -26,6 +27,8 @@ pub(crate) async fn get_status(
         update_required,
         mounts,
         account,
+        latest_version,
+        update_available,
     }))
 }
 
@@ -83,6 +86,7 @@ mod tests {
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            update_status: Arc::new(Mutex::new(Default::default())),
             backend_health: Arc::new(crate::BackendHealth::default()),
             pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
             deferred_deletes: Arc::new(Mutex::new(HashMap::new())),
@@ -111,6 +115,31 @@ mod tests {
         assert!(response.0.backend_connected);
         assert!(!response.0.paused);
         assert!(!response.0.update_required);
+    }
+
+    #[tokio::test]
+    async fn get_status_omits_update_fields_before_any_check_completes() {
+        let response = get_status(State(test_state(connected_config())))
+            .await
+            .unwrap();
+
+        assert!(response.0.latest_version.is_none());
+        assert!(response.0.update_available.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_status_includes_update_fields_after_a_successful_check() {
+        let state = test_state(connected_config());
+        {
+            let mut update_status = state.update_status.lock().await;
+            update_status.latest_version = Some("9.9.9".to_owned());
+            update_status.update_available = Some(true);
+        }
+
+        let response = get_status(State(state)).await.unwrap();
+
+        assert_eq!(response.0.latest_version.as_deref(), Some("9.9.9"));
+        assert_eq!(response.0.update_available, Some(true));
     }
 
     #[tokio::test]

@@ -154,6 +154,72 @@ async fn poll_account_status_once(state: &DaemonState) -> AccountPollOutcome {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UpdateStatus {
+    pub(crate) latest_version: Option<String>,
+    pub(crate) update_available: Option<bool>,
+}
+
+impl UpdateStatus {
+    pub(crate) fn as_status_fields(&self) -> (Option<String>, Option<bool>) {
+        (self.latest_version.clone(), self.update_available)
+    }
+}
+
+const UPDATE_CHECK_BASE_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
+const UPDATE_CHECK_JITTER: Duration = Duration::from_secs(2 * 60 * 60);
+
+pub(crate) fn spawn_update_check_task(state: &DaemonState) -> tokio::task::JoinHandle<()> {
+    let state = state.clone();
+    tokio::spawn(async move {
+        update_check_loop(state).await;
+    })
+}
+
+async fn update_check_loop(state: DaemonState) {
+    let jitter = random_jitter(UPDATE_CHECK_JITTER);
+    let period = UPDATE_CHECK_BASE_PERIOD + jitter;
+
+    loop {
+        let mut ticker = interval_at(Instant::now() + period, period);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ticker.tick().await;
+
+        poll_update_status_once(&state).await;
+    }
+}
+
+fn random_jitter(max: Duration) -> Duration {
+    let entropy = u64::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap());
+    let max_nanos = max.as_nanos().max(1);
+    let offset_nanos = (entropy as u128) % max_nanos;
+    Duration::from_nanos(offset_nanos as u64)
+}
+
+async fn poll_update_status_once(state: &DaemonState) {
+    let repo = valv_sync::update::DEFAULT_REPO;
+    let outcome = valv_sync::update::resolve_latest_version(&state.client, repo, "VALV_VERSION").await;
+    let mut update_status = state.update_status.lock().await;
+    apply_update_check_outcome(&mut update_status, outcome, env!("CARGO_PKG_VERSION"));
+}
+
+fn apply_update_check_outcome(
+    update_status: &mut UpdateStatus,
+    outcome: anyhow::Result<String>,
+    running_version: &str,
+) {
+    match outcome {
+        Ok(latest_version) => {
+            let update_available = valv_sync::update::is_newer_version(&latest_version, running_version);
+            update_status.latest_version = Some(latest_version);
+            update_status.update_available = Some(update_available);
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "update-availability check failed");
+        }
+    }
+}
+
 pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState) {
     let (notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(32);
     let token = mount.effective_token(&state.config).to_owned();
@@ -1241,6 +1307,7 @@ mod tests {
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            update_status: Arc::new(Mutex::new(Default::default())),
             backend_health: Arc::new(crate::BackendHealth::default()),
             pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
             deferred_deletes: Arc::new(Mutex::new(HashMap::new())),
@@ -1428,6 +1495,68 @@ mod tests {
         assert_eq!(account.status, "active");
         assert_eq!(account.usage_bytes, 123);
         assert_eq!(account.quota_bytes, Some(456));
+    }
+
+    #[test]
+    fn update_check_success_populates_cache() {
+        let mut update_status = UpdateStatus::default();
+
+        apply_update_check_outcome(&mut update_status, Ok("9.9.9".to_owned()), "0.1.0");
+
+        assert_eq!(update_status.latest_version.as_deref(), Some("9.9.9"));
+        assert_eq!(update_status.update_available, Some(true));
+    }
+
+    #[test]
+    fn update_check_success_with_no_newer_release_reports_unavailable() {
+        let mut update_status = UpdateStatus::default();
+
+        apply_update_check_outcome(&mut update_status, Ok("0.1.0".to_owned()), "0.1.0");
+
+        assert_eq!(update_status.latest_version.as_deref(), Some("0.1.0"));
+        assert_eq!(update_status.update_available, Some(false));
+    }
+
+    #[test]
+    fn update_check_failure_after_prior_success_preserves_cache() {
+        let mut update_status = UpdateStatus::default();
+        apply_update_check_outcome(&mut update_status, Ok("9.9.9".to_owned()), "0.1.0");
+
+        apply_update_check_outcome(
+            &mut update_status,
+            Err(anyhow::anyhow!("network error")),
+            "0.1.0",
+        );
+
+        assert_eq!(update_status.latest_version.as_deref(), Some("9.9.9"));
+        assert_eq!(update_status.update_available, Some(true));
+    }
+
+    #[test]
+    fn update_check_failure_before_any_success_stays_absent() {
+        let mut update_status = UpdateStatus::default();
+
+        apply_update_check_outcome(
+            &mut update_status,
+            Err(anyhow::anyhow!("network error")),
+            "0.1.0",
+        );
+
+        assert!(update_status.latest_version.is_none());
+        assert!(update_status.update_available.is_none());
+    }
+
+    #[tokio::test]
+    async fn poll_update_status_once_uses_pinned_version_without_network() {
+        std::env::set_var("VALV_VERSION", "v42.0.0");
+        let state = test_state();
+
+        poll_update_status_once(&state).await;
+
+        std::env::remove_var("VALV_VERSION");
+        let (latest_version, update_available) = state.update_status.lock().await.as_status_fields();
+        assert_eq!(latest_version.as_deref(), Some("42.0.0"));
+        assert_eq!(update_available, Some(true));
     }
 
     #[test]
