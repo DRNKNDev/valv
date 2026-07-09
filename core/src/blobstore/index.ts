@@ -28,7 +28,7 @@ type BatchResponseObject = {
 
 export type QuotaPrincipal = { type: "device"; id: string } | { type: "user"; id: string };
 export type QuotaInfo = {
-  quota_bytes: number;
+  quota_bytes: number | null;
   usage_bytes: number;
   subscription_status: string;
   current_period_end: string | Date | null;
@@ -74,7 +74,7 @@ export function createBlobstoreRouter(opts: CreateBlobstoreRouterOptions): Hono<
           const newBytes = uploadPlans
             .filter((plan) => !plan.existing)
             .reduce((sum, plan) => sum + plan.object.size, 0);
-          if (quota.usage_bytes + newBytes > quota.quota_bytes) {
+          if (quota.quota_bytes !== null && quota.usage_bytes + newBytes > quota.quota_bytes) {
             return ctx.json({ error: "over_quota", usage_bytes: quota.usage_bytes, quota_bytes: quota.quota_bytes }, 402);
           }
         }

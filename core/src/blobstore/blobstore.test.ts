@@ -113,6 +113,41 @@ describe("blobstore batch coordination", () => {
     expect(response.status).toBe(200);
   });
 
+  it("treats active null quota as unlimited", async () => {
+    const response = await appFor(new BlobTestDb(), { type: "device", deviceId: "device-1" }, {
+      getQuota: async () => ({
+        quota_bytes: null,
+        usage_bytes: 999_999,
+        subscription_status: "active",
+        current_period_end: null,
+      }),
+    }).request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({ operation: "upload", objects: [{ oid: "new", size: 2 }] }),
+      headers: { "content-type": "application/json", authorization: "Bearer token" },
+    });
+
+    expect(response.status).toBe(200);
+  });
+
+  it("still denies blocked subscriptions with null quota", async () => {
+    const response = await appFor(new BlobTestDb(), { type: "device", deviceId: "device-1" }, {
+      getQuota: async () => ({
+        quota_bytes: null,
+        usage_bytes: 0,
+        subscription_status: "none",
+        current_period_end: null,
+      }),
+    }).request("/objects/batch", {
+      method: "POST",
+      body: JSON.stringify({ operation: "upload", objects: [{ oid: "new", size: 2 }] }),
+      headers: { "content-type": "application/json", authorization: "Bearer token" },
+    });
+
+    expect(response.status).toBe(402);
+    await expect(response.json()).resolves.toEqual({ error: "subscription_inactive", status: "none" });
+  });
+
   it("rejects past_due subscriptions after the grace period", async () => {
     const currentPeriodEnd = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
     const response = await appFor(new BlobTestDb(), { type: "device", deviceId: "device-1" }, {
@@ -344,7 +379,7 @@ function appFor(
   principal: Principal | null = { type: "user", userId: "user-1" },
   opts: {
     getQuota?: (principal: { type: "device" | "user"; id: string }) => Promise<{
-      quota_bytes: number;
+      quota_bytes: number | null;
       usage_bytes: number;
       subscription_status: string;
       current_period_end: string | null;
