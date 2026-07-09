@@ -15,6 +15,8 @@ use crate::{
     grants::{cmd_grant_create, cmd_grant_revoke, cmd_grants},
     paths::resolve_valvd_path,
     table::print_table,
+    update::cmd_update,
+    update_notice::maybe_print_update_notice,
 };
 
 #[derive(Parser)]
@@ -94,6 +96,12 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    /// Resolve, verify, and install the latest released valv/valvd, unless --check is passed.
+    Update {
+        /// Report whether a newer version is available without downloading or installing anything.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -157,7 +165,20 @@ enum DaemonCommand {
 pub(crate) async fn run() -> Result<()> {
     let cli = Cli::parse();
     let json = cli.json;
-    match cli.command {
+    let is_update_command = matches!(cli.command, Command::Update { .. });
+    let result = run_command(cli.command, json).await;
+    // Every subcommand other than `update` itself prints the ambient stderr
+    // notice after its own output completes - `valv update`'s own output
+    // already communicates version status, so it's excluded (valv-cli-commands
+    // spec: "valv update itself never prints this notice").
+    if !is_update_command {
+        maybe_print_update_notice().await;
+    }
+    result
+}
+
+async fn run_command(command: Command, json: bool) -> Result<()> {
+    match command {
         Command::Auth { command } => match command {
             AuthCommand::Login {
                 web_base_url,
@@ -198,6 +219,7 @@ pub(crate) async fn run() -> Result<()> {
         },
         Command::Grants { folder_path } => cmd_grants(folder_path, json).await,
         Command::Daemon { command } => delegate_daemon(command),
+        Command::Update { check } => cmd_update(check).await,
     }
 }
 
@@ -351,13 +373,20 @@ async fn cmd_status(json: bool) -> Result<()> {
         return Ok(());
     }
     if status.update_required {
-        println!("Update required");
+        println!("{UPDATE_REQUIRED_MESSAGE}");
     } else if status.paused {
         println!("Paused");
     } else if status.backend_connected {
         println!("Connected");
     } else {
         println!("Disconnected");
+    }
+    if status.update_available == Some(true) {
+        if let Some(latest_version) = &status.latest_version {
+            println!(
+                "A newer version of valv is available ({latest_version}). Run 'valv update' to install it."
+            );
+        }
     }
     let rows = status
         .mounts
@@ -368,7 +397,7 @@ async fn cmd_status(json: bool) -> Result<()> {
                 mount.syncing.to_string(),
                 mount.pending_ops.to_string(),
                 mount.last_synced_at.unwrap_or_else(|| "-".into()),
-                mount.update_required.to_string(),
+                update_required_cell(mount.update_required),
                 mount.error.unwrap_or_else(|| "-".into()),
             ]
         })
@@ -385,6 +414,16 @@ async fn cmd_status(json: bool) -> Result<()> {
         &rows,
     );
     Ok(())
+}
+
+const UPDATE_REQUIRED_MESSAGE: &str = "Update required — run 'valv update' to fix this";
+
+fn update_required_cell(update_required: bool) -> String {
+    if update_required {
+        UPDATE_REQUIRED_MESSAGE.to_owned()
+    } else {
+        "false".to_owned()
+    }
 }
 
 fn status_json(status: &DaemonStatus) -> Result<String> {
@@ -489,6 +528,19 @@ mod tests {
         assert_eq!(parsed, status);
         assert!(!output.contains("path syncing"));
         assert!(!output.contains("Connected"));
+    }
+
+    #[test]
+    fn update_required_cell_names_the_fix_when_true() {
+        assert_eq!(
+            update_required_cell(true),
+            "Update required — run 'valv update' to fix this"
+        );
+    }
+
+    #[test]
+    fn update_required_cell_is_a_bare_false_otherwise() {
+        assert_eq!(update_required_cell(false), "false");
     }
 
     #[test]

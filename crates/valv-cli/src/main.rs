@@ -5,6 +5,8 @@ mod daemon;
 mod grants;
 mod paths;
 mod table;
+mod update;
+mod update_notice;
 
 use anyhow::Error;
 use std::process::ExitCode;
