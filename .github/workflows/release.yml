@@ -95,6 +95,23 @@ jobs:
           set -euo pipefail
           cd dist
           sha256sum valv-${{ needs.version.outputs.version }}-*.tar.gz > SHA256SUMS
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Sign checksum manifest
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n "${MINISIGN_SECRET_KEY}" ]] || {
+            echo "MINISIGN_SECRET_KEY secret is not set - see design.md D2" >&2
+            exit 1
+          }
+          key_file="$(mktemp)"
+          trap 'rm -f "${key_file}"' EXIT
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > "${key_file}"
+          minisign -S -s "${key_file}" -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig \
+            -t "valv release ${{ github.ref_name }}"
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
@@ -103,3 +120,4 @@ jobs:
             dist/valv-${{ needs.version.outputs.version }}-aarch64-apple-darwin.tar.gz
             dist/valv-${{ needs.version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
             dist/SHA256SUMS
+            dist/SHA256SUMS.minisig

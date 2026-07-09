@@ -34,21 +34,34 @@ usage() {
   cat >&2 <<'USAGE'
 Usage:
   DEVELOPER_ID_APPLICATION="Developer ID Application: Name (TEAMID)" \
+    MINISIGN_SECRET_KEY_FILE="/path/to/founder/minisign.key" \
     oss/scripts/sign-cli-binaries.sh v0.1.0
 
 Optionally pass the signing identity as a second argument.
+
+MINISIGN_SECRET_KEY_FILE (task 1.3) must point at the same minisign keypair
+release.yml's "Sign checksum manifest" step signs SHA256SUMS with (task 1.2)
+- this script's re-signing step is MANDATORY, not optional: it mutates
+SHA256SUMS after codesigning, so the signature release.yml already produced
+no longer verifies against the file's new content until this step
+regenerates it (see design.md D2). If the key is password-protected,
+`minisign -S` prompts for it interactively.
 USAGE
 }
 
 tag="${1:-}"
 identity="${DEVELOPER_ID_APPLICATION:-${2:-}}"
+minisign_key_file="${MINISIGN_SECRET_KEY_FILE:-}"
 
 [[ -n "${tag}" ]] || { usage; fail "missing tag"; }
 [[ "${tag}" == v* ]] || fail "tag must start with v"
 [[ -n "${identity}" ]] || { usage; fail "missing Developer ID Application identity"; }
+[[ -n "${minisign_key_file}" ]] || { usage; fail "missing MINISIGN_SECRET_KEY_FILE"; }
+[[ -f "${minisign_key_file}" ]] || fail "MINISIGN_SECRET_KEY_FILE does not exist: ${minisign_key_file}"
 
 need gh
 need codesign
+need minisign
 need tar
 need awk
 need mktemp
@@ -97,10 +110,16 @@ awk -v asset="${asset}" -v digest="${digest}" '
   fail "SHA256SUMS did not contain ${asset}"
 mv "${tmp_dir}/SHA256SUMS.updated" "${tmp_dir}/SHA256SUMS"
 
+minisign -S -s "${minisign_key_file}" \
+  -m "${tmp_dir}/SHA256SUMS" \
+  -x "${tmp_dir}/SHA256SUMS.minisig" \
+  -t "valv release ${tag} (macOS re-sign)"
+
 gh release upload "${tag}" \
   --repo "${repo}" \
   --clobber \
   "${tmp_dir}/${asset}" \
-  "${tmp_dir}/SHA256SUMS"
+  "${tmp_dir}/SHA256SUMS" \
+  "${tmp_dir}/SHA256SUMS.minisig"
 
-echo "Uploaded signed ${asset} and updated SHA256SUMS to ${repo} ${tag}"
+echo "Uploaded signed ${asset}, updated SHA256SUMS, and re-signed SHA256SUMS.minisig to ${repo} ${tag}"
