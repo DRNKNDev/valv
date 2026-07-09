@@ -32,13 +32,24 @@ pub async fn resolve_latest_version(
     repo: &str,
     pinned_version_env: &str,
 ) -> Result<String> {
+    resolve_latest_version_from(client, GITHUB_API_BASE, repo, pinned_version_env).await
+}
+
+const GITHUB_API_BASE: &str = "https://api.github.com";
+
+async fn resolve_latest_version_from(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &str,
+    pinned_version_env: &str,
+) -> Result<String> {
     if let Ok(pinned) = std::env::var(pinned_version_env) {
         if !pinned.is_empty() {
             return Ok(pinned.trim_start_matches('v').to_owned());
         }
     }
 
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let url = format!("{api_base}/repos/{repo}/releases/latest");
     let response = client
         .get(&url)
         .header("User-Agent", "valv-update-check")
@@ -193,12 +204,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_latest_version_ignores_an_empty_pin() {
+    async fn resolve_latest_version_ignores_an_empty_pin_and_resolves_live() {
         std::env::set_var("VALV_UPDATE_TEST_EMPTY_PIN", "");
+        let base_url = latest_release_server("200 OK", r#"{"tag_name":"v0.6.1"}"#).await;
+        let client = reqwest::Client::new();
 
-        let pinned = std::env::var("VALV_UPDATE_TEST_EMPTY_PIN").unwrap();
+        let version = resolve_latest_version_from(
+            &client,
+            &base_url,
+            "test/repo",
+            "VALV_UPDATE_TEST_EMPTY_PIN",
+        )
+        .await
+        .unwrap();
+
         std::env::remove_var("VALV_UPDATE_TEST_EMPTY_PIN");
-        assert!(pinned.is_empty());
+        assert_eq!(version, "0.6.1");
     }
 
     #[test]
@@ -207,35 +228,31 @@ mod tests {
         assert_eq!(release.tag_name.trim_start_matches('v'), "1.2.3");
     }
 
-    async fn resolve_from_base_url(client: &reqwest::Client, base_url: &str) -> Result<String> {
-        let response = client
-            .get(format!("{base_url}/repos/test/repo/releases/latest"))
-            .header("User-Agent", "valv-update-check")
-            .send()
-            .await
-            .context("request failed")?;
-        if !response.status().is_success() {
-            return Err(anyhow!("non-success status: {}", response.status()));
-        }
-        let release = response.json::<GithubRelease>().await.context("decode")?;
-        Ok(release.tag_name.trim_start_matches('v').to_owned())
-    }
-
     #[tokio::test]
-    async fn resolve_from_base_url_parses_tag_name_and_strips_v() {
+    async fn resolve_latest_version_from_parses_tag_name_and_strips_v() {
         let base_url = latest_release_server("200 OK", r#"{"tag_name":"v0.4.2"}"#).await;
         let client = reqwest::Client::new();
 
-        let version = resolve_from_base_url(&client, &base_url).await.unwrap();
+        let version =
+            resolve_latest_version_from(&client, &base_url, "test/repo", "VALV_UPDATE_TEST_UNSET_A")
+                .await
+                .unwrap();
 
         assert_eq!(version, "0.4.2");
     }
 
     #[tokio::test]
-    async fn resolve_from_base_url_errors_on_non_success_status() {
+    async fn resolve_latest_version_from_errors_on_non_success_status() {
         let base_url = latest_release_server("404 Not Found", r#"{"message":"Not Found"}"#).await;
         let client = reqwest::Client::new();
 
-        assert!(resolve_from_base_url(&client, &base_url).await.is_err());
+        assert!(resolve_latest_version_from(
+            &client,
+            &base_url,
+            "test/repo",
+            "VALV_UPDATE_TEST_UNSET_B"
+        )
+        .await
+        .is_err());
     }
 }
