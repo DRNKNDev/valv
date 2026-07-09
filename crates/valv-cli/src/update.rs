@@ -32,20 +32,27 @@ pub(crate) async fn cmd_update(check: bool) -> Result<()> {
 
     let current_version = env!("CARGO_PKG_VERSION");
     let client = reqwest::Client::new();
+    let pinned = std::env::var("VALV_VERSION").is_ok_and(|value| !value.is_empty());
     let latest_version =
         resolve_latest_version(&client, shared_update::DEFAULT_REPO, "VALV_VERSION")
             .await
             .context("failed to resolve the latest valv release")?;
 
-    match plan_update(current_version, &latest_version, check) {
+    match plan_update(current_version, &latest_version, check, pinned) {
         UpdatePlan::AlreadyUpToDate => {
             println!("valv is already up to date ({current_version})");
             return Ok(());
         }
         UpdatePlan::ReportOnly => {
-            println!(
-                "A newer version of valv is available ({latest_version}). Run 'valv update' to install it."
-            );
+            if pinned {
+                println!(
+                    "valv {latest_version} is pinned via VALV_VERSION and would be installed. Run 'valv update' to install it."
+                );
+            } else {
+                println!(
+                    "A newer version of valv is available ({latest_version}). Run 'valv update' to install it."
+                );
+            }
             return Ok(());
         }
         UpdatePlan::Install => {}
@@ -94,11 +101,7 @@ pub(crate) async fn cmd_update(check: bool) -> Result<()> {
 
     if should_swap_valvd {
         if let Err(error) = restart_and_confirm(&latest_version).await {
-            swap.rollback(&backup)?;
-            let _ = restart_daemon();
-            return Err(anyhow!(
-                "update failed and was rolled back: {error}"
-            ));
+            return Err(handle_failed_restart(&swap, &backup, restart_daemon, error));
         }
     }
 
@@ -120,14 +123,41 @@ enum UpdatePlan {
     Install,
 }
 
-fn plan_update(current_version: &str, latest_version: &str, check: bool) -> UpdatePlan {
-    if !is_newer_version(latest_version, current_version) {
+fn plan_update(
+    current_version: &str,
+    latest_version: &str,
+    check: bool,
+    pinned: bool,
+) -> UpdatePlan {
+    if !pinned && !is_newer_version(latest_version, current_version) {
         return UpdatePlan::AlreadyUpToDate;
     }
     if check {
         return UpdatePlan::ReportOnly;
     }
     UpdatePlan::Install
+}
+
+fn handle_failed_restart(
+    swap: &impl BinarySwap,
+    backup: &SwapBackup,
+    restart: impl Fn() -> Result<()>,
+    original_error: anyhow::Error,
+) -> anyhow::Error {
+    match swap.rollback(backup) {
+        Ok(()) => {
+            let _ = restart();
+            anyhow!("update failed and was rolled back: {original_error}")
+        }
+        Err(rollback_error) => {
+            let _ = restart();
+            anyhow!(
+                "update failed ({original_error}) AND the rollback also failed ({rollback_error}) - \
+                 the installed valv/valvd binaries may be in an inconsistent state; \
+                 reinstall with install.sh"
+            )
+        }
+    }
 }
 
 
@@ -318,24 +348,43 @@ impl BinarySwap for UnixBinarySwap {
     ) -> Result<SwapBackup> {
         let valv_current = install_dir.join("valv");
         let valv_backup = install_dir.join("valv.old");
+
         rename_atomic(&valv_current, &valv_backup)?;
+
         if let Err(error) = rename_atomic(staged_valv, &valv_current) {
-            let _ = rename_atomic(&valv_backup, &valv_current);
+            restore_binary(&valv_backup, &valv_current);
             return Err(error.context("failed to install new valv binary"));
         }
-        set_executable(&valv_current)?;
+
+        if let Err(error) = set_executable(&valv_current) {
+            restore_binary(&valv_backup, &valv_current);
+            return Err(error.context("failed to set executable permission on new valv binary"));
+        }
 
         let (valvd_current, valvd_backup) = match staged_valvd {
             Some(staged_valvd) => {
                 let valvd_current = install_dir.join("valvd");
                 let valvd_backup = install_dir.join("valvd.old");
-                rename_atomic(&valvd_current, &valvd_backup)?;
+
+                if let Err(error) = rename_atomic(&valvd_current, &valvd_backup) {
+                    restore_binary(&valv_backup, &valv_current);
+                    return Err(error.context("failed to back up valvd binary"));
+                }
+
                 if let Err(error) = rename_atomic(staged_valvd, &valvd_current) {
-                    let _ = rename_atomic(&valvd_backup, &valvd_current);
-                    let _ = rename_atomic(&valv_backup, &valv_current);
+                    restore_binary(&valvd_backup, &valvd_current);
+                    restore_binary(&valv_backup, &valv_current);
                     return Err(error.context("failed to install new valvd binary"));
                 }
-                set_executable(&valvd_current)?;
+
+                if let Err(error) = set_executable(&valvd_current) {
+                    restore_binary(&valvd_backup, &valvd_current);
+                    restore_binary(&valv_backup, &valv_current);
+                    return Err(
+                        error.context("failed to set executable permission on new valvd binary")
+                    );
+                }
+
                 (Some(valvd_current), Some(valvd_backup))
             }
             None => (None, None),
@@ -363,6 +412,11 @@ impl BinarySwap for UnixBinarySwap {
 fn rename_atomic(from: &Path, to: &Path) -> Result<()> {
     fs::rename(from, to)
         .with_context(|| format!("failed to rename {} -> {}", from.display(), to.display()))
+}
+
+#[cfg(unix)]
+fn restore_binary(backup: &Path, current: &Path) {
+    let _ = rename_atomic(backup, current);
 }
 
 #[cfg(unix)]
@@ -497,23 +551,49 @@ mod tests {
     #[test]
     fn plan_update_reports_already_up_to_date() {
         assert_eq!(
-            plan_update("0.2.0", "0.2.0", false),
+            plan_update("0.2.0", "0.2.0", false, false),
             UpdatePlan::AlreadyUpToDate
         );
         assert_eq!(
-            plan_update("0.2.0", "0.1.0", false),
+            plan_update("0.2.0", "0.1.0", false, false),
             UpdatePlan::AlreadyUpToDate
         );
     }
 
     #[test]
     fn plan_update_check_reports_without_installing() {
-        assert_eq!(plan_update("0.1.0", "0.2.0", true), UpdatePlan::ReportOnly);
+        assert_eq!(
+            plan_update("0.1.0", "0.2.0", true, false),
+            UpdatePlan::ReportOnly
+        );
     }
 
     #[test]
     fn plan_update_installs_when_newer_and_not_check() {
-        assert_eq!(plan_update("0.1.0", "0.2.0", false), UpdatePlan::Install);
+        assert_eq!(
+            plan_update("0.1.0", "0.2.0", false, false),
+            UpdatePlan::Install
+        );
+    }
+
+    #[test]
+    fn plan_update_pin_installs_regardless_of_version_comparison() {
+        assert_eq!(
+            plan_update("0.2.0", "0.2.0", false, true),
+            UpdatePlan::Install
+        );
+        assert_eq!(
+            plan_update("0.2.0", "0.1.0", false, true),
+            UpdatePlan::Install
+        );
+    }
+
+    #[test]
+    fn plan_update_pin_with_check_reports_without_installing() {
+        assert_eq!(
+            plan_update("0.2.0", "0.1.0", true, true),
+            UpdatePlan::ReportOnly
+        );
     }
 
     #[test]
@@ -687,6 +767,144 @@ mod tests {
         assert!(!install_dir.join("valvd").exists());
         assert!(backup.valvd_current.is_none());
         assert!(backup.valvd_backup.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_binary_swap_rolls_back_valv_when_valvd_backup_step_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_dir = dir.path();
+        fs::write(install_dir.join("valv"), b"old valv").unwrap();
+        let staged_valv = install_dir.join("staged-valv");
+        let staged_valvd = install_dir.join("staged-valvd");
+        fs::write(&staged_valv, b"new valv").unwrap();
+        fs::write(&staged_valvd, b"new valvd").unwrap();
+
+        let swap = UnixBinarySwap;
+        let result = swap.swap(install_dir, &staged_valv, Some(staged_valvd.as_path()));
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(install_dir.join("valv")).unwrap(),
+            b"old valv",
+            "valv must be restored to its prior bytes"
+        );
+        assert!(
+            !install_dir.join("valv.old").exists(),
+            "no leftover valv.old backup after rollback"
+        );
+        assert!(
+            !install_dir.join("valvd").exists(),
+            "no half-installed valvd"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_binary_swap_rolls_back_both_when_valvd_install_step_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_dir = dir.path();
+        fs::write(install_dir.join("valv"), b"old valv").unwrap();
+        fs::write(install_dir.join("valvd"), b"old valvd").unwrap();
+        let staged_valv = install_dir.join("staged-valv");
+        fs::write(&staged_valv, b"new valv").unwrap();
+        let missing_staged_valvd = install_dir.join("staged-valvd-missing");
+
+        let swap = UnixBinarySwap;
+        let result = swap.swap(install_dir, &staged_valv, Some(missing_staged_valvd.as_path()));
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(install_dir.join("valv")).unwrap(),
+            b"old valv",
+            "valv must be restored to its prior bytes"
+        );
+        assert_eq!(
+            fs::read(install_dir.join("valvd")).unwrap(),
+            b"old valvd",
+            "valvd must be restored to its prior bytes"
+        );
+        assert!(!install_dir.join("valv.old").exists());
+        assert!(!install_dir.join("valvd.old").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_failed_restart_rolls_back_and_restarts_then_reports() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let install_dir = dir.path();
+        fs::write(install_dir.join("valv"), b"old valv").unwrap();
+        fs::write(install_dir.join("valvd"), b"old valvd").unwrap();
+        let staged_valv = install_dir.join("staged-valv");
+        let staged_valvd = install_dir.join("staged-valvd");
+        fs::write(&staged_valv, b"new valv").unwrap();
+        fs::write(&staged_valvd, b"new valvd").unwrap();
+
+        let swap = UnixBinarySwap;
+        let backup = swap
+            .swap(install_dir, &staged_valv, Some(staged_valvd.as_path()))
+            .unwrap();
+
+        let restarted = AtomicBool::new(false);
+        let error = handle_failed_restart(
+            &swap,
+            &backup,
+            || {
+                restarted.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            anyhow!("daemon did not report the new version"),
+        );
+
+        assert!(restarted.load(Ordering::SeqCst), "daemon must be restarted");
+        assert_eq!(
+            fs::read(install_dir.join("valv")).unwrap(),
+            b"old valv",
+            "valv rolled back to prior bytes"
+        );
+        assert_eq!(
+            fs::read(install_dir.join("valvd")).unwrap(),
+            b"old valvd",
+            "valvd rolled back to prior bytes"
+        );
+        assert!(error.to_string().contains("rolled back"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_failed_restart_reports_when_rollback_also_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let install_dir = dir.path();
+        let backup = SwapBackup {
+            valv_current: install_dir.join("valv"),
+            valv_backup: install_dir.join("valv.old-missing"),
+            valvd_current: None,
+            valvd_backup: None,
+        };
+
+        let restarted = AtomicBool::new(false);
+        let error = handle_failed_restart(
+            &UnixBinarySwap,
+            &backup,
+            || {
+                restarted.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            anyhow!("daemon did not report the new version"),
+        );
+
+        assert!(
+            restarted.load(Ordering::SeqCst),
+            "daemon restart is still attempted even when rollback failed"
+        );
+        assert!(
+            error.to_string().contains("rollback also failed"),
+            "rollback failure must not be swallowed: {error}"
+        );
     }
 
     #[test]
