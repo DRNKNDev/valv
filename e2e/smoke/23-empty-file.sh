@@ -41,7 +41,7 @@ manifest_len=$(printf '%s' "$latest" | json_eval 'process.stdout.write(String((d
 [ "$size" = "5" ] || fail "expected edited file size 5, got ${size}"
 [ "$manifest_len" -ge 1 ] || fail "expected edited file to have chunks"
 chunk_hash=$(printf '%s' "$latest" | json_eval 'process.stdout.write(data.manifest[0].chunk_hash)')
-assert_bucket_key "chunks/${chunk_hash}"
+assert_bucket_key "$(expected_chunk_key "$chunk_hash")"
 
 truncate -s 0 "${mount_a}/empty.txt"
 sync_mount "$HOME_A" "$folder_id"

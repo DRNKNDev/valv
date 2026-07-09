@@ -25,7 +25,6 @@ export function gcScenarios(harness: SeededHarness): void {
     afterAll(async () => ctx?.cleanup());
 
     it("purges tombstones after 0ms retention", async () => {
-      vi.useFakeTimers();
       const file = await createNode(ctx.app, ctx.context.folderId, ctx.context.token, ctx.context.rootNodeId, "dead.txt", "file");
       await submitOp(ctx.app, ctx.context.folderId, ctx.context.token, {
         op_type: "delete",
@@ -33,6 +32,12 @@ export function gcScenarios(harness: SeededHarness): void {
         based_on_seq: file.server_seq,
         payload: {},
       });
+      // Scoped to setInterval/clearInterval/Date only - startGc only ever uses setInterval, and
+      // the Postgres Pool driver (@neondatabase/serverless) schedules its own connection-idle/
+      // timeout bookkeeping via real setTimeout calls. Faking setTimeout globally here would trap
+      // those in fake-timer land, so pool.end() in this file's afterAll hangs waiting on a timeout
+      // callback that never fires once vi.useRealTimers() restores the real (but now stale) clock.
+      vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
       vi.setSystemTime(Date.now() + 1_000);
 
       stopGc = startGc(ctx.db as Parameters<typeof startGc>[0], ctx.s3 as Parameters<typeof startGc>[1], ctx.bucket, undefined, {
@@ -42,6 +47,8 @@ export function gcScenarios(harness: SeededHarness): void {
         opLogTruncationIntervalMs: 60_000,
       });
       await vi.advanceTimersByTimeAsync(100);
+      stopGc();
+      stopGc = undefined;
       vi.useRealTimers();
       await waitForMissingNode(ctx, file.nodeId);
     });
