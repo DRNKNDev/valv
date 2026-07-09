@@ -5,9 +5,7 @@ use serde::Deserialize;
 
 pub const DEFAULT_REPO: &str = "DRNKNDev/valv";
 
-// TODO(founder): replace placeholder before first signed release.
-pub const MINISIGN_PUBLIC_KEY: &str =
-    "RWQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+pub const MINISIGN_PUBLIC_KEY: &str = "RWRgHhzVeIwqVsZrfOb3oGNC7TMurQXTgq63Yr0gFk5HuUfhBZr6dqxZ";
 
 pub fn verify_sha256sums(sha256sums_bytes: &[u8], minisig_bytes: &[u8]) -> Result<()> {
     let public_key = PublicKey::from_base64(MINISIGN_PUBLIC_KEY)
