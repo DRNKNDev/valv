@@ -167,11 +167,8 @@ pub(crate) async fn run() -> Result<()> {
     let json = cli.json;
     let is_update_command = matches!(cli.command, Command::Update { .. });
     let result = run_command(cli.command, json).await;
-    // Every subcommand other than `update` itself prints the ambient stderr
-    // notice after its own output completes - `valv update`'s own output
-    // already communicates version status, so it's excluded (valv-cli-commands
-    // spec: "valv update itself never prints this notice").
-    if !is_update_command {
+    // Print update notices only after successful non-update commands.
+    if result.is_ok() && !is_update_command {
         maybe_print_update_notice().await;
     }
     result
@@ -381,12 +378,10 @@ async fn cmd_status(json: bool) -> Result<()> {
     } else {
         println!("Disconnected");
     }
-    if status.update_available == Some(true) {
-        if let Some(latest_version) = &status.latest_version {
-            println!(
-                "A newer version of valv is available ({latest_version}). Run 'valv update' to install it."
-            );
-        }
+    if let Some(line) =
+        update_available_line(status.update_available, status.latest_version.as_deref())
+    {
+        println!("{line}");
     }
     let rows = status
         .mounts
@@ -423,6 +418,15 @@ fn update_required_cell(update_required: bool) -> String {
         UPDATE_REQUIRED_MESSAGE.to_owned()
     } else {
         "false".to_owned()
+    }
+}
+
+fn update_available_line(update_available: Option<bool>, latest_version: Option<&str>) -> Option<String> {
+    match (update_available, latest_version) {
+        (Some(true), Some(latest_version)) => Some(format!(
+            "A newer version of valv is available ({latest_version}). Run 'valv update' to install it."
+        )),
+        _ => None,
     }
 }
 
@@ -541,6 +545,22 @@ mod tests {
     #[test]
     fn update_required_cell_is_a_bare_false_otherwise() {
         assert_eq!(update_required_cell(false), "false");
+    }
+
+    #[test]
+    fn update_available_line_names_the_version_when_available() {
+        assert_eq!(
+            update_available_line(Some(true), Some("0.3.0")).as_deref(),
+            Some("A newer version of valv is available (0.3.0). Run 'valv update' to install it.")
+        );
+    }
+
+    #[test]
+    fn update_available_line_is_none_when_not_available_or_absent() {
+        // false, absent (old daemon), and true-without-a-version all print nothing.
+        assert_eq!(update_available_line(Some(false), Some("0.3.0")), None);
+        assert_eq!(update_available_line(None, None), None);
+        assert_eq!(update_available_line(Some(true), None), None);
     }
 
     #[test]
