@@ -27,6 +27,8 @@ export interface DaemonStatus {
   update_required: boolean;
   mounts: MountStatus[];
   account?: AccountStatus;
+  latest_version?: string;
+  update_available?: boolean;
 }
 
 export interface NodePathResponse {

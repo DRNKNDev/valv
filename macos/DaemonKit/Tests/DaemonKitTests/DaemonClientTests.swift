@@ -50,7 +50,7 @@ final class DaemonClientTests: XCTestCase {
             to: "GET /status",
             status: 200,
             body: """
-            {"paused":false,"backend_connected":true,"version":"1.2.3","mounts":[]}
+            {"paused":false,"backend_connected":true,"version":"1.2.3","update_required":false,"mounts":[]}
             """
         )
 
@@ -62,6 +62,55 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertEqual(status.mounts, [])
     }
 
+    func testStatusDecodesLatestVersionAndUpdateAvailableWhenPresent() async throws {
+        let transport = MockDaemonTransport()
+        transport.respond(
+            to: "GET /status",
+            status: 200,
+            body: """
+            {"paused":false,"backend_connected":true,"version":"1.2.3","update_required":false,
+             "mounts":[],"update_available":true,"latest_version":"1.2.3"}
+            """
+        )
+
+        let status = try await transport.client().status()
+
+        XCTAssertEqual(status.updateAvailable, true)
+        XCTAssertEqual(status.latestVersion, "1.2.3")
+    }
+
+    func testStatusDecodesUpdateAvailableFalse() async throws {
+        let transport = MockDaemonTransport()
+        transport.respond(
+            to: "GET /status",
+            status: 200,
+            body: """
+            {"paused":false,"backend_connected":true,"version":"1.2.3","update_required":false,
+             "mounts":[],"update_available":false,"latest_version":"1.2.3"}
+            """
+        )
+
+        let status = try await transport.client().status()
+
+        XCTAssertEqual(status.updateAvailable, false)
+    }
+
+    func testStatusDecodesNilLatestVersionAndUpdateAvailableWhenAbsent() async throws {
+        let transport = MockDaemonTransport()
+        transport.respond(
+            to: "GET /status",
+            status: 200,
+            body: """
+            {"paused":false,"backend_connected":true,"version":"1.2.3","update_required":false,"mounts":[]}
+            """
+        )
+
+        let status = try await transport.client().status()
+
+        XCTAssertNil(status.updateAvailable)
+        XCTAssertNil(status.latestVersion)
+    }
+
     func testMountsDecodesArrayWithSnakeCaseFields() async throws {
         let transport = MockDaemonTransport()
         transport.respond(
@@ -69,7 +118,7 @@ final class DaemonClientTests: XCTestCase {
             status: 200,
             body: """
             [{"path":"/Users/alice/Sync","folder_id":"f1","name":"Design Docs","can_write":false,
-              "syncing":true,"pending_ops":3,"last_synced_at":null}]
+              "syncing":true,"pending_ops":3,"last_synced_at":null,"update_required":false}]
             """
         )
 

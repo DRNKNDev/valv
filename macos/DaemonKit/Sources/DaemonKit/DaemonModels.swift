@@ -42,6 +42,8 @@ public struct DaemonStatus: Codable, Hashable, Sendable {
     public let updateRequired: Bool
     public let mounts: [MountStatus]
     public let account: AccountStatus?
+    public let latestVersion: String?
+    public let updateAvailable: Bool?
 
     enum CodingKeys: String, CodingKey {
         case paused
@@ -50,6 +52,8 @@ public struct DaemonStatus: Codable, Hashable, Sendable {
         case updateRequired = "update_required"
         case mounts
         case account
+        case latestVersion = "latest_version"
+        case updateAvailable = "update_available"
     }
 }
 
