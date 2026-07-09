@@ -77,6 +77,32 @@ daemon_version="$(crate_version "${crates_dir}/valvd/Cargo.toml")"
 [[ "${daemon_version}" == "${version}" ]] ||
   fail "tag ${tag} != valvd Cargo.toml version ${daemon_version}"
 
+echo "==> Verifying app bundle version scheme (MARKETING_VERSION / CURRENT_PROJECT_VERSION)"
+app_build_settings="$(xcodebuild -showBuildSettings \
+  -project "${project}" \
+  -scheme "${scheme}" \
+  -configuration Release 2>/dev/null)"
+marketing_version="$(printf '%s\n' "${app_build_settings}" | awk -F'= ' '/ MARKETING_VERSION / { print $2; exit }')"
+current_project_version="$(printf '%s\n' "${app_build_settings}" | awk -F'= ' '/ CURRENT_PROJECT_VERSION / { print $2; exit }')"
+
+[[ -n "${marketing_version}" ]] ||
+  fail "could not read MARKETING_VERSION from ${scheme}'s Release build settings"
+[[ -n "${current_project_version}" ]] ||
+  fail "could not read CURRENT_PROJECT_VERSION from ${scheme}'s Release build settings"
+[[ "${marketing_version}" == "${version}" ]] ||
+  fail "tag ${tag} != ${scheme} MARKETING_VERSION ${marketing_version} (task 1.4/D9: set MARKETING_VERSION to the tag's semver before releasing)"
+[[ "${current_project_version}" =~ ^[0-9]+$ ]] ||
+  fail "${scheme} CURRENT_PROJECT_VERSION (${current_project_version}) must be a plain integer, not a semver or other string (D9)"
+
+appcast_path="${repo_root}/oss/macos/appcast.xml"
+previous_build_number=0
+if [[ -f "${appcast_path}" ]]; then
+  latest_from_appcast="$(grep -o 'sparkle:version="[0-9]\+"' "${appcast_path}" | grep -o '[0-9]\+' | sort -n | tail -1 || true)"
+  [[ -n "${latest_from_appcast}" ]] && previous_build_number="${latest_from_appcast}"
+fi
+(( current_project_version > previous_build_number )) ||
+  fail "${scheme} CURRENT_PROJECT_VERSION (${current_project_version}) must be strictly greater than the previously published app release's build number (${previous_build_number}) — Sparkle orders updates by this field"
+
 work_dir="$(mktemp -d)"
 trap 'rm -rf "${work_dir}"' EXIT
 archive_path="${work_dir}/Valv.xcarchive"
@@ -164,3 +190,40 @@ gh release upload "${tag}" \
   "${checksum_file}"
 
 echo "Published Valv-${version}.dmg (sha256 ${digest}) to ${repo} ${tag}"
+
+need generate_appcast
+
+dmg_archive_dir="${VALV_DMG_ARCHIVE_DIR:-${HOME}/.valv-release-dmgs}"
+mkdir -p "${dmg_archive_dir}"
+echo "==> Archiving Valv-${version}.dmg into the local release archive (${dmg_archive_dir})"
+cp "${dmg_path}" "${dmg_archive_dir}/Valv-${version}.dmg"
+
+echo "==> Generating signed appcast entry"
+generate_appcast_args=("${dmg_archive_dir}")
+if [[ -n "${SPARKLE_ED_KEY_FILE:-}" ]]; then
+  generate_appcast_args+=(--ed-key-file "${SPARKLE_ED_KEY_FILE}")
+fi
+if [[ -n "${SPARKLE_DOWNLOAD_URL_PREFIX:-}" ]]; then
+  generate_appcast_args+=(--download-url-prefix "${SPARKLE_DOWNLOAD_URL_PREFIX}")
+fi
+generate_appcast "${generate_appcast_args[@]}"
+
+appcast_output="${dmg_archive_dir}/appcast.xml"
+[[ -f "${appcast_output}" ]] || fail "generate_appcast did not produce ${appcast_output}"
+
+cp "${appcast_output}" "${appcast_path}"
+echo "==> Wrote ${appcast_path}"
+
+cat <<STEPS
+
+==> Appcast regenerated locally but NOT yet published. Complete the publish
+    sequence by hand (design D2/D4, tooling/release/release-notes.md):
+      1. review the diff:  git -C "${repo_root}" diff -- oss/macos/appcast.xml
+      2. git -C "${repo_root}" add oss/macos/appcast.xml
+      3. git -C "${repo_root}" commit -m "chore(macos): publish appcast entry for ${tag}"
+      4. git -C "${repo_root}" push
+      5. wait for private/apps/web's Pages deploy to finish
+      6. curl -fsSL https://valvsync.com/appcast.xml | grep -- "${version}"
+         (confirm the new version's entry is actually live before calling this
+         release done - an unpublished appcast is safe, but not shipped)
+STEPS
