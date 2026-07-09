@@ -126,7 +126,7 @@ struct ValvTests {
         """.utf8))
 
         #expect(MenuBarContentView.summaryText(status: status, iconState: .syncing, isDisconnected: false) == "Update Valv to keep syncing")
-        #expect(MenuBarContentView.summaryText(status: withoutUpdateRequired(status), iconState: .syncing, isDisconnected: false) == "Syncing...")
+        #expect(MenuBarContentView.summaryText(status: try withoutUpdateRequired(status), iconState: .syncing, isDisconnected: false) == "Syncing...")
         #expect(Set([IconState.notSetUp, .error, .paused, .syncing, .synced]).count == 5)
     }
 
