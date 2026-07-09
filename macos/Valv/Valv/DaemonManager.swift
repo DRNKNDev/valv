@@ -41,11 +41,16 @@ final class DaemonManager: ObservableObject {
     @Published var pendingDecision: ReconciliationOutcome?
     @Published var installError: String?
     @Published private(set) var hasReconciled = false
+    @Published private(set) var isRestartingDaemon = false
+
+    private static let kickstartBoundedTimeoutNanoseconds: UInt64 = 5_000_000_000
 
     private let fileManager: FileManager
     private let homeDirectory: URL
     private let bundledBinDirectoryOverride: URL?
     private let cleanInstallOperation: ((Bool) async throws -> Void)?
+    private let kickstartOperation: (() async throws -> Void)?
+    private let runningDaemonVersionProvider: (() async -> String?)?
     private let client: DaemonClient
 
     init(
@@ -54,13 +59,17 @@ final class DaemonManager: ObservableObject {
         homeDirectory: URL? = nil,
         bundledBinDirectory: URL? = nil,
         startOnLaunch: Bool = true,
-        cleanInstallOperation: ((Bool) async throws -> Void)? = nil
+        cleanInstallOperation: ((Bool) async throws -> Void)? = nil,
+        kickstartOperation: (() async throws -> Void)? = nil,
+        runningDaemonVersionProvider: (() async -> String?)? = nil
     ) {
         self.client = client
         self.fileManager = fileManager
         self.homeDirectory = homeDirectory ?? fileManager.homeDirectoryForCurrentUser
         self.bundledBinDirectoryOverride = bundledBinDirectory
         self.cleanInstallOperation = cleanInstallOperation
+        self.kickstartOperation = kickstartOperation
+        self.runningDaemonVersionProvider = runningDaemonVersionProvider
         if startOnLaunch {
             Task { [weak self] in
                 await self?.reconcileOnLaunch()
@@ -117,6 +126,7 @@ final class DaemonManager: ObservableObject {
                     return
                 }
                 await refreshStableCopyIfBundledIsNewer()
+                await reconcileRunningDaemonAgainstStableCopy()
             }
             return
         }
@@ -137,18 +147,75 @@ final class DaemonManager: ObservableObject {
     private func refreshStableCopyIfBundledIsNewer() async {
         let bundledValvd = bundledBinDirectory.appendingPathComponent("valvd").path
         let stableValvd = stableBinDirectory.appendingPathComponent("valvd").path
-        guard let bundledVersion = try? await runCapturingOutput(executable: bundledValvd, arguments: ["--version"]),
-              let stableVersion = try? await runCapturingOutput(executable: stableValvd, arguments: ["--version"]),
-              bundledVersion != stableVersion
+        guard let bundledRaw = try? await runCapturingOutput(executable: bundledValvd, arguments: ["--version"]),
+              let stableRaw = try? await runCapturingOutput(executable: stableValvd, arguments: ["--version"])
+        else {
+            return
+        }
+        // Strip clap's "valvd " prefix before semver comparison.
+        let bundledVersion = Self.lastVersionToken(from: bundledRaw)
+        let stableVersion = Self.lastVersionToken(from: stableRaw)
+        guard Self.isVersion(bundledVersion, atLeast: stableVersion),
+              !Self.isVersion(stableVersion, atLeast: bundledVersion)
         else {
             return
         }
         do {
             try copyBundledBinariesToStableLocation()
-            try await run(executable: "/bin/launchctl", arguments: ["kickstart", "-k", "gui/\(getuid())/\(Self.launchAgentLabel)"])
         } catch {
             NSLog("DaemonManager: stable copy refresh failed: %@", error.localizedDescription)
+            return
         }
+        await kickstartDaemonBounded()
+    }
+
+    private func reconcileRunningDaemonAgainstStableCopy() async {
+        guard isManagedByValv else { return }
+        guard let runningVersion = await currentRunningDaemonVersion() else { return }
+        let stableValvd = stableBinDirectory.appendingPathComponent("valvd").path
+        guard let stableRaw = try? await runCapturingOutput(executable: stableValvd, arguments: ["--version"]) else {
+            return
+        }
+        let stableVersion = Self.lastVersionToken(from: stableRaw)
+        guard runningVersion != stableVersion else { return }
+        await kickstartDaemonBounded()
+    }
+
+    private func currentRunningDaemonVersion() async -> String? {
+        if let runningDaemonVersionProvider {
+            return await runningDaemonVersionProvider()
+        }
+        guard let status = try? await client.status() else { return nil }
+        return status.version
+    }
+
+    // launchctl waitUntilExit is not cancellable; bound it with a detached timeout race.
+    private func kickstartDaemonBounded() async {
+        isRestartingDaemon = true
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.performKickstart()
+                } catch {
+                    NSLog("DaemonManager: kickstart failed: %@", error.localizedDescription)
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: Self.kickstartBoundedTimeoutNanoseconds)
+            }
+            _ = await group.next()
+            group.cancelAll()
+        }
+        isRestartingDaemon = false
+    }
+
+    private func performKickstart() async throws {
+        if let kickstartOperation {
+            try await kickstartOperation()
+            return
+        }
+        try await run(executable: "/bin/launchctl", arguments: ["kickstart", "-k", "gui/\(getuid())/\(Self.launchAgentLabel)"])
     }
 
     func performCleanInstall(overwriteExisting: Bool = false) async {
@@ -201,7 +268,11 @@ final class DaemonManager: ObservableObject {
         guard let output = try? await runCapturingOutput(executable: path, arguments: ["--version"]) else {
             return nil
         }
-        return output.split(separator: " ").last.map(String.init)
+        return Self.lastVersionToken(from: output)
+    }
+
+    private static func lastVersionToken(from rawVersionOutput: String) -> String {
+        rawVersionOutput.split(separator: " ").last.map(String.init) ?? rawVersionOutput
     }
 
     private func isVersionCompatible(_ version: String?) -> Bool {
