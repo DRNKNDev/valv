@@ -197,7 +197,8 @@ gh release upload "${tag}" \
 
 echo "Published Valv-${version}.dmg (sha256 ${digest}) to ${repo} ${tag}"
 
-need generate_appcast
+generate_appcast_bin="$(command -v generate_appcast 2>/dev/null || find "${HOME}/Library/Developer/Xcode/DerivedData" -name generate_appcast -path '*sparkle*' 2>/dev/null | head -1)"
+[[ -x "${generate_appcast_bin}" ]] || fail "generate_appcast not found on PATH or in DerivedData Sparkle artifacts (build the app once so SPM resolves Sparkle's tools)"
 
 dmg_archive_dir="${VALV_DMG_ARCHIVE_DIR:-${HOME}/.valv-release-dmgs}"
 mkdir -p "${dmg_archive_dir}"
@@ -209,10 +210,8 @@ generate_appcast_args=("${dmg_archive_dir}")
 if [[ -n "${SPARKLE_ED_KEY_FILE:-}" ]]; then
   generate_appcast_args+=(--ed-key-file "${SPARKLE_ED_KEY_FILE}")
 fi
-if [[ -n "${SPARKLE_DOWNLOAD_URL_PREFIX:-}" ]]; then
-  generate_appcast_args+=(--download-url-prefix "${SPARKLE_DOWNLOAD_URL_PREFIX}")
-fi
-generate_appcast "${generate_appcast_args[@]}"
+generate_appcast_args+=(--download-url-prefix "${SPARKLE_DOWNLOAD_URL_PREFIX:-https://github.com/${repo}/releases/download/${tag}/}")
+"${generate_appcast_bin}" "${generate_appcast_args[@]}"
 
 appcast_output="${dmg_archive_dir}/appcast.xml"
 [[ -f "${appcast_output}" ]] || fail "generate_appcast did not produce ${appcast_output}"
