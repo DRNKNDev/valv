@@ -6,79 +6,213 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 24
+  PNPM_VERSION: 10.9.0
+  MINIO_IMAGE: minio/minio:RELEASE.2025-09-07T16-13-09Z
+  MC_RELEASE: RELEASE.2025-08-13T08-35-41Z
+
 jobs:
-  contracts-sync:
+  node:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: contracts/sync
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: ${{ env.NODE_VERSION }}
       - uses: pnpm/action-setup@v4
         with:
-          version: 10.9.0
-      - run: pnpm install --frozen-lockfile=false
-      - run: pnpm exec tsc --noEmit
+          version: ${{ env.PNPM_VERSION }}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run typecheck
+      - run: pnpm run test:core
 
-  contracts-http:
+  api-e2e:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: contracts/http
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: ${{ env.NODE_VERSION }}
       - uses: pnpm/action-setup@v4
         with:
-          version: 10.9.0
-      - run: pnpm install --frozen-lockfile=false
-      - run: pnpm exec tsc --noEmit
+          version: ${{ env.PNPM_VERSION }}
+      - run: pnpm install --frozen-lockfile
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            "${MINIO_IMAGE}" server /data --console-address ":9001"
+      - name: Wait for MinIO
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+              echo "MinIO is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready within the bounded startup interval" >&2
+          docker logs minio || true
+          exit 1
+      - run: pnpm run test:e2e
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true
 
-  contracts-ipc:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: contracts/ipc
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.9.0
-      - run: pnpm install --frozen-lockfile=false
-      - run: pnpm exec tsc --noEmit
-
-  core:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: core
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.9.0
-      - run: pnpm install --frozen-lockfile=false
-      - run: pnpm exec tsc --noEmit
-      - run: pnpm exec vitest run
-
-  cargo:
-    runs-on: ubuntu-latest
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: crates
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --workspace
-      - run: cargo test --workspace
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+      - run: cargo check --workspace --locked
+      - run: cargo test --workspace --locked
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - run: pnpm install --frozen-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+      - name: Build Rust workspace
+        working-directory: crates
+        run: cargo build --workspace --locked
+      - name: Install mc
+        run: |
+          asset="mc.linux-amd64.${MC_RELEASE}"
+          base="https://github.com/minio/mc/releases/download/${MC_RELEASE}"
+          curl -fsSL "${base}/${asset}" -o /usr/local/bin/mc
+          expected="$(curl -fsSL "${base}/${asset}.sha256sum" | awk '{print $1}')"
+          actual="$(sha256sum /usr/local/bin/mc | awk '{print $1}')"
+          [ "$expected" = "$actual" ] || { echo "mc checksum mismatch: expected ${expected}, got ${actual}" >&2; exit 1; }
+          chmod +x /usr/local/bin/mc
+          mc --version
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            "${MINIO_IMAGE}" server /data --console-address ":9001"
+      - name: Wait for MinIO
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+              echo "MinIO is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready within the bounded startup interval" >&2
+          docker logs minio || true
+          exit 1
+      - name: Run daemon smoke scenarios
+        shell: bash
+        run: |
+          set -o pipefail
+          bash e2e/smoke/run-all.sh 2>&1 | tee "${RUNNER_TEMP}/smoke-run.log"
+      - name: Upload smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: ${{ runner.temp }}/smoke-run.log
+          if-no-files-found: ignore
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true
+
+  daemon-kit:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test --package-path macos/DaemonKit
+
+  macos-app:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+      - name: Build arm64 valv/valvd release binaries
+        working-directory: crates
+        run: cargo build --release --locked -p valv-cli -p valvd
+      - name: Cache Swift package resolution
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Developer/Xcode/DerivedData/ModuleCache.noindex
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-${{ hashFiles('macos/Valv/Valv.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+      - name: Show selected Xcode
+        run: xcodebuild -version
+      - name: Resolve Swift package dependencies
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project macos/Valv/Valv.xcodeproj \
+            -scheme Valv
+      - name: Build Valv
+        run: |
+          xcodebuild -project macos/Valv/Valv.xcodeproj \
+            -scheme Valv \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Build ValvFileProvider
+        run: |
+          xcodebuild -project macos/Valv/Valv.xcodeproj \
+            -scheme ValvFileProvider \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Build ValvFileProviderUI
+        run: |
+          xcodebuild -project macos/Valv/Valv.xcodeproj \
+            -scheme ValvFileProviderUI \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Run ValvTests
+        run: |
+          xcodebuild -project macos/Valv/Valv.xcodeproj \
+            -scheme Valv \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -only-testing:ValvTests \
+            CODE_SIGNING_ALLOWED=NO \
+            test

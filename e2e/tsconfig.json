@@ -10,6 +10,7 @@
     "baseUrl": ".",
     "paths": {
       "@valv/core": ["../core/src/index.ts"],
+      "@valv/contracts-sync": ["../contracts/sync/src/index.ts"],
       "@hono/node-server": ["../core/node_modules/@hono/node-server"],
       "aws4fetch": ["../core/node_modules/aws4fetch/dist/main.d.mts"],
       "better-sqlite3": ["../core/node_modules/@types/better-sqlite3/index.d.ts"],

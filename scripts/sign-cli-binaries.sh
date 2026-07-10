@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo="${VALV_GITHUB_REPO:-DRNKNDev/valv}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "${script_dir}/../.." && pwd)"
+oss_root="$(cd "${script_dir}/.." && pwd)"
 
 fail() {
   echo "valv signing: $*" >&2
@@ -37,7 +37,7 @@ usage() {
 Usage:
   DEVELOPER_ID_APPLICATION="Developer ID Application: Name (TEAMID)" \
     MINISIGN_SECRET_KEY_FILE="/path/to/founder/minisign.key" \
-    oss/scripts/sign-cli-binaries.sh v0.1.0
+    scripts/sign-cli-binaries.sh v0.1.0
 
 Optionally pass the signing identity as a second argument.
 
@@ -99,7 +99,7 @@ codesign -dv --verbose=4 "${tmp_dir}/payload/valvd" >/dev/null
 
 # Persist the signed binaries to a cargo-safe handoff dir so release-app.sh can embed
 # the exact same artifacts without a flaky GitHub CDN round-trip.
-signed_dir="${repo_root}/oss/crates/target/signed-cli"
+signed_dir="${oss_root}/crates/target/signed-cli"
 mkdir -p "${signed_dir}"
 cp "${tmp_dir}/payload/valv" "${tmp_dir}/payload/valvd" "${signed_dir}/"
 

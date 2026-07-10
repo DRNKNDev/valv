@@ -2,7 +2,12 @@
   "name": "valv-oss",
   "private": true,
   "scripts": {
-    "typecheck": "pnpm --filter @valv/core typecheck && pnpm --filter @valv/e2e typecheck"
+    "typecheck": "pnpm --filter @valv/contracts-http --filter @valv/contracts-ipc --filter @valv/contracts-sync --filter @valv/core --filter @valv/e2e typecheck",
+    "typecheck:contracts": "pnpm --filter @valv/contracts-http --filter @valv/contracts-ipc --filter @valv/contracts-sync typecheck",
+    "typecheck:core": "pnpm --filter @valv/core typecheck",
+    "typecheck:e2e": "pnpm --filter @valv/e2e typecheck",
+    "test:core": "pnpm --filter @valv/core test",
+    "test:e2e": "pnpm --filter @valv/e2e test"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

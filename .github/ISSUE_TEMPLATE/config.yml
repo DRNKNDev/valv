@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & Discussion
+    url: https://discord.gg/29a3dVRdE
+    about: Ask setup/usage questions or discuss ideas on the Valv Discord.
+  - name: Report a security vulnerability
+    url: https://github.com/DRNKNDev/valv/security
+    about: Do not report vulnerabilities as a public issue. Use GitHub private vulnerability reporting.

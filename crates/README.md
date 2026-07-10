@@ -2,29 +2,33 @@
 
 ## What's Here
 
-- `valv-sync`: sync engine library with the CDC chunker, S3-compatible chunk storage client, sync loop, local SQLite mirror, and filesystem watcher.
-- `valvd`: daemon binary that owns the sync engine, exposes the local control API over a Unix socket, and manages launchd/systemd service registration.
-- `valv-cli`: thin CLI binary that sends commands to the daemon over the Unix socket.
-
-`valv-sync` contains the sync logic. `valvd` and `valv-cli` are intentionally thin wrappers around it.
+- `valv-sync`: the sync engine library. Content-defined chunking, S3-compatible chunk storage client, the sync protocol, the local SQLite mirror, filesystem watching, materialization, conflict handling, version/restore support, and update-check support all live here.
+- `valvd`: the long-running daemon. It owns the sync engine for every mounted folder and exposes a local control API (status, mount/unmount, pause/resume, sync, versions, restore) and a File Provider API (`fp/*`) over local transports, plus launchd/systemd service registration.
+- `valv-cli`: the user- and automation-facing `valv` binary. It talks to `valvd` over the local control API for daemon operations and calls selected Core backend endpoints directly (browser auth, grant creation) using the configured device token.
 
 ## Prerequisites
 
-- Rust stable >= 1.80
+- Rust stable toolchain (no pinned MSRV; CI builds against current `stable`)
 - `cargo`
 
 ## Build
 
-Run these commands from `oss/crates/`:
+Run these commands from `crates/`:
 
 ```bash
-cargo build --workspace
-cargo test --workspace
+cargo build --workspace --locked
+cargo test --workspace --locked
 ```
+
+`--locked` uses the committed `Cargo.lock` without re-resolving dependencies.
+
+Released prebuilt binaries currently cover macOS arm64 (`aarch64-apple-darwin`) and Linux x86_64 (`x86_64-unknown-linux-gnu`). Other targets require a source build.
 
 ## Config File
 
-Create `~/.config/valv/config.toml` after registering a device with the core backend. The `device_id` and `device_token` values come from the device registration steps in `../core/README.md`.
+Browser-based `valv auth login` is the preferred setup path for end users: it opens `https://valvsync.com/login`, completes device pairing, and writes `~/.config/valv/config.toml` for you.
+
+For self-hosted or development setups, register a device against your own Core backend (see [`../core/README.md`](../core/README.md)) and write the file manually:
 
 ```toml
 # Core backend URL.
@@ -44,7 +48,9 @@ device_name = "Dev Mac"
 # folder_id = "replace-with-folder-id"
 ```
 
-## Running The Daemon
+Do not commit `config.toml` or its `device_token`; treat it like any other credential.
+
+## Running The Daemon And Using The CLI
 
 Run the daemon in the foreground during development:
 
@@ -52,18 +58,31 @@ Run the daemon in the foreground during development:
 ./target/debug/valvd run
 ```
 
-The daemon creates its Unix socket at `~/.local/share/valv/valvd.sock`. Skip `valv daemon install` in dev; that command registers the daemon as a launchd LaunchAgent on macOS.
+Local transport depends on the client:
 
-## CLI Quick Reference
+- `valv-cli` and other non-sandboxed clients connect over the Unix socket at `~/.local/share/valv/valvd.sock`.
+- The sandboxed macOS app and File Provider extensions cannot use a Unix socket, so they connect over loopback TCP; `valvd` writes the bound port to a file inside the shared macOS app-group container for those clients to discover.
+
+`valv daemon install` and `valv daemon uninstall` register or remove the daemon as a service: a launchd LaunchAgent on macOS, or a systemd user service on Linux. Skip them in development and run `valvd run` directly so logs stay in the foreground.
+
+### CLI Quick Reference
 
 See [`valv-cli/README.md`](./valv-cli/README.md) for full CLI usage, setup, command examples, and troubleshooting.
 
 ```bash
+valv auth login
 valv status
 valv mount <path>
+valv unmount --folder <folder-id>
 valv pause
 valv resume
-valv grant create
+valv sync
+valv versions <path>
+valv restore <path> <version-id>
+valv grant create <path> --to <email>
 valv grants
-valv grant revoke
+valv grant revoke <grant-id>
+valv update --check
 ```
+
+`status`, `versions`, and `grants` also accept the global `--json` flag for machine-readable output.

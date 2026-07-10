@@ -447,7 +447,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\nREPO_ROOT=\"${SRCROOT}/../../..\"\nRELEASE_DIR=\"${REPO_ROOT}/oss/crates/target/release\"\nDEST_DIR=\"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin\"\nif [ ! -x \"${RELEASE_DIR}/valvd\" ] || [ ! -x \"${RELEASE_DIR}/valv\" ]; then\n  echo \"error: valvd/valv release binaries not found at ${RELEASE_DIR}.\" >&2\n  echo \"Build them first: cd oss/crates && cargo build --release\" >&2\n  exit 1\nfi\nmkdir -p \"${DEST_DIR}\"\ncp \"${RELEASE_DIR}/valvd\" \"${DEST_DIR}/valvd\"\ncp \"${RELEASE_DIR}/valv\" \"${DEST_DIR}/valv\"\necho \"Copied valvd/valv release binaries into ${DEST_DIR}\"\n";
+			shellScript = "set -euo pipefail\nOSS_ROOT=\"${SRCROOT}/../..\"\nRELEASE_DIR=\"${OSS_ROOT}/crates/target/release\"\nDEST_DIR=\"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin\"\nif [ ! -x \"${RELEASE_DIR}/valvd\" ] || [ ! -x \"${RELEASE_DIR}/valv\" ]; then\n  echo \"error: valvd/valv release binaries not found at ${RELEASE_DIR}.\" >&2\n  echo \"Build them first: cd crates && cargo build --release --locked\" >&2\n  exit 1\nfi\nmkdir -p \"${DEST_DIR}\"\ncp \"${RELEASE_DIR}/valvd\" \"${DEST_DIR}/valvd\"\ncp \"${RELEASE_DIR}/valv\" \"${DEST_DIR}/valv\"\necho \"Copied valvd/valv release binaries into ${DEST_DIR}\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

@@ -7,9 +7,9 @@ scheme="Valv"
 bundle_id="dev.drnkn.valv"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "${script_dir}/../../.." && pwd)"
-project="${repo_root}/oss/macos/Valv/Valv.xcodeproj"
-crates_dir="${repo_root}/oss/crates"
+oss_root="$(cd "${script_dir}/../.." && pwd)"
+project="${oss_root}/macos/Valv/Valv.xcodeproj"
+crates_dir="${oss_root}/crates"
 
 fail() {
   echo "valv release-app: $*" >&2
@@ -39,7 +39,7 @@ usage() {
 Usage:
   APPLE_TEAM_ID="TEAMID" \
   NOTARY_PROFILE="valv-notary" \
-    oss/macos/scripts/release-app.sh v0.1.0
+    macos/scripts/release-app.sh v0.1.0
 
 Produces Valv-<version>.dmg (signed + notarized + stapled) and uploads it plus
 its SHA-256 to the <tag> GitHub Release on ${VALV_GITHUB_REPO:-DRNKNDev/valv}.
@@ -91,7 +91,7 @@ current_project_version="$(printf '%s\n' "${app_build_settings}" | awk -F'= ' '/
 [[ "${current_project_version}" =~ ^[0-9]+$ ]] ||
   fail "${scheme} CURRENT_PROJECT_VERSION (${current_project_version}) must be a plain integer, not a semver or other string (D9)"
 
-appcast_path="${repo_root}/oss/macos/appcast.xml"
+appcast_path="${oss_root}/macos/appcast.xml"
 previous_build_number=0
 if [[ -f "${appcast_path}" ]]; then
   latest_from_appcast="$(grep -o 'sparkle:version="[0-9]\+"' "${appcast_path}" | grep -o '[0-9]\+' | sort -n | tail -1 || true)"
@@ -223,10 +223,10 @@ cat <<STEPS
 
 ==> Appcast regenerated locally but NOT yet published. Complete the publish
     sequence by hand (design D2/D4, tooling/release/release-notes.md):
-      1. review the diff:  git -C "${repo_root}" diff -- oss/macos/appcast.xml
-      2. git -C "${repo_root}" add oss/macos/appcast.xml
-      3. git -C "${repo_root}" commit -m "chore(macos): publish appcast entry for ${tag}"
-      4. git -C "${repo_root}" push
+      1. review the diff:  git -C "${oss_root}" diff -- macos/appcast.xml
+      2. git -C "${oss_root}" add macos/appcast.xml
+      3. git -C "${oss_root}" commit -m "chore(macos): publish appcast entry for ${tag}"
+      4. git -C "${oss_root}" push
       5. wait for private/apps/web's Pages deploy to finish
       6. curl -fsSL https://valvsync.com/appcast.xml | grep -- "${version}"
          (confirm the new version's entry is actually live before calling this

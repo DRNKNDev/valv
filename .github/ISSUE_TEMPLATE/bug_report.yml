@@ -1,0 +1,85 @@
+name: Bug Report
+description: Report a reproducible problem with the Valv app, CLI, daemon, or backend.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, search existing issues. If this is a security vulnerability, stop and use
+        [private vulnerability reporting](https://github.com/DRNKNDev/valv/security) instead.
+
+  - type: input
+    id: version
+    attributes:
+      label: Valv version
+      description: Output of `valv --version`, or the app version from the menu bar / About window.
+      placeholder: e.g. 0.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (app)
+        - macOS (CLI/daemon)
+        - Linux (CLI/daemon)
+    validations:
+      required: true
+
+  - type: input
+    id: architecture
+    attributes:
+      label: Architecture / OS version
+      placeholder: e.g. macOS 26.2, Apple Silicon (arm64) / Ubuntu 24.04, x86_64
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      options:
+        - macOS app (Finder integration / menu bar)
+        - File Provider extension
+        - CLI (valv)
+        - Daemon (valvd)
+        - Backend (core)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps, including any relevant configuration or commands.
+      placeholder: |
+        1. Run `valv mount ...`
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: >
+        Paste any relevant CLI output, daemon logs, or Console.app entries. **Redact secrets,
+        tokens, device IDs, account emails, and real filenames before pasting.**
+      render: shell
