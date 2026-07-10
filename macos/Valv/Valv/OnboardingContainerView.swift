@@ -183,6 +183,8 @@ private struct SignInOnboardingPage: View {
     @EnvironmentObject private var domainManager: FileProviderDomainManager
     @StateObject private var callbackCenter = AuthCallbackCenter.shared
     @State private var isWaiting = false
+    @State private var pendingDomainAccountId: String?
+    @State private var showsDomainRegistrationError = false
     let onDismiss: () -> Void
 
     var body: some View {
@@ -231,6 +233,14 @@ private struct SignInOnboardingPage: View {
         .onReceive(callbackCenter.$lastCallback.compactMap { $0 }) { url in
             handleCallback(url)
         }
+        .alert("Couldn't add Valv to Finder", isPresented: $showsDomainRegistrationError) {
+            Button("Retry") {
+                guard let pendingDomainAccountId else { return }
+                Task { await registerDomain(accountId: pendingDomainAccountId) }
+            }
+        } message: {
+            Text(domainRegistrationErrorMessage)
+        }
     }
 
     private func handleCallback(_ url: URL) {
@@ -243,14 +253,11 @@ private struct SignInOnboardingPage: View {
                 deviceName: deviceName
             )
             callbackCenter.clearExpectedState()
-            store.hasSignedIn = true
+            pendingDomainAccountId = credentials.deviceId
             Task {
                 await restartDaemon()
                 await store.refresh()
-                // Exactly one NSFileProviderDomain for the whole account (design.md
-                // D11) - registered once, here, on first successful sign-in.
-                await domainManager.registerDomainIfNeeded(accountId: credentials.deviceId)
-                coordinator.advance()
+                await registerDomain(accountId: credentials.deviceId)
             }
         } catch SignInDevicePairing.CallbackError.missingOrMismatchedState {
             coordinator.signInError = "Sign-in link did not match this device. Please try again."
@@ -262,6 +269,25 @@ private struct SignInOnboardingPage: View {
             coordinator.signInError = "Couldn't save sign-in details: \(error.localizedDescription)"
             isWaiting = false
         }
+    }
+
+    private var domainRegistrationErrorMessage: String {
+        guard let error = domainManager.registrationError else {
+            return "Valv couldn't add its location to Finder."
+        }
+        return UserFacingError(from: error).message
+    }
+
+    private func registerDomain(accountId: String) async {
+        await domainManager.registerDomainIfNeeded(accountId: accountId)
+        if domainManager.registrationError != nil {
+            showsDomainRegistrationError = true
+            return
+        }
+
+        pendingDomainAccountId = nil
+        store.hasSignedIn = true
+        coordinator.advance()
     }
 
     // valvd reads config.toml once at startup and does not hot-reload it (design.md D4).
