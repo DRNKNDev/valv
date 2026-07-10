@@ -47,6 +47,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     }
 
     private func resolveItem(for identifier: NSFileProviderItemIdentifier) async throws -> NSFileProviderItem {
+        guard identifier != .rootContainer else {
+            return FileProviderItem(kind: .root)
+        }
         switch ValvItemIdentifier(identifier) {
         case .mount(let folderId):
             let mounts = try await client.mounts()

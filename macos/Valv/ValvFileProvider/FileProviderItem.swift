@@ -4,6 +4,10 @@ import UniformTypeIdentifiers
 
 final class FileProviderItem: NSObject, NSFileProviderItem {
     enum Kind {
+        /// The domain's single root container. Answered without consulting the daemon:
+        /// the root is not a node in any mount's tree, and its children are the
+        /// synthetic mount folders below.
+        case root
         /// A synthetic folder representing one entry from `GET /mounts`, shown directly
         /// under the domain's single root container. Read-only from Finder's
         /// perspective - see `capabilities` below - regardless of the mount's own
@@ -26,6 +30,8 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
 
     var itemIdentifier: NSFileProviderItemIdentifier {
         switch kind {
+        case .root:
+            return .rootContainer
         case .syntheticMount(let mount):
             return ValvItemIdentifier.mount(folderId: mount.folderId).fileProviderIdentifier
         case .node(let item, _):
@@ -35,6 +41,8 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
 
     var parentItemIdentifier: NSFileProviderItemIdentifier {
         switch kind {
+        case .root:
+            return .rootContainer
         case .syntheticMount:
             return .rootContainer
         case .node(let item, _):
@@ -50,6 +58,8 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
 
     var filename: String {
         switch kind {
+        case .root:
+            return "Valv"
         case .syntheticMount(let mount):
             return mount.name.isEmpty ? mount.folderId : mount.name
         case .node(let item, _):
@@ -59,6 +69,8 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
 
     var contentType: UTType {
         switch kind {
+        case .root:
+            return .folder
         case .syntheticMount:
             return .folder
         case .node(let item, _):
@@ -79,6 +91,8 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     /// activation rule predicate can express (see design.md Risks).
     var capabilities: NSFileProviderItemCapabilities {
         switch kind {
+        case .root:
+            return [.allowsReading, .allowsContentEnumerating]
         case .syntheticMount:
             // Read-only synthetic entry: no rename/reparent/trash/delete/add-subitems,
             // matching task 4.10's "reject outright, independent of capabilities"
@@ -105,6 +119,8 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
 
     var documentSize: NSNumber? {
         switch kind {
+        case .root:
+            return nil
         case .syntheticMount:
             return nil
         case .node(let item, _):
@@ -114,6 +130,9 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
 
     var itemVersion: NSFileProviderItemVersion {
         switch kind {
+        case .root:
+            let content = Data("root".utf8)
+            return NSFileProviderItemVersion(contentVersion: content, metadataVersion: content)
         case .syntheticMount(let mount):
             let content = Data("mount:\(mount.folderId):\(mount.name)".utf8)
             return NSFileProviderItemVersion(contentVersion: content, metadataVersion: content)
@@ -127,8 +146,10 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     /// The mount a node belongs to, for callers (`FileProviderExtension`) that need to
     /// reject cross-mount reparenting (task 4.11) without re-deriving it from the
     /// identifier scheme.
-    var mountFolderId: String {
+    var mountFolderId: String? {
         switch kind {
+        case .root:
+            return nil
         case .syntheticMount(let mount):
             return mount.folderId
         case .node(let item, _):
