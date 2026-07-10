@@ -1,6 +1,7 @@
 
 import Combine
 import Foundation
+import FileProvider
 import Testing
 import DaemonKit
 @testable import Valv
@@ -69,6 +70,81 @@ struct ValvTests {
         #expect(didAttemptRestart)
         #expect(store.hasSignedIn == false)
         #expect(defaults.bool(forKey: "dev.drnkn.valv.hasSignedIn") == false)
+    }
+
+    @MainActor
+    @Test func domainRegistrationFailureCanRetryAndPersistSuccess() async throws {
+        let suiteName = "dev.drnkn.valv.tests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let accountId = "account-1"
+        var attempt = 0
+        var retryContinuation: CheckedContinuation<Void, Error>?
+        let manager = FileProviderDomainManager(
+            userDefaults: defaults,
+            addDomain: { _ in
+                attempt += 1
+                if attempt == 1 {
+                    throw NSError(domain: "ValvTests", code: 1)
+                }
+                try await withCheckedThrowingContinuation { continuation in
+                    retryContinuation = continuation
+                }
+            },
+            signalRootEnumerator: { _ in }
+        )
+
+        await manager.registerDomainIfNeeded(accountId: accountId)
+
+        #expect(manager.registrationError != nil)
+        #expect(manager.domain == nil)
+        #expect(defaults.string(forKey: "dev.drnkn.valv.fileProviderDomainIdentifier") == nil)
+
+        let retryTask = Task {
+            await manager.registerDomainIfNeeded(accountId: accountId)
+        }
+        while retryContinuation == nil {
+            await Task.yield()
+        }
+
+        #expect(manager.registrationError == nil)
+        #expect(manager.domain == nil)
+        #expect(defaults.string(forKey: "dev.drnkn.valv.fileProviderDomainIdentifier") == nil)
+
+        retryContinuation?.resume()
+        await retryTask.value
+
+        #expect(manager.registrationError == nil)
+        #expect(manager.domain?.identifier.rawValue == accountId)
+        #expect(defaults.string(forKey: "dev.drnkn.valv.fileProviderDomainIdentifier") == accountId)
+    }
+
+    @MainActor
+    @Test func domainRegistrationRepairsSystemStateEvenWhenCacheExists() async throws {
+        let suiteName = "dev.drnkn.valv.tests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let accountId = "account-1"
+        defaults.set(accountId, forKey: "dev.drnkn.valv.fileProviderDomainIdentifier")
+        var addCount = 0
+        let manager = FileProviderDomainManager(
+            userDefaults: defaults,
+            addDomain: { _ in
+                addCount += 1
+            },
+            signalRootEnumerator: { _ in }
+        )
+
+        await manager.registerDomainIfNeeded(accountId: accountId)
+
+        #expect(addCount == 1)
+        #expect(manager.registrationError == nil)
+        #expect(manager.domain?.identifier.rawValue == accountId)
+        #expect(defaults.string(forKey: "dev.drnkn.valv.fileProviderDomainIdentifier") == accountId)
     }
 
     @Test func deviceGrantBodyOmitsNilScopeAndPreservesSubfolderScope() throws {
@@ -617,6 +693,25 @@ struct ValvTests {
             #expect(contents.contains("device_id = \"device-1\""))
             #expect(contents.contains("device_token = \"token-1\""))
             #expect(contents.contains("device_name = \"Test Mac\""))
+        }
+    }
+
+    @Test func configReaderIncludesDeviceIdForLaunchReconciliation() throws {
+        try withTemporaryConfigDirectory { directory in
+            try ConfigWriter.write(
+                ConfigWriter.Values(
+                    backendURL: "https://api.example.test",
+                    deviceId: "device-1",
+                    deviceToken: "token-1",
+                    deviceName: "Test Mac"
+                ),
+                configDirectory: directory
+            )
+
+            let values = try #require(ConfigReader.read(configPath: ConfigWriter.configPath(in: directory)))
+            #expect(values.backendURL == "https://api.example.test")
+            #expect(values.deviceId == "device-1")
+            #expect(values.deviceToken == "token-1")
         }
     }
 

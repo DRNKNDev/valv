@@ -1,4 +1,5 @@
 import AppKit
+import DaemonKit
 import SwiftUI
 
 /// Auto-presents onboarding for a not-signed-in user right at launch, instead of
@@ -18,12 +19,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        guard !DaemonStore.shared.hasSignedIn else { return }
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
+
+        if DaemonStore.shared.hasSignedIn, let accountId = ConfigReader.read()?.deviceId {
+            Task { await reconcileFileProviderDomain(accountId: accountId) }
+            return
+        }
+
+        DaemonStore.shared.hasSignedIn = false
         OnboardingWindowController.shared.present(
             store: DaemonStore.shared,
             daemonManager: DaemonManager.shared,
             domainManager: FileProviderDomainManager.shared
         )
+    }
+
+    private func reconcileFileProviderDomain(accountId: String) async {
+        while true {
+            await FileProviderDomainManager.shared.registerDomainIfNeeded(accountId: accountId)
+            guard let error = FileProviderDomainManager.shared.registrationError else { return }
+
+            let alert = NSAlert()
+            alert.messageText = "Couldn't add Valv to Finder"
+            alert.informativeText = UserFacingError(from: error).message
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Retry")
+            alert.addButton(withTitle: "Cancel")
+            NSApp.activate()
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
     }
 
     @objc private func handleGetURLEvent(

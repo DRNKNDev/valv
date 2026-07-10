@@ -7,6 +7,7 @@ import Foundation
 enum ConfigReader {
     struct Values {
         let backendURL: String
+        let deviceId: String
         let deviceToken: String
 
         var webAccountURL: URL? {
@@ -23,8 +24,8 @@ enum ConfigReader {
         }
     }
 
-    static func read() -> Values? {
-        guard let contents = try? String(contentsOf: ConfigWriter.configPath, encoding: .utf8) else {
+    static func read(configPath: URL = ConfigWriter.configPath) -> Values? {
+        guard let contents = try? String(contentsOf: configPath, encoding: .utf8) else {
             return nil
         }
         var values: [String: String] = [:]
@@ -40,9 +41,11 @@ enum ConfigReader {
             }
             values[key] = value
         }
-        guard let backendURL = values["backend_url"], let deviceToken = values["device_token"] else {
+        guard let backendURL = values["backend_url"],
+              let deviceId = values["device_id"],
+              let deviceToken = values["device_token"] else {
             return nil
         }
-        return Values(backendURL: backendURL, deviceToken: deviceToken)
+        return Values(backendURL: backendURL, deviceId: deviceId, deviceToken: deviceToken)
     }
 }

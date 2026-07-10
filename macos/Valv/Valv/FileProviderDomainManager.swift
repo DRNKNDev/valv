@@ -13,11 +13,22 @@ final class FileProviderDomainManager: ObservableObject {
     static let shared = FileProviderDomainManager()
 
     @Published private(set) var domain: NSFileProviderDomain?
+    @Published private(set) var registrationError: Error?
 
     private static let domainIdentifierDefaultsKey = "dev.drnkn.valv.fileProviderDomainIdentifier"
+    private let userDefaults: UserDefaults
+    private let addDomain: ((NSFileProviderDomain) async throws -> Void)?
+    private let signalRootEnumeratorOperation: ((NSFileProviderDomain) async -> Void)?
 
-    init() {
-        if let existingId = UserDefaults.standard.string(forKey: Self.domainIdentifierDefaultsKey) {
+    init(
+        userDefaults: UserDefaults = .standard,
+        addDomain: ((NSFileProviderDomain) async throws -> Void)? = nil,
+        signalRootEnumerator: ((NSFileProviderDomain) async -> Void)? = nil
+    ) {
+        self.userDefaults = userDefaults
+        self.addDomain = addDomain
+        self.signalRootEnumeratorOperation = signalRootEnumerator
+        if let existingId = userDefaults.string(forKey: Self.domainIdentifierDefaultsKey) {
             domain = NSFileProviderDomain(
                 identifier: NSFileProviderDomainIdentifier(existingId),
                 displayName: "Valv"
@@ -25,40 +36,75 @@ final class FileProviderDomainManager: ObservableObject {
         }
     }
 
-    /// Registers the one domain for this account, if not already registered. Safe to
-    /// call more than once - a no-op after the first successful call for a given
-    /// account identifier.
+    /// Registers or updates the expected domain. `NSFileProviderManager.add` is
+    /// idempotent for an existing identifier, so every launch repairs missing system
+    /// state without relying on the local UserDefaults cache.
     func registerDomainIfNeeded(accountId: String) async {
-        guard domain == nil else { return }
-        let newDomain = NSFileProviderDomain(
+        registrationError = nil
+        let expectedDomain = NSFileProviderDomain(
             identifier: NSFileProviderDomainIdentifier(accountId),
             displayName: "Valv"
         )
         do {
-            try await NSFileProviderManager.add(newDomain)
-            domain = newDomain
-            UserDefaults.standard.set(accountId, forKey: Self.domainIdentifierDefaultsKey)
-            await signalRootEnumerator()
+            if let addDomain {
+                try await addDomain(expectedDomain)
+            } else {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    NSFileProviderManager.add(expectedDomain) { error in
+                        if let error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume()
+                        }
+                    }
+                }
+            }
+            domain = expectedDomain
+            userDefaults.set(accountId, forKey: Self.domainIdentifierDefaultsKey)
+            await signalRootEnumerator(for: expectedDomain)
         } catch {
+            registrationError = error
             NSLog("FileProviderDomainManager: failed to register domain: %@", error.localizedDescription)
         }
     }
 
     func removeDomainIfRegistered() async throws {
         guard let domain else {
-            UserDefaults.standard.removeObject(forKey: Self.domainIdentifierDefaultsKey)
+            userDefaults.removeObject(forKey: Self.domainIdentifierDefaultsKey)
             return
         }
-        try await NSFileProviderManager.remove(domain)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            NSFileProviderManager.remove(domain) { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
         self.domain = nil
-        UserDefaults.standard.removeObject(forKey: Self.domainIdentifierDefaultsKey)
+        registrationError = nil
+        userDefaults.removeObject(forKey: Self.domainIdentifierDefaultsKey)
     }
 
     /// Called after a successful `POST /mount` or an unmount, so the synthetic root's
     /// enumeration (one item per `GET /mounts` entry) picks up the change without
     /// waiting for the background watch loop's next cycle.
     func signalRootEnumerator() async {
-        guard let domain, let manager = NSFileProviderManager(for: domain) else { return }
-        try? await manager.signalEnumerator(for: .rootContainer)
+        guard let domain else { return }
+        await signalRootEnumerator(for: domain)
+    }
+
+    private func signalRootEnumerator(for domain: NSFileProviderDomain) async {
+        if let signalRootEnumeratorOperation {
+            await signalRootEnumeratorOperation(domain)
+            return
+        }
+        guard let manager = NSFileProviderManager(for: domain) else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            manager.signalEnumerator(for: .rootContainer) { _ in
+                continuation.resume()
+            }
+        }
     }
 }
