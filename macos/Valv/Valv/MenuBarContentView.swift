@@ -1,3 +1,4 @@
+import AppKit
 import DaemonKit
 import SwiftUI
 
@@ -35,7 +36,6 @@ struct MenuBarContentView: View {
     @EnvironmentObject private var daemonManager: DaemonManager
     @EnvironmentObject private var domainManager: FileProviderDomainManager
     @EnvironmentObject private var updateManager: UpdateManager
-    @State private var isConfirmingSignOut = false
     @State private var signOutError: String?
 
     var body: some View {
@@ -48,14 +48,6 @@ struct MenuBarContentView: View {
         }
         .padding(.vertical, 6)
         .frame(width: 320)
-        .alert("Sign out of Valv?", isPresented: $isConfirmingSignOut) {
-            Button("Sign Out", role: .destructive) {
-                Task { await signOut() }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Syncing stops on this Mac. Files already synced here stay in place, and your other devices and collaborators are unaffected.")
-        }
         .task {
             store.startPolling()
         }
@@ -105,6 +97,11 @@ struct MenuBarContentView: View {
 
             Divider()
 
+            Button("Sync Now") {
+                Task { await store.syncNow() }
+            }
+            .buttonStyle(MenuItemButtonStyle())
+
             Button(store.status?.paused == true ? "Resume Syncing" : "Pause Syncing") {
                 Task {
                     if store.status?.paused == true {
@@ -116,19 +113,12 @@ struct MenuBarContentView: View {
             }
             .buttonStyle(MenuItemButtonStyle())
 
-            Button("Sync Now") {
-                Task { await store.syncNow() }
-            }
-            .buttonStyle(MenuItemButtonStyle())
-
             if store.isDisconnected {
                 Button("Retry") {
                     Task { await store.refresh() }
                 }
                 .buttonStyle(MenuItemButtonStyle())
             }
-
-            Divider()
 
             Button("Manage Folders & Sharing...") {
                 ManageFoldersWindowController.shared.present(
@@ -140,22 +130,18 @@ struct MenuBarContentView: View {
 
             Divider()
 
-            accountSection
-
-            Divider()
-
-            Button(daemonManager.cliInstallStatus.actionTitle) {
-                Task { await daemonManager.installCLI() }
-            }
-            .buttonStyle(MenuItemButtonStyle())
-            .disabled(!daemonManager.cliInstallStatus.isActionable)
-
-            daemonOwnershipLine
-                .padding(.horizontal, 14)
-
             checkForUpdatesRow
 
-            Divider()
+            Button("Sign Out...") {
+                confirmSignOut()
+            }
+            .buttonStyle(MenuItemButtonStyle())
+            if let signOutError {
+                Text(signOutError)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 14)
+            }
 
             quitSection
         }
@@ -167,11 +153,6 @@ struct MenuBarContentView: View {
                 StatusBadge(color: color(for: store.iconState))
                 Text(summaryText)
                     .font(.body.weight(.medium))
-            }
-            if let caption = summaryCaption {
-                Text(caption)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -210,23 +191,6 @@ struct MenuBarContentView: View {
         }
     }
 
-    private var summaryCaption: String? {
-        if store.isDisconnected {
-            guard let lastSuccessAt = store.lastSuccessAt else {
-                return "No successful connection yet"
-            }
-            return "Last connected \(Self.relativeFormatter.localizedString(for: lastSuccessAt, relativeTo: Date()))"
-        }
-        guard let lastSuccessAt = store.lastSuccessAt else { return nil }
-        return "Last checked \(Self.relativeFormatter.localizedString(for: lastSuccessAt, relativeTo: Date()))"
-    }
-
-    private static let relativeFormatter: RelativeDateTimeFormatter = {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .short
-        return formatter
-    }()
-
     private func color(for state: IconState) -> Color {
         switch state {
         case .notSetUp: return .gray
@@ -263,56 +227,6 @@ struct MenuBarContentView: View {
         NSWorkspace.shared.open(url)
     }
 
-    private var accountSection: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(store.status?.account?.email ?? "Signed in")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 14)
-            Button("Sign Out...") {
-                isConfirmingSignOut = true
-            }
-            .buttonStyle(MenuItemButtonStyle())
-            if let signOutError {
-                Text(signOutError)
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 14)
-            }
-        }
-    }
-
-    private var daemonOwnershipLine: some View {
-        Group {
-            if let version = store.status?.version {
-                Text(Self.daemonOwnershipText(
-                    version: version,
-                    isManagedByValv: daemonManager.isManagedByValv,
-                    updateAvailable: store.status?.updateAvailable,
-                    latestVersion: store.status?.latestVersion
-                ))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            } else {
-                Text("Daemon not connected").font(.caption).foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    static func daemonOwnershipText(
-        version: String,
-        isManagedByValv: Bool,
-        updateAvailable: Bool?,
-        latestVersion: String?
-    ) -> String {
-        let ownership = isManagedByValv ? "managed by Valv" : "managed externally"
-        var text = "valvd \(version) - \(ownership)"
-        if updateAvailable == true, let latestVersion {
-            text += " - Update available (\(latestVersion))"
-        }
-        return text
-    }
-
     private var checkForUpdatesRow: some View {
         Button {
             updateManager.checkForUpdates()
@@ -345,11 +259,31 @@ struct MenuBarContentView: View {
                 NSApplication.shared.terminate(nil)
             }
             .buttonStyle(MenuItemButtonStyle())
-            Text("Syncing continues in the background")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 14)
+            if let daemonFooterText = Self.daemonFooterText(version: store.status?.version) {
+                Text(daemonFooterText)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 14)
+            }
         }
+    }
+
+    static func daemonFooterText(version: String?) -> String? {
+        guard let version else { return nil }
+        return "valvd \(version) · Syncs after quit"
+    }
+
+    private func confirmSignOut() {
+        let alert = NSAlert()
+        alert.messageText = "Sign out of Valv?"
+        alert.informativeText = "Syncing stops on this Mac. Files already synced here stay in place, and your other devices and collaborators are unaffected."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Sign Out").hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+
+        NSApp.activate()
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task { await signOut() }
     }
 
     private func signOut() async {

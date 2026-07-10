@@ -154,7 +154,7 @@ final class DaemonStore: ObservableObject {
         if let restartDaemonOperation {
             restartDaemonOperation()
         } else {
-            restartDaemon()
+            await restartDaemon()
         }
         hasSignedIn = false
         status = nil
@@ -162,15 +162,17 @@ final class DaemonStore: ObservableObject {
         lastSuccessAt = nil
     }
 
-    private func restartDaemon() {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = ["kickstart", "-k", "gui/\(getuid())/dev.drnkn.valvd"]
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            NSLog("DaemonStore: failed to restart daemon after sign out: %@", error.localizedDescription)
-        }
+    private func restartDaemon() async {
+        await Task.detached(priority: .utility) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            process.arguments = ["kickstart", "-k", "gui/\(getuid())/dev.drnkn.valvd"]
+            do {
+                try process.run()
+                process.waitUntilExit()
+            } catch {
+                NSLog("DaemonStore: failed to restart daemon after sign out: %@", error.localizedDescription)
+            }
+        }.value
     }
 }

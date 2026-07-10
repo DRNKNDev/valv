@@ -248,34 +248,12 @@ struct ValvTests {
         ) == UserFacingError.connectionFailureMessage)
     }
 
-    @Test func daemonOwnershipTextShowsUpdateAvailableIndicatorWithVersion() {
-        let text = MenuBarContentView.daemonOwnershipText(
-            version: "0.2.0",
-            isManagedByValv: true,
-            updateAvailable: true,
-            latestVersion: "0.3.0"
-        )
-        #expect(text == "valvd 0.2.0 - managed by Valv - Update available (0.3.0)")
+    @Test func daemonFooterTextIncludesVersionAndQuitBehavior() {
+        #expect(MenuBarContentView.daemonFooterText(version: "0.2.0") == "valvd 0.2.0 · Syncs after quit")
     }
 
-    @Test func daemonOwnershipTextOmitsIndicatorWhenUpdateAvailableIsFalse() {
-        let text = MenuBarContentView.daemonOwnershipText(
-            version: "0.2.0",
-            isManagedByValv: true,
-            updateAvailable: false,
-            latestVersion: "0.2.0"
-        )
-        #expect(text == "valvd 0.2.0 - managed by Valv")
-    }
-
-    @Test func daemonOwnershipTextOmitsIndicatorWhenFieldsAreAbsent() {
-        let text = MenuBarContentView.daemonOwnershipText(
-            version: "0.2.0",
-            isManagedByValv: false,
-            updateAvailable: nil,
-            latestVersion: nil
-        )
-        #expect(text == "valvd 0.2.0 - managed externally")
+    @Test func daemonFooterTextIsAbsentWithoutVersion() {
+        #expect(MenuBarContentView.daemonFooterText(version: nil) == nil)
     }
 
     @Test func cleanInstallFailureSetsInstallErrorAndReconcileStillSettles() async {
