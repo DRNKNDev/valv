@@ -48,7 +48,7 @@ private struct WelcomeOnboardingPage: View {
         OnboardingCardChrome(
             metadata: OnboardingPageMetadata(
                 imageName: "OnboardingWelcome",
-                heroSymbolName: "sparkles",
+                heroImageName: "OnboardingValvIcon",
                 title: "Welcome to Valv",
                 description: "Sync your files across every device, and share them with anyone."
             ),

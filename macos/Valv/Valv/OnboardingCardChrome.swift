@@ -5,9 +5,24 @@ import SwiftUI
 /// interactive controls below them) stays each page's own view code.
 struct OnboardingPageMetadata {
     let imageName: String
-    let heroSymbolName: String
+    let heroSymbolName: String?
+    let heroImageName: String?
     let title: String
     let description: String
+
+    init(
+        imageName: String,
+        heroSymbolName: String? = nil,
+        heroImageName: String? = nil,
+        title: String,
+        description: String
+    ) {
+        self.imageName = imageName
+        self.heroSymbolName = heroSymbolName
+        self.heroImageName = heroImageName
+        self.title = title
+        self.description = description
+    }
 }
 
 /// TourKit-style card chrome (github.com/rampatra/TourKit), built fresh rather than
@@ -83,17 +98,32 @@ struct OnboardingCardChrome<Content: View>: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .allowsHitTesting(false)
 
-            Image(systemName: metadata.heroSymbolName)
+            hero
+
+            topControls
+        }
+        .frame(width: Self.cardWidth, height: imageHeight)
+    }
+
+    @ViewBuilder
+    private var hero: some View {
+        if let heroImageName = metadata.heroImageName {
+            Image(heroImageName)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 120, height: 120)
+                .shadow(color: .black.opacity(0.22), radius: 10, y: 5)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                .allowsHitTesting(false)
+        } else if let heroSymbolName = metadata.heroSymbolName {
+            Image(systemName: heroSymbolName)
                 .symbolRenderingMode(.hierarchical)
                 .font(.system(size: 72, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.88))
                 .shadow(color: .black.opacity(0.22), radius: 10, y: 5)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 .allowsHitTesting(false)
-
-            topControls
         }
-        .frame(width: Self.cardWidth, height: imageHeight)
     }
 
     private var topControls: some View {
