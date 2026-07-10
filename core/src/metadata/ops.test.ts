@@ -67,6 +67,41 @@ describe("submitOp", () => {
     ]);
   });
 
+  it("rejects a move whose new_parent_id belongs to a different folder_id", async () => {
+    const db = new OpTestDb();
+    const hub = new TestHub();
+
+    const error = await submitOp(authFor(db), hub, "folder-1", devicePrincipal, {
+      op_type: "move",
+      node_id: "doc",
+      based_on_seq: 1,
+      payload: { new_parent_id: "archive-b" },
+    }).then(() => undefined, (reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(Response);
+    const response = error as Response;
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "cross_folder_move_rejected" });
+    expect(db.nodes.get("doc")?.parentId).toBe("root");
+    expect(db.ops).toHaveLength(0);
+    expect(hub.notifications).toEqual([]);
+  });
+
+  it("applies a move whose new_parent_id belongs to the same folder_id", async () => {
+    const db = new OpTestDb();
+    const hub = new TestHub();
+
+    const response = await submitOp(authFor(db), hub, "folder-1", devicePrincipal, {
+      op_type: "move",
+      node_id: "doc",
+      based_on_seq: 1,
+      payload: { new_parent_id: "archive" },
+    });
+
+    expect(response).toEqual({ result: "applied", server_seq: 2, node_id: "doc" });
+    expect(db.nodes.get("doc")?.parentId).toBe("archive");
+  });
+
   it("applies canonical new_version ops by updating current version and chunk refcounts", async () => {
     const db = new OpTestDb();
     const hub = new TestHub();
@@ -368,6 +403,19 @@ class OpTestDb implements CoreDb {
         deletedAt: null,
       },
     ],
+    [
+      "archive-b",
+      {
+        nodeId: "archive-b",
+        folderId: "folder-2",
+        parentId: null,
+        name: "archive-b",
+        type: "folder",
+        serverSeq: 1,
+        currentVersionId: null,
+        deletedAt: null,
+      },
+    ],
   ]);
   versions: TestVersion[] = [];
   versionChunks: TestVersionChunk[] = [];
@@ -462,11 +510,11 @@ class OpTestDb implements CoreDb {
   }
 
   private selectFrom(table: unknown, selection?: Record<string, unknown>): any {
-    const rows = () => this.selectRows(table, selection);
+    const rows = (condition?: unknown) => this.selectRows(table, selection, condition);
     return {
-      where: () => ({
-        limit: async (limit: number) => rows().slice(0, limit),
-        orderBy: () => this.orderable(rows()),
+      where: (condition?: unknown) => ({
+        limit: async (limit: number) => rows(condition).slice(0, limit),
+        orderBy: () => this.orderable(rows(condition)),
       }),
       orderBy: () => this.orderable(rows()),
       innerJoin: (joinTable: unknown) => ({
@@ -484,12 +532,13 @@ class OpTestDb implements CoreDb {
     };
   }
 
-  private selectRows(table: unknown, selection?: Record<string, unknown>): any[] {
+  private selectRows(table: unknown, selection?: Record<string, unknown>, condition?: unknown): any[] {
     const keys = Object.keys(selection ?? {});
     if (table === pgSchema.nodes) {
       const doc = this.nodes.get("doc");
       if (keys.includes("type")) {
-        return [this.nodes.get("archive")].filter(Boolean);
+        const targetId = extractEqValue(condition) ?? "archive";
+        return [this.nodes.get(targetId)].filter(Boolean);
       }
       if (keys.includes("name") && keys.includes("parentId")) {
         return doc ? [{ name: doc.name, parentId: doc.parentId }] : [];
@@ -556,6 +605,22 @@ class TestHub implements MetadataHub {
 
 function authFor(db: OpTestDb, schema: CoreAuth["schema"] = pgSchema): CoreAuth {
   return { db, schema } as unknown as CoreAuth;
+}
+
+function extractEqValue(condition: unknown): string | undefined {
+  if (!condition || typeof condition !== "object" || !("queryChunks" in condition)) {
+    return undefined;
+  }
+  const chunks = (condition as { queryChunks: unknown[] }).queryChunks;
+  for (const chunk of chunks) {
+    if (chunk && typeof chunk === "object" && "value" in chunk) {
+      const value = (chunk as { value: unknown }).value;
+      if (typeof value === "string") {
+        return value;
+      }
+    }
+  }
+  return undefined;
 }
 
 function sqlText(query: unknown): string {

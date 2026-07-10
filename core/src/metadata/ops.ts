@@ -71,12 +71,15 @@ export async function submitOp(
 
   if (op.op_type === "move") {
     const parents = await auth.db
-      .select({ nodeId: auth.schema.nodes.nodeId, type: auth.schema.nodes.type })
+      .select({ nodeId: auth.schema.nodes.nodeId, type: auth.schema.nodes.type, folderId: auth.schema.nodes.folderId })
       .from(auth.schema.nodes)
       .where(eq(auth.schema.nodes.nodeId, op.payload.new_parent_id))
       .limit(1);
     if (!parents[0] || parents[0].type !== "folder") {
       throw new Response(JSON.stringify({ error: "parent_not_found" }), { status: 404 });
+    }
+    if (parents[0].folderId !== folderId) {
+      throw new Response(JSON.stringify({ error: "cross_folder_move_rejected" }), { status: 409 });
     }
   }
 
