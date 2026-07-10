@@ -381,6 +381,16 @@ pub(crate) async fn fp_move(
     }
 
     if let Some(new_parent_id) = req.new_parent_id.as_deref() {
+        {
+            let conn = state.db.lock().await;
+            if let Some(parent) = nodes::get_node(&conn, new_parent_id)? {
+                if parent.folder_id != updated_node.folder_id {
+                    return Err(DaemonError::Conflict(json!({
+                        "error": "cross_folder_move_rejected"
+                    })));
+                }
+            }
+        }
         let response = submit_op_daemon_for_mount(
             &state,
             &mount,
@@ -1753,6 +1763,79 @@ mod fp_error_tests {
         assert_eq!(captured[0]["op_type"], "move");
         assert_eq!(captured[0]["based_on_seq"], 7);
         assert_eq!(captured[0]["payload"]["new_parent_id"], "parent-2");
+    }
+
+    #[tokio::test]
+    async fn fp_move_cross_folder_destination_rejected_without_backend_call() {
+        let (backend_url, requests) = backend_url_recording_responses(vec![(
+            "HTTP/1.1 500 Internal Server Error",
+            r#"{}"#,
+        )])
+        .await;
+        let state = test_state(backend_url);
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("node-1", Some("parent-1"), "doc.txt")).unwrap();
+            let mut other_folder_parent = folder_node("parent-9", None, "Other Folder Root");
+            other_folder_parent.folder_id = "folder-9".to_owned();
+            node_store::upsert_node(&conn, &other_folder_parent).unwrap();
+        }
+
+        let error = fp_move(
+            State(state.clone()),
+            Json(FpMoveRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 7,
+                new_name: None,
+                new_parent_id: Some("parent-9".to_owned()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        let (status, body) = response_json(error).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, json!({ "error": "cross_folder_move_rejected" }));
+        assert_eq!(requests.lock().await.len(), 0);
+        let conn = state.db.lock().await;
+        let unchanged = node_store::get_node(&conn, "node-1").unwrap().unwrap();
+        assert_eq!(unchanged.parent_id.as_deref(), Some("parent-1"));
+        assert_eq!(unchanged.server_seq, 7);
+    }
+
+    #[tokio::test]
+    async fn fp_move_destination_not_in_local_mirror_reaches_backend() {
+        let (backend_url, requests) = backend_url_recording_responses(vec![(
+            "HTTP/1.1 200 OK",
+            r#"{"result":"applied","server_seq":9,"node_id":"node-1"}"#,
+        )])
+        .await;
+        let state = test_state(backend_url);
+        {
+            let conn = state.db.lock().await;
+            node_store::upsert_node(&conn, &node("node-1", Some("parent-1"), "doc.txt")).unwrap();
+        }
+
+        let response = fp_move(
+            State(state.clone()),
+            Json(FpMoveRequest {
+                node_id: "node-1".to_owned(),
+                based_on_seq: 7,
+                new_name: None,
+                new_parent_id: Some("not-mounted-locally".to_owned()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.server_seq, 9);
+        let captured = requests.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["op_type"], "move");
+        assert_eq!(
+            captured[0]["payload"]["new_parent_id"],
+            "not-mounted-locally"
+        );
     }
 
     #[tokio::test]
