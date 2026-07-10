@@ -178,6 +178,14 @@ struct ValvTests {
         #expect(!DaemonManager.isVersion("not-a-version", atLeast: "0.9.0"))
     }
 
+    @Test func daemonVersionFloorRejectsDaemonsWithoutFileProviderRoutes() {
+        let floor = DaemonManager.minimumRequiredVersion
+        #expect(!DaemonManager.isVersion("0.1.0", atLeast: floor))
+        #expect(!DaemonManager.isVersion("0.1.9", atLeast: floor))
+        #expect(DaemonManager.isVersion("0.2.0", atLeast: floor))
+        #expect(DaemonManager.isVersion("0.3.1", atLeast: floor))
+    }
+
     @Test func updateRequiredSummaryOverridesTextWithoutChangingIconState() throws {
         let decoder = JSONDecoder()
         let status = try decoder.decode(DaemonStatus.self, from: Data("""

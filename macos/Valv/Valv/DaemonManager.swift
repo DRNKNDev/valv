@@ -34,7 +34,8 @@ final class DaemonManager: ObservableObject {
     }
 
     private static let launchAgentLabel = "dev.drnkn.valvd"
-    private static let minimumRequiredVersion = "0.1.0"
+    /// First `valvd` that registers the `/fp/*` routes the File Provider extension calls.
+    static let minimumRequiredVersion = "0.2.0"
 
     @Published private(set) var isManagedByValv = false
     @Published private(set) var cliInstallStatus: CLIInstallStatus = .notChecked
