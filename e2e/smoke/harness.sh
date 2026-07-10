@@ -8,7 +8,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 fi
 
 SMOKE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd "${SMOKE_DIR}/../../.." && pwd)
+OSS_ROOT=$(cd "${SMOKE_DIR}/../.." && pwd)
 REAL_HOME=${HOME:-}
 
 export VALV_NO_UPDATE_CHECK=1
@@ -30,29 +30,29 @@ find_tool() {
 }
 
 require_tools() {
-  TSX_BIN="${REPO_ROOT}/oss/core/node_modules/.bin/tsx"
-  [ -x "$TSX_BIN" ] || fail "tsx is required at oss/core/node_modules/.bin/tsx. Run: cd oss && pnpm install"
+  TSX_BIN="${OSS_ROOT}/core/node_modules/.bin/tsx"
+  [ -x "$TSX_BIN" ] || fail "tsx is required at core/node_modules/.bin/tsx. Run: pnpm install"
 
   if ! command -v mc >/dev/null 2>&1; then
     fail "mc (MinIO Client) is required. Install: brew install minio/stable/mc"
   fi
 
-  VALVD_BIN=$(find_tool valvd "${REPO_ROOT}/oss/crates/target/debug/valvd") \
-    || fail "valvd is required. Build it with: cd oss/crates && cargo build"
-  VALV_BIN=$(find_tool valv "${REPO_ROOT}/oss/crates/target/debug/valv") \
-    || fail "valv is required. Build it with: cd oss/crates && cargo build"
+  VALVD_BIN=$(find_tool valvd "${OSS_ROOT}/crates/target/debug/valvd") \
+    || fail "valvd is required. Build it with: cd crates && cargo build"
+  VALV_BIN=$(find_tool valv "${OSS_ROOT}/crates/target/debug/valv") \
+    || fail "valv is required. Build it with: cd crates && cargo build"
   export TSX_BIN VALVD_BIN VALV_BIN
 }
 
 apply_sqlite_migrations() {
   local db_path="$1"
-  node - "$db_path" "$REPO_ROOT" <<'NODE'
+  node - "$db_path" "$OSS_ROOT" <<'NODE'
 const fs = require("fs");
 const path = require("path");
 const dbPath = process.argv[2];
-const repoRoot = process.argv[3];
-const Database = require(path.join(repoRoot, "oss/core/node_modules/better-sqlite3"));
-const migrationsDir = path.join(repoRoot, "oss/core/src/db/migrations/sqlite");
+const ossRoot = process.argv[3];
+const Database = require(path.join(ossRoot, "core/node_modules/better-sqlite3"));
+const migrationsDir = path.join(ossRoot, "core/src/db/migrations/sqlite");
 const db = new Database(dbPath);
 for (const file of fs.readdirSync(migrationsDir).filter((name) => name.endsWith(".sql")).sort()) {
   db.exec(fs.readFileSync(path.join(migrationsDir, file), "utf8"));
@@ -83,7 +83,7 @@ start_backend() {
   export BUCKET_SECRET_ACCESS_KEY="minioadmin"
 
   apply_sqlite_migrations "${TMPDIR}/backend.db"
-  HOME="$REAL_HOME" "$TSX_BIN" "${REPO_ROOT}/oss/core/src/server.ts" > "${TMPDIR}/backend.log" 2>&1 &
+  HOME="$REAL_HOME" "$TSX_BIN" --tsconfig "${OSS_ROOT}/core/tsconfig.json" "${OSS_ROOT}/core/src/server.ts" > "${TMPDIR}/backend.log" 2>&1 &
   BACKEND_PID=$!
   export BACKEND_PID
   wait_for_backend
