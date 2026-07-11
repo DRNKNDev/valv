@@ -108,6 +108,10 @@ public actor DaemonClient {
         try await get("/nodes/\(nodeId)/path")
     }
 
+    public func nodeIdForPath(_ path: String) async throws -> NodeByPathResponse {
+        try await get("/nodes/by-path?path=\(urlEncoded(path))")
+    }
+
     // MARK: - File Provider API
 
     // `folderId` is required (not optional) even though the daemon's own query struct

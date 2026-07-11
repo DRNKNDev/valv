@@ -69,6 +69,8 @@ public struct UserFacingError: Sendable {
         "name_collision": "A file or folder with that name already exists.",
         "no_grant": "You don't have access to that item.",
         "node_not_found": "That file or folder could not be found.",
+        "node_not_synced": "This file hasn't finished syncing yet.",
+        "not_in_mount": "This file isn't inside a synced folder.",
         "parent_not_found": "The destination folder could not be found.",
         "user_required": "Sign in with a user account to accept this invite.",
         "version_not_found": "That file version could not be found."

@@ -79,6 +79,14 @@ public struct NodePathResponse: Codable, Hashable, Sendable {
     public let path: String
 }
 
+public struct NodeByPathResponse: Codable, Hashable, Sendable {
+    public let nodeId: String
+
+    enum CodingKeys: String, CodingKey {
+        case nodeId = "node_id"
+    }
+}
+
 public struct MountRequest: Codable, Hashable, Sendable {
     public let path: String
     public let folderId: String?
