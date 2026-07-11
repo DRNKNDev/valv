@@ -9,12 +9,10 @@
 /* Begin PBXBuildFile section */
 		640099A544F68D4A2C0E977D /* DaemonKit in Frameworks */ = {isa = PBXBuildFile; productRef = 1725C69B19D99BAD576DFB24 /* DaemonKit */; };
 		8495E49467511E5F9F6B7CC5 /* DaemonKit in Frameworks */ = {isa = PBXBuildFile; productRef = 218055D4D13F74307806BF25 /* DaemonKit */; };
-		EDE2FAFB1381E0AEE2F64065 /* DaemonKit in Frameworks */ = {isa = PBXBuildFile; productRef = 7C175398AB2EEB0F5DB4573B /* DaemonKit */; };
 		FB045D4B300155A70032EBE5 /* ValvFinderSync.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = FB045D44300155A70032EBE5 /* ValvFinderSync.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		FB045D52300156660032EBE5 /* DaemonKit in Frameworks */ = {isa = PBXBuildFile; productRef = FB045D51300156660032EBE5 /* DaemonKit */; };
 		FB5243C32FF7B11700C299B8 /* UniformTypeIdentifiers.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FB5243C22FF7B11700C299B8 /* UniformTypeIdentifiers.framework */; };
 		FB5243CF2FF7B11700C299B8 /* ValvFileProvider.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = FB5243C02FF7B11700C299B8 /* ValvFileProvider.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
-		FB5243E72FF7B24600C299B8 /* ValvFileProviderUI.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = FB5243D92FF7B24600C299B8 /* ValvFileProviderUI.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		FBE3EF312FFFC87700888CD6 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = FBE3EF302FFFC87700888CD6 /* Sparkle */; };
 /* End PBXBuildFile section */
 
@@ -47,13 +45,6 @@
 			remoteGlobalIDString = FB5243BF2FF7B11700C299B8;
 			remoteInfo = ValvFileProvider;
 		};
-		FB5243E52FF7B24600C299B8 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = FB5243882FF7B09900C299B8 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = FB5243D82FF7B24600C299B8;
-			remoteInfo = ValvFileProviderUI;
-		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -63,7 +54,6 @@
 			dstPath = "";
 			dstSubfolderSpec = 13;
 			files = (
-				FB5243E72FF7B24600C299B8 /* ValvFileProviderUI.appex in Embed Foundation Extensions */,
 				FB045D4B300155A70032EBE5 /* ValvFinderSync.appex in Embed Foundation Extensions */,
 				FB5243CF2FF7B11700C299B8 /* ValvFileProvider.appex in Embed Foundation Extensions */,
 			);
@@ -79,7 +69,6 @@
 		FB5243A92FF7B09A00C299B8 /* ValvUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ValvUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		FB5243C02FF7B11700C299B8 /* ValvFileProvider.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = ValvFileProvider.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		FB5243C22FF7B11700C299B8 /* UniformTypeIdentifiers.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UniformTypeIdentifiers.framework; path = System/Library/Frameworks/UniformTypeIdentifiers.framework; sourceTree = SDKROOT; };
-		FB5243D92FF7B24600C299B8 /* ValvFileProviderUI.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = ValvFileProviderUI.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -103,13 +92,6 @@
 				Info.plist,
 			);
 			target = FB5243BF2FF7B11700C299B8 /* ValvFileProvider */;
-		};
-		FB5243E82FF7B24600C299B8 /* Exceptions for "ValvFileProviderUI" folder in "ValvFileProviderUI" target */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (
-				Info.plist,
-			);
-			target = FB5243D82FF7B24600C299B8 /* ValvFileProviderUI */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -146,14 +128,6 @@
 				FB5243D02FF7B11700C299B8 /* Exceptions for "ValvFileProvider" folder in "ValvFileProvider" target */,
 			);
 			path = ValvFileProvider;
-			sourceTree = "<group>";
-		};
-		FB5243DA2FF7B24600C299B8 /* ValvFileProviderUI */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-				FB5243E82FF7B24600C299B8 /* Exceptions for "ValvFileProviderUI" folder in "ValvFileProviderUI" target */,
-			);
-			path = ValvFileProviderUI;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -199,14 +173,6 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		FB5243D62FF7B24600C299B8 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				EDE2FAFB1381E0AEE2F64065 /* DaemonKit in Frameworks */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -217,7 +183,6 @@
 				FB5243A22FF7B09A00C299B8 /* ValvTests */,
 				FB5243AC2FF7B09A00C299B8 /* ValvUITests */,
 				FB5243C42FF7B11700C299B8 /* ValvFileProvider */,
-				FB5243DA2FF7B24600C299B8 /* ValvFileProviderUI */,
 				FB045D45300155A70032EBE5 /* ValvFinderSync */,
 				FB5243C12FF7B11700C299B8 /* Frameworks */,
 				FB5243912FF7B09900C299B8 /* Products */,
@@ -231,7 +196,6 @@
 				FB52439F2FF7B09A00C299B8 /* ValvTests.xctest */,
 				FB5243A92FF7B09A00C299B8 /* ValvUITests.xctest */,
 				FB5243C02FF7B11700C299B8 /* ValvFileProvider.appex */,
-				FB5243D92FF7B24600C299B8 /* ValvFileProviderUI.appex */,
 				FB045D44300155A70032EBE5 /* ValvFinderSync.appex */,
 			);
 			name = Products;
@@ -285,7 +249,6 @@
 			);
 			dependencies = (
 				FB5243CE2FF7B11700C299B8 /* PBXTargetDependency */,
-				FB5243E62FF7B24600C299B8 /* PBXTargetDependency */,
 				FB045D4A300155A70032EBE5 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
@@ -369,29 +332,6 @@
 			productReference = FB5243C02FF7B11700C299B8 /* ValvFileProvider.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
-		FB5243D82FF7B24600C299B8 /* ValvFileProviderUI */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = FB5243E92FF7B24600C299B8 /* Build configuration list for PBXNativeTarget "ValvFileProviderUI" */;
-			buildPhases = (
-				FB5243D52FF7B24600C299B8 /* Sources */,
-				FB5243D62FF7B24600C299B8 /* Frameworks */,
-				FB5243D72FF7B24600C299B8 /* Resources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-			);
-			fileSystemSynchronizedGroups = (
-				FB5243DA2FF7B24600C299B8 /* ValvFileProviderUI */,
-			);
-			name = ValvFileProviderUI;
-			packageProductDependencies = (
-				7C175398AB2EEB0F5DB4573B /* DaemonKit */,
-			);
-			productName = ValvFileProviderUI;
-			productReference = FB5243D92FF7B24600C299B8 /* ValvFileProviderUI.appex */;
-			productType = "com.apple.product-type.app-extension";
-		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -419,9 +359,6 @@
 					FB5243BF2FF7B11700C299B8 = {
 						CreatedOnToolsVersion = 26.3;
 					};
-					FB5243D82FF7B24600C299B8 = {
-						CreatedOnToolsVersion = 26.3;
-					};
 				};
 			};
 			buildConfigurationList = FB52438B2FF7B09900C299B8 /* Build configuration list for PBXProject "Valv" */;
@@ -446,7 +383,6 @@
 				FB52439E2FF7B09A00C299B8 /* ValvTests */,
 				FB5243A82FF7B09A00C299B8 /* ValvUITests */,
 				FB5243BF2FF7B11700C299B8 /* ValvFileProvider */,
-				FB5243D82FF7B24600C299B8 /* ValvFileProviderUI */,
 				FB045D43300155A70032EBE5 /* ValvFinderSync */,
 			);
 		};
@@ -482,13 +418,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		FB5243BE2FF7B11700C299B8 /* Resources */ = {
-			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		FB5243D72FF7B24600C299B8 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -558,13 +487,6 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		FB5243D52FF7B24600C299B8 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -587,11 +509,6 @@
 			isa = PBXTargetDependency;
 			target = FB5243BF2FF7B11700C299B8 /* ValvFileProvider */;
 			targetProxy = FB5243CD2FF7B11700C299B8 /* PBXContainerItemProxy */;
-		};
-		FB5243E62FF7B24600C299B8 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = FB5243D82FF7B24600C299B8 /* ValvFileProviderUI */;
-			targetProxy = FB5243E52FF7B24600C299B8 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -1016,72 +933,6 @@
 			};
 			name = Release;
 		};
-		FB5243EA2FF7B24600C299B8 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = ValvFileProviderUI/ValvFileProviderUI.entitlements;
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = YEB6B8BE7X;
-				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = ValvFileProviderUI/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = ValvFileProviderUI;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-					"@executable_path/../../../../Frameworks",
-				);
-				MARKETING_VERSION = 0.2.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "dev.drnkn.valv.fileprovider-ui";
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				REGISTER_APP_GROUPS = YES;
-				SKIP_INSTALL = YES;
-				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
-			};
-			name = Debug;
-		};
-		FB5243EB2FF7B24600C299B8 /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = ValvFileProviderUI/ValvFileProviderUI.entitlements;
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = YEB6B8BE7X;
-				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
-				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = ValvFileProviderUI/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = ValvFileProviderUI;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/../Frameworks",
-					"@executable_path/../../../../Frameworks",
-				);
-				MARKETING_VERSION = 0.2.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "dev.drnkn.valv.fileprovider-ui";
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				REGISTER_APP_GROUPS = YES;
-				SKIP_INSTALL = YES;
-				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
-			};
-			name = Release;
-		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -1139,15 +990,6 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		FB5243E92FF7B24600C299B8 /* Build configuration list for PBXNativeTarget "ValvFileProviderUI" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				FB5243EA2FF7B24600C299B8 /* Debug */,
-				FB5243EB2FF7B24600C299B8 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
@@ -1175,11 +1017,6 @@
 			productName = DaemonKit;
 		};
 		218055D4D13F74307806BF25 /* DaemonKit */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 8BD78AFBF91251ED3D7BCB30 /* XCLocalSwiftPackageReference "../DaemonKit" */;
-			productName = DaemonKit;
-		};
-		7C175398AB2EEB0F5DB4573B /* DaemonKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 8BD78AFBF91251ED3D7BCB30 /* XCLocalSwiftPackageReference "../DaemonKit" */;
 			productName = DaemonKit;
