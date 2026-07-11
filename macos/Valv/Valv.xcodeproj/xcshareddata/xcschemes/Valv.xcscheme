@@ -55,6 +55,17 @@
                ReferencedContainer = "container:Valv.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "FB5243A82FF7B09A00C299B8"
+               BuildableName = "ValvUITests.xctest"
+               BlueprintName = "ValvUITests"
+               ReferencedContainer = "container:Valv.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction
