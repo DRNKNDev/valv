@@ -6,7 +6,7 @@ Two local transports carry the same protocol: `valv-cli` and other non-sandboxed
 
 ## Sub-Modules
 
-- `control`: daemon status (`DaemonStatus`, `MountStatus`, `AccountStatus`), mount (`MountRequest`/`MountResponse`), unmount (`UnmountRequest`), and sync (`SyncRequest`) request/response types, plus `NodePathResponse`. `valvd` also exposes bodyless `pause`/`resume` routes and `versions`/`restore` routes typed on the Rust side by `valv_sync::protocol::ipc` rather than by this package.
+- `control`: daemon status (`DaemonStatus`, `MountStatus`, `AccountStatus`), mount (`MountRequest`/`MountResponse`), unmount (`UnmountRequest`), and sync (`SyncRequest`) request/response types, plus `NodePathResponse` and `NodeByPathResponse`. `valvd` also exposes bodyless `pause`/`resume` routes and `versions`/`restore` routes typed on the Rust side by `valv_sync::protocol::ipc` rather than by this package.
 - `fileprovider`: enumeration (`FpEnumerateQuery`/`FpEnumerateResponse`, `FpItem`), change tracking (`FpAnchorResponse`, `FpChangesResponse`, `FpWatchQuery`/`FpWatchResponse`), content download (`FpContentResponse`, `FpChunkDownload`), upload (`FpUploadRequest`/`FpUploadQueued`), delete (`FpDeleteRequest`), move (`FpMoveRequest`/`FpMoveResponse`), and share/invite (`FpShareRequest`/`FpShareResponse`) types for the File Provider extension.
 
 ## Typecheck
