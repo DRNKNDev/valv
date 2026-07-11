@@ -56,12 +56,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) {
         guard let rawURL = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
               let url = URL(string: rawURL),
-              url.scheme == "valv",
-              url.host == "auth-callback" else {
+              url.scheme == "valv" else {
             return
         }
 
-        AuthCallbackCenter.shared.handle(url)
+        switch url.host {
+        case "auth-callback":
+            AuthCallbackCenter.shared.handle(url)
+        case "share":
+            handleShareURL(url)
+        default:
+            break
+        }
+    }
+
+    private func handleShareURL(_ url: URL) {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let path = components.queryItems?.first(where: { $0.name == "path" })?.value else {
+            return
+        }
+        let node = components.queryItems?.first(where: { $0.name == "node" })?.value
+        ShareWindowController.shared.present(path: path, node: node)
     }
 }
 
@@ -72,6 +87,7 @@ struct ValvApp: App {
     @StateObject private var daemonManager = DaemonManager.shared
     @StateObject private var domainManager = FileProviderDomainManager.shared
     @StateObject private var updateManager = UpdateManager.shared
+    @StateObject private var finderSyncMonitor = FinderSyncEnablementMonitor.shared
 
     var body: some Scene {
         MenuBarExtra {
@@ -80,6 +96,7 @@ struct ValvApp: App {
                 .environmentObject(daemonManager)
                 .environmentObject(domainManager)
                 .environmentObject(updateManager)
+                .environmentObject(finderSyncMonitor)
         } label: {
             Image(systemName: symbolName(for: store.iconState))
         }
