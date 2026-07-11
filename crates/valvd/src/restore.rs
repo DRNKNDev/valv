@@ -1,5 +1,3 @@
-use std::path::{Component, Path, PathBuf};
-
 use axum::{extract::State, Json};
 use reqwest::Response;
 use serde::Deserialize;
@@ -14,7 +12,8 @@ use valv_sync::{
 
 use crate::{
     error::{backend_response_or_error, DaemonError},
-    DaemonState, MountState,
+    path_resolution::{resolve_path_to_node, PathResolutionError, ResolvedPath},
+    DaemonState,
 };
 
 pub(crate) async fn post_versions(
@@ -87,13 +86,6 @@ pub(crate) async fn post_restore(
     }))
 }
 
-#[derive(Debug)]
-struct ResolvedPath {
-    mount: MountState,
-    folder_id: String,
-    node_id: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct BackendVersionEntry {
     version_id: String,
@@ -125,60 +117,17 @@ async fn resolve_local_path(
     state: &DaemonState,
     local_path: &str,
 ) -> Result<ResolvedPath, DaemonError> {
-    let local_path = normalize_path(local_path);
-    let (mount, relative_path) = {
-        let mounts = state.mounts.lock().await;
-        mounts
-            .iter()
-            .filter_map(|mount| {
-                let mount_path = normalize_path(&mount.path);
-                local_path.strip_prefix(&mount_path).ok().map(|relative| {
-                    (
-                        mount.clone(),
-                        relative.to_path_buf(),
-                        mount_path.components().count(),
-                    )
-                })
-            })
-            .max_by_key(|(_, _, component_count)| *component_count)
-            .map(|(mount, relative, _)| (mount, relative))
-            .ok_or_else(|| {
-                DaemonError::NotFound("path is not under any mounted folder".to_owned())
-            })?
-    };
-
+    let mounts = state.mounts.lock().await.clone();
     let conn = state.db.lock().await;
-    let mut current = match mount.scope_node_id.as_deref() {
-        Some(scope_node_id) => nodes::get_node(&conn, scope_node_id)?,
-        None => nodes::get_root_node(&conn, &mount.folder_id)?,
-    }
-    .ok_or_else(|| DaemonError::NotFound("path not found in local mirror".to_owned()))?;
-
-    for component in relative_path.components() {
-        let Component::Normal(name) = component else {
-            continue;
-        };
-        let name = name
-            .to_str()
-            .ok_or_else(|| DaemonError::NotFound("path not found in local mirror".to_owned()))?;
-        current = nodes::get_node_by_parent_and_name(
-            &conn,
-            &mount.folder_id,
-            Some(&current.node_id),
-            name,
-        )?
-        .ok_or_else(|| DaemonError::NotFound("path not found in local mirror".to_owned()))?;
-    }
-
-    Ok(ResolvedPath {
-        folder_id: mount.folder_id.clone(),
-        node_id: current.node_id,
-        mount,
+    resolve_path_to_node(&conn, &mounts, local_path).map_err(|error| match error {
+        PathResolutionError::NotInMount => {
+            DaemonError::NotFound("path is not under any mounted folder".to_owned())
+        }
+        PathResolutionError::NodeNotSynced => {
+            DaemonError::NotFound("path not found in local mirror".to_owned())
+        }
+        PathResolutionError::Internal(error) => DaemonError::from(error),
     })
-}
-
-fn normalize_path(path: &str) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_path_buf())
 }
 
 async fn parse_backend_json<T: for<'de> Deserialize<'de>>(
@@ -210,7 +159,7 @@ mod tests {
         protocol::ipc::{RestoreRequest, VersionsRequest},
     };
 
-    use crate::config::DaemonConfig;
+    use crate::{config::DaemonConfig, MountState};
 
     use super::*;
 

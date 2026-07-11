@@ -746,6 +746,13 @@ struct ValvTests {
         try body(directory)
     }
 
+    // `FpShareResponse` has no public memberwise initializer across the DaemonKit
+    // module boundary (only `Decodable`'s `init(from:)` is public) - decode a small
+    // JSON payload instead of constructing it directly.
+    private func makeFpShareResponse(inviteUrl: String) throws -> FpShareResponse {
+        try JSONDecoder().decode(FpShareResponse.self, from: Data("{\"invite_url\":\"\(inviteUrl)\"}".utf8))
+    }
+
     private func withoutUpdateRequired(_ status: DaemonStatus) throws -> DaemonStatus {
         let data = try JSONEncoder().encode(status)
         var object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -756,6 +763,139 @@ struct ValvTests {
         }
         object["mounts"] = mounts
         return try JSONDecoder().decode(DaemonStatus.self, from: JSONSerialization.data(withJSONObject: object))
+    }
+
+    @MainActor
+    @Test func shareWindowNodeParameterSkipsResolutionAndSubmitsDirectly() async throws {
+        var resolveCallCount = 0
+        let viewModel = ShareWindowViewModel(
+            path: "/Users/alice/Design Docs/report.pdf",
+            node: "n1",
+            resolveNode: { _ in
+                resolveCallCount += 1
+                return "unused"
+            },
+            submitShare: { nodeId, email, canWrite in
+                #expect(nodeId == "n1")
+                #expect(email == "friend@example.com")
+                #expect(canWrite == true)
+                return try makeFpShareResponse(inviteUrl: "https://valvsync.com/invite/abc")
+            }
+        )
+
+        await viewModel.resolveIfNeeded()
+        #expect(resolveCallCount == 0)
+        #expect(!viewModel.canSubmit)
+
+        viewModel.email = "friend@example.com"
+        #expect(viewModel.canSubmit)
+
+        await viewModel.submit()
+        #expect(viewModel.inviteURL == "https://valvsync.com/invite/abc")
+    }
+
+    @MainActor
+    @Test func shareWindowMissingNodeResolvesBeforeEnablingSubmit() async throws {
+        var resolveCallCount = 0
+        let viewModel = ShareWindowViewModel(
+            path: "/Users/alice/Design Docs/report.pdf",
+            node: nil,
+            resolveNode: { _ in
+                resolveCallCount += 1
+                return "n2"
+            },
+            submitShare: { _, _, _ in try makeFpShareResponse(inviteUrl: "unused") }
+        )
+        viewModel.email = "friend@example.com"
+        #expect(!viewModel.canSubmit)
+
+        await viewModel.resolveIfNeeded()
+
+        #expect(resolveCallCount == 1)
+        #expect(viewModel.canSubmit)
+    }
+
+    @MainActor
+    @Test func shareWindowResolutionFailuresMapToDistinctCopyPerErrorCode() async throws {
+        let notInMountViewModel = ShareWindowViewModel(
+            path: "/tmp/outside.txt",
+            node: nil,
+            resolveNode: { _ in throw DaemonClientError.httpStatus(404, "{\"error\":\"not_in_mount\"}") },
+            submitShare: { _, _, _ in throw DaemonClientError.malformedResponse }
+        )
+        await notInMountViewModel.resolveIfNeeded()
+        guard case .failed(let notInMountMessage) = notInMountViewModel.resolution else {
+            Issue.record("Expected resolution to fail")
+            return
+        }
+
+        let notSyncedViewModel = ShareWindowViewModel(
+            path: "/tmp/pending.txt",
+            node: nil,
+            resolveNode: { _ in throw DaemonClientError.httpStatus(404, "{\"error\":\"node_not_synced\"}") },
+            submitShare: { _, _, _ in throw DaemonClientError.malformedResponse }
+        )
+        await notSyncedViewModel.resolveIfNeeded()
+        guard case .failed(let notSyncedMessage) = notSyncedViewModel.resolution else {
+            Issue.record("Expected resolution to fail")
+            return
+        }
+
+        let unreachableViewModel = ShareWindowViewModel(
+            path: "/tmp/file.txt",
+            node: nil,
+            resolveNode: { _ in throw DaemonClientError.connectionFailed("timed out") },
+            submitShare: { _, _, _ in throw DaemonClientError.malformedResponse }
+        )
+        await unreachableViewModel.resolveIfNeeded()
+        guard case .failed(let unreachableMessage) = unreachableViewModel.resolution else {
+            Issue.record("Expected resolution to fail")
+            return
+        }
+
+        #expect(notInMountMessage == "This file isn't inside a synced folder.")
+        #expect(notSyncedMessage == "This file hasn't finished syncing yet.")
+        #expect(unreachableMessage == UserFacingError.connectionFailureMessage)
+        #expect(Set([notInMountMessage, notSyncedMessage, unreachableMessage]).count == 3)
+
+        #expect(!notInMountViewModel.canSubmit)
+    }
+
+    @Test func shareURLQueryItemsRoundTripPathAndOptionalNode() throws {
+        var components = URLComponents()
+        components.scheme = "valv"
+        components.host = "share"
+        components.queryItems = [
+            URLQueryItem(name: "path", value: "/Users/alice/Design Docs/report.pdf"),
+            URLQueryItem(name: "node", value: "n1")
+        ]
+        let url = try #require(components.url)
+
+        let parsed = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        #expect(parsed.queryItems?.first(where: { $0.name == "path" })?.value == "/Users/alice/Design Docs/report.pdf")
+        #expect(parsed.queryItems?.first(where: { $0.name == "node" })?.value == "n1")
+    }
+
+    @Test func finderSyncEnablementMonitorReflectsInjectedProvider() {
+        let monitorEnabled = FinderSyncEnablementMonitor(isExtensionEnabledProvider: { true })
+        #expect(monitorEnabled.isEnabled)
+
+        let monitorDisabled = FinderSyncEnablementMonitor(isExtensionEnabledProvider: { false })
+        #expect(!monitorDisabled.isEnabled)
+    }
+
+    @Test func finderSyncEnablementMonitorRefreshesOnActivation() {
+        var enabled = false
+        let activationSubject = PassthroughSubject<Void, Never>()
+        let monitor = FinderSyncEnablementMonitor(
+            isExtensionEnabledProvider: { enabled },
+            activationPublisher: activationSubject.eraseToAnyPublisher()
+        )
+        #expect(!monitor.isEnabled)
+
+        enabled = true
+        activationSubject.send(())
+        #expect(monitor.isEnabled)
     }
 
 }

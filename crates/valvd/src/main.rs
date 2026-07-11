@@ -41,6 +41,7 @@ mod fp;
 mod launchd;
 mod mounts;
 mod nodes;
+mod path_resolution;
 mod restore;
 #[cfg(target_os = "linux")]
 mod systemd;
@@ -351,6 +352,7 @@ fn build_router(state: DaemonState) -> Router {
         .route("/fp/share", post(fp::fp_share))
         .route("/fp/watch", get(fp::fp_watch))
         .route("/nodes/:node_id/path", get(nodes::get_node_path))
+        .route("/nodes/by-path", get(nodes::get_node_by_path))
         .with_state(state)
 }
 

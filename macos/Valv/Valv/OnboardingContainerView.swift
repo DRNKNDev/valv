@@ -407,6 +407,7 @@ private struct FirstFolderOnboardingPage: View {
 
 private struct ShareExplainerOnboardingPage: View {
     let coordinator: OnboardingCoordinator
+    @EnvironmentObject private var finderSyncMonitor: FinderSyncEnablementMonitor
     let onDismiss: () -> Void
 
     var body: some View {
@@ -423,7 +424,16 @@ private struct ShareExplainerOnboardingPage: View {
             onBack: coordinator.goBack,
             onClose: onDismiss
         ) {
-            OnboardingPrimaryButton(title: "Continue") { coordinator.advance() }
+            VStack(spacing: 12) {
+                if !finderSyncMonitor.isEnabled {
+                    Button("Enable Finder Extension...") {
+                        finderSyncMonitor.showManagementInterface()
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.white.opacity(0.70))
+                }
+                OnboardingPrimaryButton(title: "Continue") { coordinator.advance() }
+            }
         }
     }
 }

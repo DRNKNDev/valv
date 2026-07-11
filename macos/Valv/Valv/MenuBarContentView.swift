@@ -36,6 +36,7 @@ struct MenuBarContentView: View {
     @EnvironmentObject private var daemonManager: DaemonManager
     @EnvironmentObject private var domainManager: FileProviderDomainManager
     @EnvironmentObject private var updateManager: UpdateManager
+    @EnvironmentObject private var finderSyncMonitor: FinderSyncEnablementMonitor
     @State private var signOutError: String?
 
     var body: some View {
@@ -131,6 +132,13 @@ struct MenuBarContentView: View {
             Divider()
 
             checkForUpdatesRow
+
+            if !finderSyncMonitor.isEnabled {
+                Button("Enable Finder Extension...") {
+                    finderSyncMonitor.showManagementInterface()
+                }
+                .buttonStyle(MenuItemButtonStyle())
+            }
 
             Button("Sign Out...") {
                 confirmSignOut()

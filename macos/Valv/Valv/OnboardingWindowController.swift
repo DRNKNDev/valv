@@ -41,7 +41,8 @@ final class OnboardingWindowController {
     func present(
         store: DaemonStore,
         daemonManager: DaemonManager,
-        domainManager: FileProviderDomainManager
+        domainManager: FileProviderDomainManager,
+        finderSyncMonitor: FinderSyncEnablementMonitor = .shared
     ) {
         if let existing = window {
             existing.makeKeyAndOrderFront(nil)
@@ -57,6 +58,7 @@ final class OnboardingWindowController {
             .environmentObject(store)
             .environmentObject(daemonManager)
             .environmentObject(domainManager)
+            .environmentObject(finderSyncMonitor)
 
         let contentSize = CGSize(width: Self.cardWidth, height: Self.cardHeight)
         let hosting = NSHostingView(rootView: rootView)

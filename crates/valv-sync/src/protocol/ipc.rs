@@ -241,3 +241,13 @@ pub struct FpShareResponse {
 pub struct NodePathResponse {
     pub path: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeByPathQuery {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeByPathResponse {
+    pub node_id: String,
+}

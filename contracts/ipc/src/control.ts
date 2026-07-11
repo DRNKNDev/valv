@@ -35,6 +35,10 @@ export interface NodePathResponse {
   path: string;
 }
 
+export interface NodeByPathResponse {
+  node_id: string;
+}
+
 export interface MountRequest {
   path: string;
   folder_id?: string;

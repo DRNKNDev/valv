@@ -261,4 +261,57 @@ final class DaemonClientTests: XCTestCase {
             XCTAssertTrue(body.contains("mount_not_found"))
         }
     }
+
+    func testNodeIdForPathDecodesSuccessfully() async throws {
+        let transport = MockDaemonTransport()
+        transport.respond(
+            to: "GET /nodes/by-path?path=%2FUsers%2Falice%2FDesign%20Docs%2Freport.pdf",
+            status: 200,
+            body: """
+            {"node_id":"n1"}
+            """
+        )
+
+        let response = try await transport.client().nodeIdForPath("/Users/alice/Design Docs/report.pdf")
+
+        XCTAssertEqual(response.nodeId, "n1")
+    }
+
+    func testNodeIdForPathNotInMountMapsToUserFacingErrorMessage() async throws {
+        let transport = MockDaemonTransport()
+        transport.respond(
+            to: "GET /nodes/by-path?path=%2FUsers%2Falice%2Foutside.txt",
+            status: 404,
+            body: """
+            {"error":"not_in_mount"}
+            """
+        )
+
+        do {
+            _ = try await transport.client().nodeIdForPath("/Users/alice/outside.txt")
+            XCTFail("expected nodeIdForPath to throw for a 404 not_in_mount response")
+        } catch {
+            let userFacing = UserFacingError(from: error)
+            XCTAssertEqual(userFacing.message, "This file isn't inside a synced folder.")
+        }
+    }
+
+    func testNodeIdForPathNodeNotSyncedMapsToUserFacingErrorMessage() async throws {
+        let transport = MockDaemonTransport()
+        transport.respond(
+            to: "GET /nodes/by-path?path=%2FUsers%2Falice%2FSync%2Fnew.txt",
+            status: 404,
+            body: """
+            {"error":"node_not_synced"}
+            """
+        )
+
+        do {
+            _ = try await transport.client().nodeIdForPath("/Users/alice/Sync/new.txt")
+            XCTFail("expected nodeIdForPath to throw for a 404 node_not_synced response")
+        } catch {
+            let userFacing = UserFacingError(from: error)
+            XCTAssertEqual(userFacing.message, "This file hasn't finished syncing yet.")
+        }
+    }
 }
