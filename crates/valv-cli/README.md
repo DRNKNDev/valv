@@ -159,8 +159,8 @@ Add the global `--json` flag before the subcommand (`valv --json status`) on `st
 ## Troubleshooting
 
 - `Daemon is not running. Start it with: valv daemon install`: no Unix socket was found at `~/.local/share/valv/valvd.sock`. Start `valvd`, or install it as a service with `valv daemon install`.
-- `Config not found`: run `valv auth login`, or create `~/.config/valv/config.toml` with `backend_url` and `device_token` set.
-- `Missing backend_url in config.toml` / `Missing device_token in config.toml`: `config.toml` exists but is missing one of the required fields; fill it in or rerun `valv auth login`.
+- `Not signed in. Run: valv auth login`: no `~/.config/valv/config.toml` was found. Run `valv auth login`, or create the file with `backend_url` and `device_token` set.
+- `Missing backend_url in config.toml` / `Missing device_token in config.toml`: `config.toml` exists but is missing one of the required fields. This is what you get if `valv daemon install` wrote the config template (which leaves `device_token` empty) and you have not signed in yet. Run `valv auth login`.
 - `--folder and --grant are mutually exclusive`: pass only one of `--folder` or `--grant` to `valv mount`.
 - `path is not inside a mounted folder`: use a path under a folder that `valvd` has mounted.
 - `path is not present in the local mirror`: wait for sync to discover the path, or run `valv sync` and retry.
