@@ -32,7 +32,7 @@ public enum DaemonClientError: LocalizedError, Sendable {
 /// clients) and, alongside it, a `127.0.0.1`-only TCP listener on an OS-assigned ephemeral
 /// port (see `daemon-ipc-server` spec, added by `phase-5-macos-gui`). App Sandbox denies
 /// `connect()` on the Unix-domain socket regardless of entitlement - validated directly,
-/// not assumed - so all three Xcode targets (`Valv`, `ValvFileProvider`, `ValvFileProviderUI`)
+/// not assumed - so all three Xcode targets (`Valv`, `ValvFileProvider`, `ValvFinderSync`)
 /// use this TCP transport uniformly instead of a UDS path.
 ///
 /// The port itself is discovered by reading a plain-text port number `valvd` writes to

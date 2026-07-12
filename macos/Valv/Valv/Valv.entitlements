@@ -7,7 +7,7 @@
 	     to need real filesystem access outside a sandbox container: writing
 	     ~/Library/LaunchAgents/dev.drnkn.valvd.plist, ~/Library/Application
 	     Support/Valv/bin/, and /usr/local/bin/valv). Apple requires ValvFileProvider
-	     and ValvFileProviderUI to be sandboxed (they still are); it does not require
+	     and ValvFinderSync to be sandboxed (they still are); it does not require
 	     the host app to be. This is the same pattern other sync-client host apps use.
 	     Rules out Mac App Store distribution for Valv.app unless revisited later - does
 	     not affect valv-cli (never sandboxed) or the two extensions (still sandboxed). -->

@@ -85,7 +85,7 @@ printf 'Valv local reset (%s)\n\n' "${MODE#--}"
 
 stop_process "Valv"
 stop_process "ValvFileProvider"
-stop_process "ValvFileProviderUI"
+stop_process "ValvFinderSync"
 
 if launchctl print "gui/$(id -u)/${LAUNCH_AGENT_LABEL}" >/dev/null 2>&1; then
   if [[ "$MODE" == "--dry-run" ]]; then

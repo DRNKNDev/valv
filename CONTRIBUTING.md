@@ -90,7 +90,7 @@ swift test --package-path macos/DaemonKit
 
 ### macOS App And File Provider
 
-Open `macos/Valv/Valv.xcodeproj` in Xcode 26.2 or newer and build the `Valv`, `ValvFileProvider`, and `ValvFileProviderUI` targets. For a command-line compile-only check with signing disabled:
+Open `macos/Valv/Valv.xcodeproj` in Xcode 26.2 or newer and build the `Valv`, `ValvFileProvider`, and `ValvFinderSync` targets. For a command-line compile-only check with signing disabled:
 
 ```bash
 xcodebuild -project "macos/Valv/Valv.xcodeproj" -scheme "Valv" -configuration Debug CODE_SIGNING_ALLOWED=NO build
