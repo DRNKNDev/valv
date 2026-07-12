@@ -19,7 +19,7 @@ Valv is an open-source, self-hostable file sync product with a Rust sync engine 
 | `valv` CLI / `valvd` daemon (prebuilt) | macOS arm64 (`aarch64-apple-darwin`), Linux x86_64 (`x86_64-unknown-linux-gnu`) | Other targets require a source build |
 | Core backend | Any OS that runs a current Node.js LTS | Requires SQLite or PostgreSQL and S3-compatible storage |
 
-Windows, Intel macOS, Linux arm64, and end-to-end encryption are not supported yet.
+Windows, Intel macOS, and Linux arm64 are not supported yet.
 
 ## Install
 
