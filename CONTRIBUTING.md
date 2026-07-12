@@ -9,7 +9,8 @@ Thanks for your interest in contributing. This guide covers everything needed to
 - `crates/valv-sync`: Rust sync engine (chunking, storage, filesystem watching, local mirror).
 - `crates/valvd`: Rust daemon that owns the sync engine and exposes the local control API.
 - `crates/valv-cli`: Rust CLI for controlling the daemon.
-- `macos/Valv`, `macos/file-provider`, `macos/DaemonKit`: the native macOS app, File Provider extension, and shared Swift daemon-control library.
+- `macos/Valv`: the native macOS app Xcode project, including the File Provider and Finder Sync extensions.
+- `macos/DaemonKit`: the shared Swift daemon-control library used by the app and both extensions.
 - `e2e`: MinIO-backed API integration tests and the numbered daemon smoke suite under `e2e/smoke`.
 
 ## Prerequisites
