@@ -200,10 +200,10 @@ jobs:
             -configuration Debug \
             CODE_SIGNING_ALLOWED=NO \
             build
-      - name: Build ValvFileProviderUI
+      - name: Build ValvFinderSync
         run: |
           xcodebuild -project macos/Valv/Valv.xcodeproj \
-            -scheme ValvFileProviderUI \
+            -scheme ValvFinderSync \
             -configuration Debug \
             CODE_SIGNING_ALLOWED=NO \
             build
