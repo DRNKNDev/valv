@@ -1,112 +1,67 @@
-use std::{fs, process::Command as ProcessCommand, time::Duration};
+use std::{
+    collections::HashSet,
+    fs,
+    io::IsTerminal,
+    process::{Command as ProcessCommand, Stdio},
+    time::{Duration, Instant},
+};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::StatusCode;
 use valv_sync::protocol::ipc::{
-    DaemonStatus, MountRequest, MountResponse, RestoreRequest, RestoreResponse, SyncRequest,
-    SyncSummary, UnmountRequest, VersionsRequest, VersionsResponse,
+    Credential, DaemonStatus, MountRequest, MountResponse, MountStatus, PrincipalStatus,
+    RestoreRequest, RestoreResponse, SyncRequest, SyncSummary, UnmountRequest, VersionsRequest,
+    VersionsResponse,
 };
 
 use crate::{
     auth::{cmd_auth_login, default_auth_login_args},
-    daemon::{daemon_client, expect_status, map_daemon_error, parse_daemon_json},
-    grants::{cmd_grant_create, cmd_grant_revoke, cmd_grants},
-    paths::resolve_valvd_path,
+    config::{load_config, peek_config},
+    daemon::{
+        daemon_client, diagnose_daemon_absence, ensure_daemon, expect_status, map_daemon_error,
+        parse_daemon_json, platform_log_hint, probe_status_default, wait_for_daemon_socket,
+        DaemonAbsenceReason,
+    },
+    error::{confirm, CliError},
+    grants::{
+        cmd_share_grant, cmd_share_list, cmd_unshare, fetch_reachable_grants, GrantListEntry,
+    },
+    paths::{list_local_mounts, resolve_mount, resolve_valvd_path},
     table::print_table,
     update::cmd_update,
     update_notice::maybe_print_update_notice,
 };
 
-#[derive(Parser)]
-#[command(name = "valv", about = "Valv sync CLI", version)]
+const SYNC_BARRIER_TIMEOUT: Duration = Duration::from_secs(120);
+const SYNC_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+const EXIT_CODES_HELP: &str = "Exit codes:\n  \
+    0   ok\n  \
+    1   failed\n  \
+    2   usage error\n  \
+    75  temporary failure - retry with backoff (daemon starting, backend unreachable)\n  \
+    77  refused - this principal may not do this, do not retry";
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "valv",
+    about = "Valv sync CLI",
+    version,
+    after_help = EXIT_CODES_HELP
+)]
 struct Cli {
-    /// Print machine-readable JSON instead of a human-formatted table; supported on status, versions, and grants.
+    /// Print machine-readable JSON instead of human-formatted text. Honored by every command.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Command {
     /// Sign in this device and write the local CLI configuration needed by Valv.
-    Auth {
-        /// Authentication workflow to run.
-        #[command(subcommand)]
-        command: AuthCommand,
-    },
-    /// Mount an existing Valv folder, accept a grant token, or create a new shared folder from a local path.
-    Mount {
-        /// Local directory to materialize and keep in sync, such as ~/Documents/project.
-        path: String,
-        /// Existing folder id to mount at the local path instead of creating a new folder.
-        #[arg(long)]
-        folder: Option<String>,
-        /// One-time grant token from another device to mount a shared folder.
-        #[arg(long)]
-        grant: Option<String>,
-    },
-    /// Unmounts locally only - does not delete the shared folder or its grants, and
-    /// does not remove the locally materialized files.
-    Unmount {
-        /// Folder id to unmount from this device.
-        #[arg(long)]
-        folder: String,
-    },
-    /// Show daemon connectivity, pause state, and every mounted folder's sync status.
-    Status,
-    /// Pause background filesystem watching and sync work for this device.
-    Pause,
-    /// Resume background filesystem watching and sync work for this device.
-    Resume,
-    /// Ask the daemon to run a sync pass now, optionally limited to one folder id.
-    Sync {
-        /// Folder id to sync; omit to sync all mounted folders.
-        #[arg(long)]
-        folder: Option<String>,
-    },
-    /// List stored versions for a local file inside a mounted folder.
-    Versions {
-        /// Local file path whose version history should be listed.
-        path: String,
-    },
-    /// Restore a local file to a specific stored version.
-    Restore {
-        /// Local file path to restore.
-        path: String,
-        /// Version id from `valv versions <path>` to restore.
-        version_id: String,
-    },
-    /// Create or revoke access grants for mounted folders.
-    Grant {
-        /// Grant-management action to run.
-        #[command(subcommand)]
-        command: GrantCommand,
-    },
-    /// List grants for a mounted folder, or for the first mounted folder if no path is supplied.
-    Grants {
-        /// Optional local path inside the mounted folder whose grants should be listed.
-        folder_path: Option<String>,
-    },
-    /// Install or uninstall the background daemon service by delegating to `valvd`.
-    Daemon {
-        /// Daemon service action to run.
-        #[command(subcommand)]
-        command: DaemonCommand,
-    },
-    /// Resolve, verify, and install the latest released valv/valvd, unless --check is passed.
-    Update {
-        /// Report whether a newer version is available without downloading or installing anything.
-        #[arg(long)]
-        check: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum AuthCommand {
-    /// Complete browser-based login and save the backend URL and device token locally.
     Login {
         /// Web app base URL that opens for login; defaults to the built-in Valv URL.
         #[arg(long)]
@@ -121,118 +76,267 @@ enum AuthCommand {
         #[arg(long)]
         no_open: bool,
     },
-}
-
-#[derive(Subcommand)]
-enum GrantCommand {
-    /// Create an invite link or a one-time device token for access to a mounted folder path.
-    Create(GrantCreateArgs),
-    /// Revoke an existing grant so the grantee can no longer access the shared scope.
-    Revoke {
-        /// Grant id shown by `valv grants`.
-        grant_id: String,
+    /// Attach an existing folder (--folder or --key), or create one from this path (--new).
+    Mount(MountArgs),
+    /// Unmount locally only: does not delete the shared folder, its grants, or the local files.
+    Unmount {
+        /// Local mount path to unmount.
+        path: String,
+        /// Skip the confirmation prompt (required in non-interactive sessions).
+        #[arg(long)]
+        yes: bool,
     },
+    /// Show this machine's principal, daemon health, and every mounted folder's sync state.
+    Status,
+    /// Pause background filesystem watching and sync work for this device.
+    Pause,
+    /// Ask the daemon to run a sync pass, optionally limited to one local path.
+    Sync {
+        /// Local path inside a mounted folder to sync; omit to sync every mounted folder.
+        path: Option<String>,
+    },
+    /// Resume background filesystem watching and sync work for this device.
+    Resume,
+    /// List stored versions for a local file inside a mounted folder.
+    Versions {
+        /// Local file path whose version history should be listed.
+        path: String,
+    },
+    /// Restore a local file to a specific stored version.
+    Restore {
+        /// Local file path to restore.
+        path: String,
+        /// Version id from `valv versions <path>` to restore.
+        version_id: String,
+    },
+    /// Grant access to a folder (--to an email, or --key for a machine), or list who has it.
+    Share(ShareArgs),
+    /// Revoke a person's or machine's access to a folder.
+    Unshare(UnshareArgs),
+    /// Restart or uninstall the background daemon service by delegating to `valvd`.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+    /// Resolve, verify, and install the latest released valv/valvd.
+    Update,
 }
 
-#[derive(Parser)]
-#[command(group(ArgGroup::new("target").required(true).args(["to", "device"])))]
-#[command(group(ArgGroup::new("access").args(["write", "read_only"])))]
-pub(crate) struct GrantCreateArgs {
-    /// Local file or folder path that defines the grant scope.
-    pub(crate) node_path: String,
-    /// Email address to invite through the backend, producing an invite URL.
+#[derive(Parser, Debug)]
+#[command(group(ArgGroup::new("source").required(true).args(["folder", "key", "new"])))]
+pub(crate) struct MountArgs {
+    /// Local directory to materialize and keep in sync, such as ~/Documents/project.
+    pub(crate) path: String,
+    /// Id or name of a folder this principal can already reach; ids come from `valv status`.
+    #[arg(long)]
+    pub(crate) folder: Option<String>,
+    /// Access key token to redeem, attaching the folder it grants access to.
+    #[arg(long, allow_hyphen_values = true)]
+    pub(crate) key: Option<String>,
+    /// Create a new folder from the contents of `<path>`.
+    #[arg(long)]
+    pub(crate) new: bool,
+}
+
+#[derive(Parser, Debug)]
+#[command(group(ArgGroup::new("target").args(["to", "key"])))]
+pub(crate) struct ShareArgs {
+    /// Local path identifying the folder to share.
+    pub(crate) path: String,
+    /// Email address to invite; they accept in a browser with their own account.
     #[arg(long)]
     pub(crate) to: Option<String>,
-    /// Device name to provision directly, producing a one-time mount token.
-    #[arg(long)]
-    pub(crate) device: Option<String>,
-    /// Allow the grantee to upload changes as well as read files.
-    #[arg(long)]
-    pub(crate) write: bool,
-    /// Limit the grantee to read-only access.
+    /// Name for a new access key, issued once and never shown again.
+    #[arg(long, allow_hyphen_values = true)]
+    pub(crate) key: Option<String>,
+    /// Grant read-only access instead of the read/write default.
     #[arg(long = "read-only")]
     pub(crate) read_only: bool,
 }
 
-#[derive(Subcommand)]
+#[derive(Parser, Debug)]
+#[command(group(ArgGroup::new("target").required(true).args(["to", "key", "id"])))]
+pub(crate) struct UnshareArgs {
+    /// Local path identifying the folder to revoke access to.
+    pub(crate) path: String,
+    /// Revoke the grant or pending invite belonging to this email address.
+    #[arg(long)]
+    pub(crate) to: Option<String>,
+    /// Revoke the access key with this name.
+    #[arg(long, allow_hyphen_values = true)]
+    pub(crate) key: Option<String>,
+    /// Revoke by pinned grant id, printed by `valv share <path>`.
+    #[arg(long, allow_hyphen_values = true)]
+    pub(crate) id: Option<String>,
+    /// Skip the confirmation prompt (required under --json).
+    #[arg(long)]
+    pub(crate) yes: bool,
+}
+
+#[derive(Subcommand, Debug)]
 enum DaemonCommand {
-    /// Install and start the Valv daemon service for the current user.
-    Install,
+    /// Stop, start, and verify the Valv daemon service is serving before reporting success.
+    Restart,
     /// Stop and remove the Valv daemon service for the current user.
     Uninstall,
 }
 
-pub(crate) async fn run() -> Result<()> {
-    let cli = Cli::parse();
+pub(crate) struct AppFailure {
+    pub(crate) error: anyhow::Error,
+    pub(crate) json: bool,
+}
+
+pub(crate) async fn run() -> Result<(), AppFailure> {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(clap_error) => {
+            use clap::error::ErrorKind;
+            if matches!(
+                clap_error.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                    | ErrorKind::DisplayVersion
+            ) {
+                let _ = clap_error.print();
+                return Ok(());
+            }
+            let json = json_flag_present();
+            return Err(AppFailure {
+                error: map_clap_error(clap_error).into(),
+                json,
+            });
+        }
+    };
     let json = cli.json;
-    let is_update_command = matches!(cli.command, Command::Update { .. });
+    let is_update_command = matches!(cli.command, Command::Update);
     let result = run_command(cli.command, json).await;
     // Print update notices only after successful non-update commands.
     if result.is_ok() && !is_update_command {
         maybe_print_update_notice().await;
     }
-    result
+    result.map_err(|error| AppFailure { error, json })
+}
+
+fn json_flag_present() -> bool {
+    std::env::args().any(|arg| arg == "--json")
+}
+
+fn map_clap_error(error: clap::Error) -> CliError {
+    use clap::error::ErrorKind;
+    let rendered = error.render().to_string();
+    let is_missing_mount_source = error.kind() == ErrorKind::MissingRequiredArgument
+        && rendered.contains("--folder")
+        && rendered.contains("--key")
+        && rendered.contains("--new");
+    if is_missing_mount_source {
+        return CliError::mount_source_required();
+    }
+    CliError::usage("usage_error", rendered.trim_end().to_owned())
 }
 
 async fn run_command(command: Command, json: bool) -> Result<()> {
     match command {
-        Command::Auth { command } => match command {
-            AuthCommand::Login {
-                web_base_url,
-                backend_url,
-                device_name,
-                no_open,
-            } => {
-                let mut args = default_auth_login_args(!no_open);
-                if let Some(web_base_url) = web_base_url {
-                    args.web_base_url = web_base_url;
-                }
-                if let Some(backend_url) = backend_url {
-                    args.backend_url = backend_url;
-                }
-                if let Some(device_name) = device_name {
-                    args.device_name = device_name;
-                }
-                cmd_auth_login(args).await
+        Command::Login {
+            web_base_url,
+            backend_url,
+            device_name,
+            no_open,
+        } => {
+            let mut args = default_auth_login_args(!no_open);
+            if let Some(web_base_url) = web_base_url {
+                args.web_base_url = web_base_url;
             }
-        },
-        Command::Mount {
-            path,
-            folder,
-            grant,
-        } => cmd_mount(path, folder, grant).await,
-        Command::Unmount { folder } => cmd_unmount(folder).await,
-        Command::Status => cmd_status(json).await,
-        Command::Pause => cmd_pause_resume("pause", "Paused sync: background sync is paused").await,
-        Command::Resume => {
-            cmd_pause_resume("resume", "Resumed sync: background sync is running").await
+            if let Some(backend_url) = backend_url {
+                args.backend_url = backend_url;
+            }
+            if let Some(device_name) = device_name {
+                args.device_name = device_name;
+            }
+            ensure_daemon(Some(args.backend_url.as_str())).await?;
+            cmd_auth_login(args, json).await
         }
-        Command::Sync { folder } => cmd_sync(folder).await,
-        Command::Versions { path } => cmd_versions(path, json).await,
-        Command::Restore { path, version_id } => cmd_restore(path, version_id).await,
-        Command::Grant { command } => match command {
-            GrantCommand::Create(args) => cmd_grant_create(args).await,
-            GrantCommand::Revoke { grant_id } => cmd_grant_revoke(grant_id).await,
-        },
-        Command::Grants { folder_path } => cmd_grants(folder_path, json).await,
-        Command::Daemon { command } => delegate_daemon(command),
-        Command::Update { check } => cmd_update(check).await,
+        Command::Mount(args) => {
+            ensure_daemon(None).await?;
+            cmd_mount(args, json).await
+        }
+        Command::Unmount { path, yes } => {
+            ensure_daemon(None).await?;
+            cmd_unmount(path, yes, json).await
+        }
+        Command::Status => cmd_status(json).await,
+        Command::Pause => {
+            ensure_daemon(None).await?;
+            cmd_pause_resume("pause", "Paused sync: background sync is paused", json).await
+        }
+        Command::Resume => {
+            ensure_daemon(None).await?;
+            cmd_pause_resume("resume", "Resumed sync: background sync is running", json).await
+        }
+        Command::Sync { path } => {
+            ensure_daemon(None).await?;
+            cmd_sync(path, json).await
+        }
+        Command::Versions { path } => {
+            ensure_daemon(None).await?;
+            cmd_versions(path, json).await
+        }
+        Command::Restore { path, version_id } => {
+            ensure_daemon(None).await?;
+            cmd_restore(path, version_id, json).await
+        }
+        Command::Share(args) => {
+            if args.to.is_some() || args.key.is_some() {
+                cmd_share_grant(args, json).await
+            } else {
+                cmd_share_list(args.path, json).await
+            }
+        }
+        Command::Unshare(args) => {
+            if json && (args.to.is_some() || args.key.is_some()) {
+                return Err(CliError::handle_requires_pinned_id().into());
+            }
+            cmd_unshare(args.path, args.to, args.key, args.id, args.yes, json).await
+        }
+        Command::Daemon { command } => delegate_daemon(command, json),
+        Command::Update => cmd_update(json).await,
     }
 }
 
-async fn cmd_mount(path: String, folder: Option<String>, grant: Option<String>) -> Result<()> {
-    if folder.is_some() && grant.is_some() {
-        return Err(anyhow!("--folder and --grant are mutually exclusive"));
+async fn refuse_if_access_key_cannot_mount(args: &MountArgs) -> Result<()> {
+    if args.key.is_some() {
+        return Ok(());
     }
-    let spinner = request_spinner("Mounting…");
+    let status = fetch_daemon_status().await?;
+    if status.credential != Credential::AccessKey {
+        return Ok(());
+    }
+    if args.new {
+        return Err(CliError::access_key_cannot_create_folder().into());
+    }
+    Err(CliError::access_key_cannot_mount_folder().into())
+}
+
+async fn fetch_daemon_status() -> Result<DaemonStatus> {
+    let response = daemon_client()
+        .context("failed to create daemon client for status")?
+        .get("http://localhost/status")
+        .send()
+        .await
+        .map_err(|error| daemon_request_error("status", error))?;
+    parse_daemon_json::<DaemonStatus>(response).await
+}
+
+async fn cmd_mount(args: MountArgs, json: bool) -> Result<()> {
+    refuse_if_access_key_cannot_mount(&args).await?;
+    let spinner = request_spinner("Mounting…", json);
     let mounted = async {
         let response = daemon_client()
             .context("failed to create daemon client for mount")?
             .post("http://localhost/mount")
             .json(&MountRequest {
-                path: path.clone(),
-                folder_id: folder.clone(),
-                grant_token: grant,
+                path: args.path.clone(),
+                folder_id: args.folder.clone(),
+                grant_token: args.key.clone(),
             })
             .send()
             .await
@@ -240,44 +344,102 @@ async fn cmd_mount(path: String, folder: Option<String>, grant: Option<String>) 
         parse_daemon_json::<MountResponse>(response).await
     }
     .await;
-    spinner.finish_and_clear();
+    finish_spinner(spinner);
     let mounted = mounted?;
-    if folder.is_some() {
-        println!("Mounted folder {}: {}", mounted.folder_id, mounted.path);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "action": if args.new { "created" } else { "attached" },
+                "folder_id": mounted.folder_id,
+                "path": mounted.path,
+            }))?
+        );
+    } else if args.new {
+        println!(
+            "Created and mounted folder {}: {}",
+            mounted.folder_id, mounted.path
+        );
     } else {
-        println!("Mounted new folder {}: {}", mounted.folder_id, mounted.path);
+        println!("Attached folder {}: {}", mounted.folder_id, mounted.path);
     }
     Ok(())
 }
 
-fn request_spinner(message: &'static str) -> ProgressBar {
+fn request_spinner(message: &'static str, json: bool) -> Option<ProgressBar> {
+    if json || !std::io::stdout().is_terminal() {
+        return None;
+    }
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::with_template("{spinner} {msg}").expect("spinner template is valid"),
     );
     spinner.set_message(message);
     spinner.enable_steady_tick(Duration::from_millis(100));
-    spinner
+    Some(spinner)
+}
+
+fn finish_spinner(spinner: Option<ProgressBar>) {
+    if let Some(spinner) = spinner {
+        spinner.finish_and_clear();
+    }
 }
 
 fn daemon_request_error(action: &str, error: reqwest::Error) -> anyhow::Error {
     let error = map_daemon_error(error);
-    anyhow!("failed to send {action} request to daemon: {error}")
+    error.context(format!("failed to send {action} request to daemon"))
 }
 
-async fn cmd_unmount(folder: String) -> Result<()> {
+async fn cmd_unmount(path: String, yes: bool, json: bool) -> Result<()> {
+    let mount = resolve_mount(&path).with_context(|| format!("failed to resolve mount {path}"))?;
+    if mount_holds_last_credential(&mount).await? {
+        confirm(
+            &format!(
+                "Unmounting {path} destroys this machine's only Valv credential. \
+                 It cannot be recovered; the folder owner must issue a new one."
+            ),
+            yes,
+        )?;
+    }
     let response = daemon_client()
         .context("failed to create daemon client for unmount")?
         .delete("http://localhost/mount")
         .json(&UnmountRequest {
-            folder_id: folder.clone(),
+            folder_id: mount.folder_id.clone(),
         })
         .send()
         .await
         .map_err(|error| daemon_request_error("unmount", error))?;
     expect_status(response, StatusCode::NO_CONTENT).await?;
-    println!("Unmounted folder {folder}");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(
+                &serde_json::json!({"folder_id": mount.folder_id, "path": path})
+            )?
+        );
+    } else {
+        println!("Unmounted {path}");
+    }
     Ok(())
+}
+
+async fn mount_holds_last_credential(
+    mount: &valv_sync::persistence::mounts::LocalMount,
+) -> Result<bool> {
+    if mount.mount_token.is_none() {
+        return Ok(false);
+    }
+    let status = fetch_daemon_status().await?;
+    if status.credential == Credential::Account {
+        return Ok(false);
+    }
+    let mounts_holding_a_token = list_local_mounts()
+        .unwrap_or_default()
+        .iter()
+        .filter(|mount| mount.mount_token.is_some())
+        .count();
+    Ok(mounts_holding_a_token <= 1)
 }
 
 async fn cmd_versions(path: String, json: bool) -> Result<()> {
@@ -324,8 +486,23 @@ async fn cmd_versions(path: String, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_restore(path: String, version_id: String) -> Result<()> {
+async fn refuse_if_access_key_restore_is_read_only(local_path: &str) -> Result<()> {
+    let mount = resolve_mount(local_path)
+        .with_context(|| format!("failed to resolve mount for {local_path}"))?;
+    if mount.can_write {
+        return Ok(());
+    }
+    let status = fetch_daemon_status().await?;
+    if status.credential != Credential::AccessKey {
+        return Ok(());
+    }
+    let folder_label = mount.name.unwrap_or(mount.folder_id);
+    Err(CliError::access_key_is_read_only(folder_label).into())
+}
+
+async fn cmd_restore(path: String, version_id: String, json: bool) -> Result<()> {
     let local_path = canonical_path(&path)?;
+    refuse_if_access_key_restore_is_read_only(&local_path).await?;
     let response = daemon_client()
         .context("failed to create daemon client for restore")?
         .post("http://localhost/restore")
@@ -337,13 +514,24 @@ async fn cmd_restore(path: String, version_id: String) -> Result<()> {
         .await
         .map_err(|error| daemon_request_error("restore", error))?;
     let response = parse_daemon_json::<RestoreResponse>(response).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "result": response.result,
+                "path": local_path,
+                "version_id": version_id,
+            }))?
+        );
+        return Ok(());
+    }
     match response.result.as_str() {
         "applied" => println!("Restored {local_path} to version {version_id}"),
         "conflict_copy" => {
-            println!("Restored as conflict copy — another write occurred concurrently")
+            println!("Restored as conflict copy: another write occurred concurrently")
         }
         "superseded" => {
-            println!("Restore superseded — a concurrent write already advanced the file")
+            println!("Restore superseded: a concurrent write already advanced the file")
         }
         result => println!("Restore result: {result}"),
     }
@@ -352,66 +540,307 @@ async fn cmd_restore(path: String, version_id: String) -> Result<()> {
 
 fn canonical_path(path: &str) -> Result<String> {
     Ok(fs::canonicalize(path)
-        .map_err(|error| anyhow!("failed to resolve {path}: {error}"))?
+        .with_context(|| format!("failed to resolve {path}"))?
         .to_string_lossy()
         .into_owned())
 }
 
 async fn cmd_status(json: bool) -> Result<()> {
-    let response = daemon_client()
-        .context("failed to create daemon client for status")?
-        .get("http://localhost/status")
-        .send()
-        .await
-        .map_err(|error| daemon_request_error("status", error))?;
-    let status = parse_daemon_json::<DaemonStatus>(response).await?;
+    match probe_status_default().await {
+        Some(status) => render_status_online(status, json).await,
+        None => render_status_offline(json).await,
+    }
+}
+
+enum Discovery {
+    NotApplicable,
+    Unavailable,
+    Available(Vec<GrantListEntry>),
+}
+
+async fn fetch_reachable_folders(status: &DaemonStatus) -> Discovery {
+    if status.credential != Credential::Account {
+        return Discovery::NotApplicable;
+    }
+    let Ok(config) = load_config() else {
+        return Discovery::Unavailable;
+    };
+    match fetch_reachable_grants(&config, Duration::from_secs(3)).await {
+        Ok(grants) => Discovery::Available(grants),
+        Err(_) => Discovery::Unavailable,
+    }
+}
+
+async fn render_status_online(status: DaemonStatus, json: bool) -> Result<()> {
+    let discovery = fetch_reachable_folders(&status).await;
     if json {
-        println!("{}", status_json(&status)?);
+        println!("{}", online_status_json(&status, &discovery)?);
         return Ok(());
     }
-    if status.update_required {
-        println!("{UPDATE_REQUIRED_MESSAGE}");
-    } else if status.paused {
+
+    print_principal_line(status.credential, status.principal.as_ref());
+    if let Some(advisory) = legacy_device_token_advisory(status.credential) {
+        println!("{advisory}");
+    }
+
+    if status.paused {
         println!("Paused");
     } else if status.backend_connected {
         println!("Connected");
     } else {
         println!("Disconnected");
     }
+
+    let rows = build_folder_rows(&status, &discovery);
+    print_table(
+        &["folder_id", "name", "access", "path", "sync_state"],
+        &rows,
+    );
+
+    if matches!(discovery, Discovery::Unavailable) {
+        println!("The reachable-folder list is unavailable: the backend could not be reached.");
+    }
+
     if let Some(line) =
         update_available_line(status.update_available, status.latest_version.as_deref())
     {
         println!("{line}");
     }
-    let rows = status
-        .mounts
-        .into_iter()
-        .map(|mount| {
-            vec![
-                mount.path,
-                mount.syncing.to_string(),
-                mount.pending_ops.to_string(),
-                mount.last_synced_at.unwrap_or_else(|| "-".into()),
-                update_required_cell(mount.update_required),
-                mount.error.unwrap_or_else(|| "-".into()),
-            ]
-        })
-        .collect::<Vec<_>>();
-    print_table(
-        &[
-            "path",
-            "syncing",
-            "pending_ops",
-            "last_synced_at",
-            "update_required",
-            "error",
-        ],
-        &rows,
-    );
+    if status.update_required {
+        println!("{UPDATE_REQUIRED_MESSAGE}");
+    }
     Ok(())
 }
 
-const UPDATE_REQUIRED_MESSAGE: &str = "Update required — run 'valv update' to fix this";
+async fn fetch_offline_reachable_folders() -> Discovery {
+    let Ok(config) = load_config() else {
+        return Discovery::NotApplicable;
+    };
+    match fetch_reachable_grants(&config, Duration::from_secs(3)).await {
+        Ok(grants) => Discovery::Available(grants),
+        Err(_) => Discovery::Unavailable,
+    }
+}
+
+async fn render_status_offline(json: bool) -> Result<()> {
+    let reason = diagnose_daemon_absence();
+    let mounts = list_local_mounts().unwrap_or_default();
+    let principal_line = offline_principal_line(&mounts);
+    let discovery = fetch_offline_reachable_folders().await;
+
+    if json {
+        println!(
+            "{}",
+            offline_status_json(&reason, &principal_line, &mounts, &discovery)?
+        );
+        return Ok(());
+    }
+
+    println!("{principal_line}");
+    print_daemon_absence(&reason);
+
+    let rows = mounts
+        .iter()
+        .map(|mount| {
+            vec![
+                mount.folder_id.clone(),
+                mount.name.clone().unwrap_or_else(|| "-".into()),
+                mount.path.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(&["folder_id", "name", "path"], &rows);
+
+    if let Discovery::Available(grants) = &discovery {
+        let mounted_ids = mounts
+            .iter()
+            .map(|mount| mount.folder_id.as_str())
+            .collect::<HashSet<_>>();
+        let unmounted_rows = grants
+            .iter()
+            .filter(|grant| !mounted_ids.contains(grant.folder_id.as_str()))
+            .map(|grant| {
+                vec![
+                    grant.folder_id.clone(),
+                    grant.folder_name.clone().unwrap_or_else(|| "-".into()),
+                    "not mounted".into(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        if !unmounted_rows.is_empty() {
+            print_table(&["folder_id", "name", "path"], &unmounted_rows);
+        }
+    }
+    if matches!(discovery, Discovery::Unavailable) {
+        println!("The reachable-folder list is unavailable: the backend could not be reached.");
+    }
+    Ok(())
+}
+
+fn print_principal_line(credential: Credential, principal: Option<&PrincipalStatus>) {
+    for line in principal_lines(credential, principal) {
+        println!("{line}");
+    }
+}
+
+fn principal_lines(credential: Credential, principal: Option<&PrincipalStatus>) -> Vec<String> {
+    match credential {
+        Credential::Account => {
+            let label = principal
+                .and_then(|principal| principal.email.clone())
+                .unwrap_or_else(offline_device_name_fallback);
+            vec![format!("Signed in as {label}")]
+        }
+        Credential::AccessKey => {
+            let mut lines = vec!["Access key".to_owned()];
+            for scope in principal
+                .map(|principal| principal.scopes.as_slice())
+                .unwrap_or_default()
+            {
+                let permission = if scope.can_write {
+                    "read/write"
+                } else {
+                    "read-only"
+                };
+                lines.push(format!(
+                    "folder-scoped: {} ({permission})",
+                    scope.folder_name
+                ));
+            }
+            lines
+        }
+        Credential::Rejected => {
+            vec!["Access key rejected. Ask the folder owner for a new key.".to_owned()]
+        }
+        Credential::Pending => vec!["Verifying this machine's credential...".to_owned()],
+        Credential::None => vec!["Not configured, no key yet".to_owned()],
+    }
+}
+
+fn legacy_device_token_advisory(credential: Credential) -> Option<&'static str> {
+    if credential != Credential::AccessKey {
+        return None;
+    }
+    let has_device_token = peek_config()
+        .and_then(|peek| peek.device_token)
+        .map(|token| !token.trim().is_empty())
+        .unwrap_or(false);
+    has_device_token.then_some(
+        "This machine's config.toml stores an access key in device_token. Redeem it as a mount instead: valv mount <path> --key <token>, then remove device_token from config.toml.",
+    )
+}
+
+fn offline_device_name_fallback() -> String {
+    peek_config()
+        .and_then(|peek| peek.device_name)
+        .unwrap_or_else(|| "this device".into())
+}
+
+fn access_label(can_write: bool, role: Option<&str>) -> String {
+    if role == Some("owner") {
+        return "owner".into();
+    }
+    if can_write {
+        "read/write".into()
+    } else {
+        "read-only".into()
+    }
+}
+
+fn mount_sync_state(mount: &MountStatus) -> String {
+    if mount.update_required {
+        return update_required_cell(true);
+    }
+    if let Some(error) = &mount.error {
+        return error.clone();
+    }
+    if mount.syncing {
+        return "syncing".into();
+    }
+    if mount.pending_ops > 0 {
+        format!("{} pending", mount.pending_ops)
+    } else {
+        "synced".into()
+    }
+}
+
+fn build_folder_rows(status: &DaemonStatus, discovery: &Discovery) -> Vec<Vec<String>> {
+    let mut rows = status
+        .mounts
+        .iter()
+        .map(|mount| {
+            vec![
+                mount.folder_id.clone(),
+                mount.name.clone(),
+                access_label(mount.can_write, None),
+                mount.path.clone(),
+                mount_sync_state(mount),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    if let Discovery::Available(grants) = discovery {
+        let mounted_ids = status
+            .mounts
+            .iter()
+            .map(|mount| mount.folder_id.as_str())
+            .collect::<HashSet<_>>();
+        for grant in grants {
+            if mounted_ids.contains(grant.folder_id.as_str()) {
+                continue;
+            }
+            rows.push(vec![
+                grant.folder_id.clone(),
+                grant.folder_name.clone().unwrap_or_else(|| "-".into()),
+                access_label(grant.can_write.unwrap_or(false), grant.role.as_deref()),
+                "not mounted".into(),
+                "-".into(),
+            ]);
+        }
+    }
+    rows
+}
+
+fn offline_principal_line(mounts: &[valv_sync::persistence::mounts::LocalMount]) -> String {
+    let Some(peek) = peek_config() else {
+        return "Not configured, no key yet".into();
+    };
+    let has_device_token = peek
+        .device_token
+        .as_deref()
+        .map(|token| !token.trim().is_empty())
+        .unwrap_or(false);
+    let has_mount_token = mounts.iter().any(|mount| mount.mount_token.is_some());
+    if has_device_token || has_mount_token {
+        "A local credential is present, but the daemon is unreachable so its type cannot be verified.".into()
+    } else {
+        "Not configured, no key yet".into()
+    }
+}
+
+fn print_daemon_absence(reason: &DaemonAbsenceReason) {
+    match reason {
+        DaemonAbsenceReason::NotConfigured => {
+            println!("Daemon: not configured (no config.toml found).");
+            println!(
+                "Run: valv login, or valv mount <path> --key <token> if you were given an access key."
+            );
+        }
+        DaemonAbsenceReason::NotInstalled => {
+            println!("Daemon: not installed (no background service is registered).");
+            println!("Run any valv command to install and start it, or run: valv daemon restart");
+        }
+        DaemonAbsenceReason::InstalledButFailing { last_error } => {
+            println!("Daemon: installed, but failing to start.");
+            if let Some(last_error) = last_error {
+                println!("Last daemon output:\n{last_error}");
+            }
+            println!("Inspect it with: {}", platform_log_hint());
+        }
+    }
+}
+
+const UPDATE_REQUIRED_MESSAGE: &str = "Update required. Run 'valv update' to fix this.";
 
 fn update_required_cell(update_required: bool) -> String {
     if update_required {
@@ -421,7 +850,10 @@ fn update_required_cell(update_required: bool) -> String {
     }
 }
 
-fn update_available_line(update_available: Option<bool>, latest_version: Option<&str>) -> Option<String> {
+fn update_available_line(
+    update_available: Option<bool>,
+    latest_version: Option<&str>,
+) -> Option<String> {
     match (update_available, latest_version) {
         (Some(true), Some(latest_version)) => Some(format!(
             "A newer version of valv is available ({latest_version}). Run 'valv update' to install it."
@@ -430,15 +862,102 @@ fn update_available_line(update_available: Option<bool>, latest_version: Option<
     }
 }
 
-fn status_json(status: &DaemonStatus) -> Result<String> {
-    serde_json::to_string(status).context("failed to serialize status as JSON")
+fn online_status_json(status: &DaemonStatus, discovery: &Discovery) -> Result<String> {
+    let mut value = serde_json::to_value(status).context("failed to serialize status as JSON")?;
+    if let Some(object) = value.as_object_mut() {
+        match discovery {
+            Discovery::Available(grants) => {
+                let mounted_ids = status
+                    .mounts
+                    .iter()
+                    .map(|mount| mount.folder_id.as_str())
+                    .collect::<HashSet<_>>();
+                let reachable = grants
+                    .iter()
+                    .filter(|grant| !mounted_ids.contains(grant.folder_id.as_str()))
+                    .map(|grant| {
+                        serde_json::json!({
+                            "folder_id": grant.folder_id,
+                            "name": grant.folder_name,
+                            "access": access_label(grant.can_write.unwrap_or(false), grant.role.as_deref()),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                object.insert("reachable_folders".into(), serde_json::json!(reachable));
+            }
+            Discovery::Unavailable => {
+                object.insert("discovery_unavailable".into(), serde_json::json!(true));
+            }
+            Discovery::NotApplicable => {}
+        }
+    }
+    serde_json::to_string(&value).context("failed to serialize status as JSON")
+}
+
+fn offline_status_json(
+    reason: &DaemonAbsenceReason,
+    principal_summary: &str,
+    mounts: &[valv_sync::persistence::mounts::LocalMount],
+    discovery: &Discovery,
+) -> Result<String> {
+    let (state, last_error) = match reason {
+        DaemonAbsenceReason::NotConfigured => ("not_configured", None),
+        DaemonAbsenceReason::NotInstalled => ("not_installed", None),
+        DaemonAbsenceReason::InstalledButFailing { last_error } => {
+            ("installed_but_failing", last_error.clone())
+        }
+    };
+    let mount_rows = mounts
+        .iter()
+        .map(|mount| {
+            serde_json::json!({
+                "folder_id": mount.folder_id,
+                "name": mount.name,
+                "path": mount.path,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut value = serde_json::json!({
+        "daemon_state": state,
+        "last_error": last_error,
+        "log_command": if state == "installed_but_failing" { Some(platform_log_hint()) } else { None },
+        "principal_summary": principal_summary,
+        "mounts": mount_rows,
+    });
+    if let Some(object) = value.as_object_mut() {
+        match discovery {
+            Discovery::Available(grants) => {
+                let mounted_ids = mounts
+                    .iter()
+                    .map(|mount| mount.folder_id.as_str())
+                    .collect::<HashSet<_>>();
+                let reachable = grants
+                    .iter()
+                    .filter(|grant| !mounted_ids.contains(grant.folder_id.as_str()))
+                    .map(|grant| {
+                        serde_json::json!({
+                            "folder_id": grant.folder_id,
+                            "name": grant.folder_name,
+                            "access": access_label(grant.can_write.unwrap_or(false), grant.role.as_deref()),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                object.insert("reachable_folders".into(), serde_json::json!(reachable));
+            }
+            Discovery::Unavailable => {
+                object.insert("discovery_unavailable".into(), serde_json::json!(true));
+            }
+            Discovery::NotApplicable => {}
+        }
+    }
+    serde_json::to_string(&value).context("failed to serialize offline status as JSON")
 }
 
 fn versions_json(response: &VersionsResponse) -> Result<String> {
     serde_json::to_string(&response.versions).context("failed to serialize versions as JSON")
 }
 
-async fn cmd_pause_resume(route: &str, message: &str) -> Result<()> {
+async fn cmd_pause_resume(route: &str, message: &str, json: bool) -> Result<()> {
     let response = daemon_client()
         .context("failed to create daemon client for pause/resume")?
         .post(format!("http://localhost/{route}"))
@@ -446,29 +965,112 @@ async fn cmd_pause_resume(route: &str, message: &str) -> Result<()> {
         .await
         .map_err(|error| daemon_request_error(route, error))?;
     expect_status(response, StatusCode::NO_CONTENT).await?;
-    println!("{message}");
+    if json {
+        println!("{}", serde_json::to_string(&serde_json::json!({ "action": route }))?);
+    } else {
+        println!("{message}");
+    }
     Ok(())
 }
 
-async fn cmd_sync(folder: Option<String>) -> Result<()> {
-    let subject = folder
-        .as_ref()
-        .map(|folder_id| format!("folder {folder_id}"))
-        .unwrap_or_else(|| "folders".into());
-    let spinner = request_spinner("Syncing…");
-    let summary = async {
-        let response = daemon_client()
-            .context("failed to create daemon client for sync")?
-            .post("http://localhost/sync")
-            .json(&SyncRequest { folder_id: folder })
-            .send()
-            .await
-            .map_err(|error| daemon_request_error("sync", error))?;
-        parse_daemon_json::<SyncSummary>(response).await
+async fn request_sync_pass(folder_id: Option<&str>) -> Result<SyncSummary> {
+    let response = daemon_client()
+        .context("failed to create daemon client for sync")?
+        .post("http://localhost/sync")
+        .json(&SyncRequest {
+            folder_id: folder_id.map(str::to_owned),
+        })
+        .send()
+        .await
+        .map_err(|error| daemon_request_error("sync", error))?;
+    parse_daemon_json::<SyncSummary>(response).await
+}
+
+fn relevant_mounts<'a>(status: &'a DaemonStatus, folder_id: Option<&str>) -> Vec<&'a MountStatus> {
+    status
+        .mounts
+        .iter()
+        .filter(|mount| folder_id.is_none_or(|folder_id| mount.folder_id == folder_id))
+        .collect()
+}
+
+async fn run_sync_barrier(
+    folder_id: Option<&str>,
+    subject: &str,
+    spinner: Option<&ProgressBar>,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<SyncSummary> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let summary = request_sync_pass(folder_id).await?;
+        let status = fetch_daemon_status().await?;
+        let mounts = relevant_mounts(&status, folder_id);
+
+        if let Some(mount) = mounts.iter().find(|mount| mount.error.is_some()) {
+            return Err(CliError::sync_mount_error(
+                mount.name.clone(),
+                mount.error.clone().unwrap_or_default(),
+            )
+            .into());
+        }
+
+        let settled = mounts.iter().all(|mount| mount.pending_ops == 0);
+        if settled {
+            return Ok(summary);
+        }
+
+        if Instant::now() >= deadline {
+            return Err(
+                CliError::sync_timed_out(format!("Timed out waiting for {subject} to settle."))
+                    .into(),
+            );
+        }
+
+        if let Some(spinner) = spinner {
+            let pending: u64 = mounts.iter().map(|mount| mount.pending_ops).sum();
+            spinner.set_message(format!(
+                "Waiting for {subject} to settle: {pending} pending op(s)…"
+            ));
+        }
+        tokio::time::sleep(poll_interval).await;
     }
+}
+
+async fn cmd_sync(path: Option<String>, json: bool) -> Result<()> {
+    let folder_id = path
+        .as_ref()
+        .map(|path| resolve_mount(path).map(|mount| mount.folder_id))
+        .transpose()?;
+    let subject = path
+        .clone()
+        .unwrap_or_else(|| "every mounted folder".into());
+    let spinner = request_spinner("Syncing…", json);
+
+    let result = run_sync_barrier(
+        folder_id.as_deref(),
+        &subject,
+        spinner.as_ref(),
+        SYNC_BARRIER_TIMEOUT,
+        SYNC_POLL_INTERVAL,
+    )
     .await;
-    spinner.finish_and_clear();
-    let summary = summary?;
+
+    finish_spinner(spinner);
+    let summary = result?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "path": path,
+                "creates_submitted": summary.creates_submitted,
+                "versions_submitted": summary.versions_submitted,
+                "deletes_submitted": summary.deletes_submitted,
+                "pulled_ops": summary.pulled_ops,
+            }))?
+        );
+        return Ok(());
+    }
     println!(
         "Synced {subject}: {} created, {} updated, {} deleted, {} remote ops applied",
         summary.creates_submitted,
@@ -479,19 +1081,52 @@ async fn cmd_sync(folder: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn delegate_daemon(command: DaemonCommand) -> Result<()> {
+fn delegate_daemon(command: DaemonCommand, json: bool) -> Result<()> {
+    match command {
+        DaemonCommand::Restart => cmd_daemon_restart(json),
+        DaemonCommand::Uninstall => {
+            run_valvd_daemon_subcommand("uninstall", json)?;
+            print_daemon_command_result("uninstalled", json);
+            Ok(())
+        }
+    }
+}
+
+fn cmd_daemon_restart(json: bool) -> Result<()> {
+    let _ = run_valvd_daemon_subcommand("uninstall", json);
+    run_valvd_daemon_subcommand("install", json)?;
+    wait_for_daemon_socket(Duration::from_secs(10))?;
+    print_daemon_command_result("restarted", json);
+    Ok(())
+}
+
+fn print_daemon_command_result(action: &str, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({ "action": action }))
+                .unwrap_or_else(|_| "{\"action\":\"unknown\"}".to_owned())
+        );
+    } else {
+        eprintln!("Valv daemon {action}.");
+    }
+}
+
+fn run_valvd_daemon_subcommand(subcommand: &str, json: bool) -> Result<()> {
     let valvd = resolve_valvd_path().context("failed to resolve valvd path")?;
-    let subcommand = match command {
-        DaemonCommand::Install => "install",
-        DaemonCommand::Uninstall => "uninstall",
-    };
-    let status = ProcessCommand::new(valvd)
-        .arg("daemon")
-        .arg(subcommand)
-        .status()
-        .context("failed to launch valvd")?;
+    let mut command = ProcessCommand::new(valvd);
+    command.arg("daemon").arg(subcommand);
+    if json {
+        command.stdout(Stdio::null());
+    }
+    let status = command.status().context("failed to launch valvd")?;
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(CliError::new(
+            1,
+            "daemon_command_failed",
+            format!("valvd daemon {subcommand} failed"),
+        )
+        .into());
     }
     Ok(())
 }
@@ -499,11 +1134,10 @@ fn delegate_daemon(command: DaemonCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use valv_sync::protocol::ipc::{Credential, MountStatus, VersionEntry};
+    use valv_sync::protocol::ipc::VersionEntry;
 
-    #[test]
-    fn status_json_round_trips_without_human_table_text() {
-        let status = DaemonStatus {
+    fn sample_status() -> DaemonStatus {
+        DaemonStatus {
             paused: false,
             backend_connected: true,
             version: "0.1.0".into(),
@@ -526,9 +1160,14 @@ mod tests {
             update_available: None,
             credential: Credential::None,
             principal: None,
-        };
+        }
+    }
 
-        let output = status_json(&status).unwrap();
+    #[test]
+    fn online_status_json_round_trips_without_human_table_text_when_discovery_is_not_applicable() {
+        let status = sample_status();
+
+        let output = online_status_json(&status, &Discovery::NotApplicable).unwrap();
         let parsed: DaemonStatus = serde_json::from_str(&output).unwrap();
 
         assert_eq!(parsed, status);
@@ -537,10 +1176,343 @@ mod tests {
     }
 
     #[test]
+    fn online_status_json_adds_reachable_folders_only_for_unmounted_grants() {
+        let status = sample_status();
+        let grants = vec![
+            GrantListEntry {
+                grant_id: "g_1".into(),
+                folder_id: "folder-1".into(),
+                scope_node_id: "root".into(),
+                role: Some("owner".into()),
+                can_read: Some(true),
+                can_write: Some(true),
+                user_id: Some("user-1".into()),
+                device_id: None,
+                name: None,
+                grantee_email: None,
+                device_name: None,
+                created_at: None,
+                created_by_email: None,
+                folder_name: Some("Valv".into()),
+            },
+            GrantListEntry {
+                grant_id: "g_2".into(),
+                folder_id: "folder-2".into(),
+                scope_node_id: "root".into(),
+                role: Some("collaborator".into()),
+                can_read: Some(true),
+                can_write: Some(false),
+                user_id: Some("user-1".into()),
+                device_id: None,
+                name: None,
+                grantee_email: None,
+                device_name: None,
+                created_at: None,
+                created_by_email: None,
+                folder_name: Some("Assets".into()),
+            },
+        ];
+
+        let output = online_status_json(&status, &Discovery::Available(grants)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let reachable = value["reachable_folders"].as_array().unwrap();
+
+        assert_eq!(reachable.len(), 1);
+        assert_eq!(reachable[0]["folder_id"], "folder-2");
+        assert_eq!(reachable[0]["access"], "read-only");
+    }
+
+    #[test]
+    fn online_status_json_flags_discovery_as_unavailable_rather_than_omitting_it() {
+        let status = sample_status();
+
+        let output = online_status_json(&status, &Discovery::Unavailable).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(value["discovery_unavailable"], true);
+    }
+
+    #[test]
+    fn principal_lines_account_signs_in_by_email() {
+        let principal = PrincipalStatus {
+            principal_type: valv_sync::protocol::ipc::PrincipalType::Account,
+            email: Some("alice@example.com".into()),
+            scopes: vec![],
+        };
+        assert_eq!(
+            principal_lines(Credential::Account, Some(&principal)),
+            vec!["Signed in as alice@example.com".to_owned()]
+        );
+    }
+
+    #[test]
+    fn principal_lines_access_key_renders_one_line_per_scope() {
+        let principal = PrincipalStatus {
+            principal_type: valv_sync::protocol::ipc::PrincipalType::AccessKey,
+            email: None,
+            scopes: vec![
+                valv_sync::protocol::ipc::PrincipalScope {
+                    folder_id: "folder-1".into(),
+                    folder_name: "Design".into(),
+                    scope_label: "Design".into(),
+                    can_write: true,
+                },
+                valv_sync::protocol::ipc::PrincipalScope {
+                    folder_id: "folder-2".into(),
+                    folder_name: "Assets".into(),
+                    scope_label: "Assets".into(),
+                    can_write: false,
+                },
+            ],
+        };
+
+        let lines = principal_lines(Credential::AccessKey, Some(&principal));
+
+        assert_eq!(
+            lines,
+            vec![
+                "Access key".to_owned(),
+                "folder-scoped: Design (read/write)".to_owned(),
+                "folder-scoped: Assets (read-only)".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn principal_lines_rejected_names_the_folder_owner_not_a_network_outage() {
+        let lines = principal_lines(Credential::Rejected, None);
+        assert_eq!(
+            lines,
+            vec!["Access key rejected. Ask the folder owner for a new key.".to_owned()]
+        );
+    }
+
+    #[test]
+    fn principal_lines_pending_does_not_guess_account_or_access_key() {
+        let lines = principal_lines(Credential::Pending, None);
+        assert_eq!(
+            lines,
+            vec!["Verifying this machine's credential...".to_owned()]
+        );
+    }
+
+    #[test]
+    fn principal_lines_none_reads_not_configured_no_key_yet() {
+        let lines = principal_lines(Credential::None, None);
+        assert_eq!(lines, vec!["Not configured, no key yet".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn fetch_reachable_folders_makes_no_request_for_an_access_key_machine() {
+        let mut status = sample_status();
+        status.credential = Credential::AccessKey;
+
+        let discovery = fetch_reachable_folders(&status).await;
+
+        assert!(matches!(discovery, Discovery::NotApplicable));
+    }
+
+    #[test]
+    fn build_folder_rows_still_lists_mounts_when_discovery_is_unavailable() {
+        let status = sample_status();
+
+        let rows = build_folder_rows(&status, &Discovery::Unavailable);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "folder-1");
+    }
+
+    #[test]
+    fn offline_status_json_adds_reachable_folders_only_for_unmounted_grants() {
+        let mounts = vec![valv_sync::persistence::mounts::LocalMount {
+            path: "/tmp/valv".into(),
+            folder_id: "folder-1".into(),
+            grant_id: None,
+            scope_node_id: None,
+            mount_token: None,
+            cursor: 0,
+            can_write: true,
+            name: Some("Valv".into()),
+        }];
+        let grants = vec![
+            GrantListEntry {
+                grant_id: "g_1".into(),
+                folder_id: "folder-1".into(),
+                scope_node_id: "root".into(),
+                role: Some("owner".into()),
+                can_read: Some(true),
+                can_write: Some(true),
+                user_id: Some("user-1".into()),
+                device_id: None,
+                name: None,
+                grantee_email: None,
+                device_name: None,
+                created_at: None,
+                created_by_email: None,
+                folder_name: Some("Valv".into()),
+            },
+            GrantListEntry {
+                grant_id: "g_2".into(),
+                folder_id: "folder-2".into(),
+                scope_node_id: "root".into(),
+                role: Some("collaborator".into()),
+                can_read: Some(true),
+                can_write: Some(false),
+                user_id: Some("user-1".into()),
+                device_id: None,
+                name: None,
+                grantee_email: None,
+                device_name: None,
+                created_at: None,
+                created_by_email: None,
+                folder_name: Some("Assets".into()),
+            },
+        ];
+
+        let output = offline_status_json(
+            &DaemonAbsenceReason::NotInstalled,
+            "Signed in as alice@example.com",
+            &mounts,
+            &Discovery::Available(grants),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let reachable = value["reachable_folders"].as_array().unwrap();
+
+        assert_eq!(reachable.len(), 1);
+        assert_eq!(reachable[0]["folder_id"], "folder-2");
+    }
+
+    #[tokio::test]
+    async fn fetch_offline_reachable_folders_calls_grants_when_a_device_token_is_present() {
+        let _loopback_guard = crate::LOOPBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to bind loopback test listener: {error}"),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir.path());
+
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            let body = "[]";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let config_path = crate::paths::config_path().unwrap();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            format!("backend_url = \"http://{addr}\"\ndevice_token = \"test-token\"\n"),
+        )
+        .unwrap();
+
+        let discovery = fetch_offline_reachable_folders().await;
+
+        match previous_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(matches!(discovery, Discovery::Available(grants) if grants.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn fetch_offline_reachable_folders_makes_no_call_without_a_device_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir.path());
+
+        let discovery = fetch_offline_reachable_folders().await;
+
+        match previous_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(matches!(discovery, Discovery::NotApplicable));
+    }
+
+    #[test]
+    fn legacy_device_token_advisory_names_the_fix_for_an_access_key_holding_a_device_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir.path());
+        let config_path = crate::paths::config_path().unwrap();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            "backend_url = \"https://api.example.test\"\ndevice_token = \"legacy-key\"\n",
+        )
+        .unwrap();
+
+        let advisory = legacy_device_token_advisory(Credential::AccessKey);
+        let none_for_account = legacy_device_token_advisory(Credential::Account);
+
+        match previous_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let advisory = advisory.expect("a stray access key in device_token should be flagged");
+        assert!(advisory.contains("valv mount <path> --key <token>"));
+        assert!(none_for_account.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_offline_never_writes_a_config_file_or_installs_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir.path());
+
+        let result = cmd_status(true).await;
+        let config_path = dir.path().join(".config/valv/config.toml");
+        let config_was_written = config_path.exists();
+
+        match previous_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(result.is_ok());
+        assert!(
+            !config_was_written,
+            "status must never write a config file: that is ensure_daemon's job, and status must never call it"
+        );
+    }
+
+    #[test]
     fn update_required_cell_names_the_fix_when_true() {
         assert_eq!(
             update_required_cell(true),
-            "Update required — run 'valv update' to fix this"
+            "Update required. Run 'valv update' to fix this."
         );
     }
 
@@ -583,5 +1555,678 @@ mod tests {
         assert_eq!(parsed, response.versions);
         assert!(output.starts_with('['));
         assert!(!output.contains("version_id created_at"));
+    }
+
+    fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
+        Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn mount_without_a_source_is_a_usage_error_naming_mount_source_required() {
+        let error = parse(&["valv", "mount", "/tmp/data"]).unwrap_err();
+        let cli_error = map_clap_error(error);
+
+        assert_eq!(cli_error.payload.code, "mount_source_required");
+        assert_eq!(cli_error.exit_code, 2);
+    }
+
+    #[test]
+    fn mount_with_exactly_one_source_parses() {
+        assert!(parse(&["valv", "mount", "/tmp/data", "--new"]).is_ok());
+        assert!(parse(&["valv", "mount", "/tmp/data", "--folder", "f_1"]).is_ok());
+        assert!(parse(&["valv", "mount", "/tmp/data", "--key", "token"]).is_ok());
+    }
+
+    #[test]
+    fn mount_with_two_sources_is_a_usage_error() {
+        assert!(parse(&["valv", "mount", "/tmp/data", "--new", "--folder", "f_1"]).is_err());
+    }
+
+    #[test]
+    fn mount_key_accepts_a_token_that_looks_like_a_flag() {
+        let cli = parse(&["valv", "mount", "/tmp/data", "--key", "-dGVzdA"]).unwrap();
+        let Command::Mount(args) = cli.command else {
+            panic!("expected a mount command");
+        };
+        assert_eq!(args.key.as_deref(), Some("-dGVzdA"));
+    }
+
+    #[test]
+    fn mount_has_no_read_only_flag() {
+        assert!(parse(&["valv", "mount", "/tmp/data", "--new", "--read-only"]).is_err());
+    }
+
+    #[test]
+    fn unmount_and_sync_take_a_path_not_a_folder_flag() {
+        assert!(parse(&["valv", "unmount", "/tmp/data"]).is_ok());
+        assert!(parse(&["valv", "sync"]).is_ok());
+        assert!(parse(&["valv", "sync", "/tmp/data"]).is_ok());
+    }
+
+    #[test]
+    fn login_replaces_the_auth_namespace() {
+        assert!(parse(&["valv", "login"]).is_ok());
+        assert!(parse(&["valv", "auth", "login"]).is_err());
+    }
+
+    #[test]
+    fn grant_and_grants_no_longer_exist() {
+        assert!(parse(&["valv", "grant", "create", "/tmp/data", "--to", "a@b.com"]).is_err());
+        assert!(parse(&["valv", "grants"]).is_err());
+    }
+
+    #[test]
+    fn share_bare_and_with_a_target_both_parse() {
+        assert!(parse(&["valv", "share", "/tmp/data"]).is_ok());
+        assert!(parse(&["valv", "share", "/tmp/data", "--to", "a@b.com"]).is_ok());
+        assert!(parse(&["valv", "share", "/tmp/data", "--key", "box"]).is_ok());
+    }
+
+    #[test]
+    fn share_rejects_both_a_person_and_a_key_at_once() {
+        assert!(parse(&[
+            "valv",
+            "share",
+            "/tmp/data",
+            "--to",
+            "a@b.com",
+            "--key",
+            "box"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn unshare_requires_exactly_one_target() {
+        assert!(parse(&["valv", "unshare", "/tmp/data"]).is_err());
+        assert!(parse(&["valv", "unshare", "/tmp/data", "--to", "a@b.com"]).is_ok());
+        assert!(parse(&["valv", "unshare", "/tmp/data", "--id", "g_1"]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn unshare_json_with_a_handle_is_a_usage_error_before_any_network_call() {
+        let error = run_command(
+            Command::Unshare(UnshareArgs {
+                path: "/tmp/data".into(),
+                to: Some("bob@example.com".into()),
+                key: None,
+                id: None,
+                yes: false,
+            }),
+            true,
+        )
+        .await
+        .unwrap_err();
+        let cli_error = error
+            .downcast_ref::<CliError>()
+            .expect("a handle under --json should be a CliError");
+
+        assert_eq!(cli_error.payload.code, "handle_requires_pinned_id");
+        assert_eq!(cli_error.exit_code, 2);
+    }
+
+    #[test]
+    fn daemon_install_no_longer_exists_restart_does() {
+        assert!(parse(&["valv", "daemon", "install"]).is_err());
+        assert!(parse(&["valv", "daemon", "restart"]).is_ok());
+        assert!(parse(&["valv", "daemon", "uninstall"]).is_ok());
+    }
+
+    #[test]
+    fn update_has_no_check_flag() {
+        assert!(parse(&["valv", "update"]).is_ok());
+        assert!(parse(&["valv", "update", "--check"]).is_err());
+    }
+
+    #[test]
+    fn json_is_a_global_flag_accepted_before_or_after_the_subcommand() {
+        assert!(parse(&["valv", "--json", "status"]).is_ok());
+        assert!(parse(&["valv", "status", "--json"]).is_ok());
+    }
+
+    use crate::daemon::test_support::MockDaemon;
+
+    const ACCESS_KEY_STATUS: &str = r#"{"paused":false,"backend_connected":true,"version":"0.1.0","update_required":false,"mounts":[],"credential":"access_key","principal":{"type":"access_key","scopes":[]}}"#;
+    const ACCOUNT_STATUS: &str = r#"{"paused":false,"backend_connected":true,"version":"0.1.0","update_required":false,"mounts":[],"credential":"account","principal":{"type":"account","email":"alice@example.com","scopes":[]}}"#;
+
+    fn set_test_home(dir: &std::path::Path) -> Option<std::ffi::OsString> {
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir);
+        previous
+    }
+
+    fn restore_home(previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_under_json_still_pauses_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        MockDaemon::new()
+            .route("POST", "/pause", 204, "")
+            .spawn(&socket_path, 1);
+
+        let result = cmd_pause_resume("pause", "Paused sync: background sync is paused", true).await;
+
+        restore_home(previous_home);
+
+        assert!(result.is_ok(), "pause --json should still pause: {result:?}");
+    }
+
+    fn write_mount(path: &str, folder_id: &str, mount_token: Option<&str>, can_write: bool) {
+        let db_path = crate::paths::data_dir().unwrap().join("sync.db");
+        let conn = valv_sync::persistence::open_db(&db_path).unwrap();
+        valv_sync::persistence::mounts::upsert_mount(
+            &conn,
+            path,
+            folder_id,
+            None,
+            None,
+            mount_token,
+            can_write,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mount_new_is_refused_locally_on_an_access_key_machine_before_any_mount_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        MockDaemon::new()
+            .route("GET", "/status", 200, ACCESS_KEY_STATUS)
+            .spawn(&socket_path, 1);
+
+        let result = cmd_mount(
+            MountArgs {
+                path: "/tmp/data".into(),
+                folder: None,
+                key: None,
+                new: true,
+            },
+            false,
+        )
+        .await;
+
+        restore_home(previous_home);
+
+        let error = result.unwrap_err();
+        let cli_error = error
+            .downcast_ref::<CliError>()
+            .expect("an access-key refusal should be a CliError");
+        assert_eq!(cli_error.payload.code, "access_key_cannot_create_folder");
+        assert_eq!(cli_error.exit_code, 77);
+    }
+
+    #[tokio::test]
+    async fn mount_folder_is_refused_locally_on_an_access_key_machine_before_any_mount_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        MockDaemon::new()
+            .route("GET", "/status", 200, ACCESS_KEY_STATUS)
+            .spawn(&socket_path, 1);
+
+        let result = cmd_mount(
+            MountArgs {
+                path: "/tmp/data".into(),
+                folder: Some("folder-1".into()),
+                key: None,
+                new: false,
+            },
+            false,
+        )
+        .await;
+
+        restore_home(previous_home);
+
+        let error = result.unwrap_err();
+        let cli_error = error
+            .downcast_ref::<CliError>()
+            .expect("an access-key refusal should be a CliError");
+        assert_eq!(cli_error.payload.code, "access_key_cannot_mount_folder");
+        assert_eq!(cli_error.exit_code, 77);
+    }
+
+    #[tokio::test]
+    async fn mount_key_is_never_refused_even_on_a_machine_with_no_credential_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        MockDaemon::new()
+            .route(
+                "POST",
+                "/mount",
+                200,
+                r#"{"folder_id":"folder-1","path":"/tmp/data"}"#,
+            )
+            .spawn(&socket_path, 1);
+
+        let result = cmd_mount(
+            MountArgs {
+                path: "/tmp/data".into(),
+                folder: None,
+                key: Some("a-token".into()),
+                new: false,
+            },
+            true,
+        )
+        .await;
+
+        restore_home(previous_home);
+
+        assert!(
+            result.is_ok(),
+            "mount --key must never be refused, even with no prior credential: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_is_refused_locally_on_an_access_key_machine_when_the_covering_mount_is_read_only(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+
+        let mount_dir = dir.path().join("Design");
+        fs::create_dir_all(&mount_dir).unwrap();
+        let mount_dir = fs::canonicalize(&mount_dir).unwrap();
+        let file_path = mount_dir.join("report.md");
+        fs::write(&file_path, "content").unwrap();
+        write_mount(mount_dir.to_str().unwrap(), "folder-1", None, false);
+
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        MockDaemon::new()
+            .route("GET", "/status", 200, ACCESS_KEY_STATUS)
+            .spawn(&socket_path, 1);
+
+        let result = cmd_restore(
+            file_path.to_str().unwrap().to_owned(),
+            "version-1".into(),
+            false,
+        )
+        .await;
+
+        restore_home(previous_home);
+
+        let error = result.unwrap_err();
+        let cli_error = error
+            .downcast_ref::<CliError>()
+            .expect("a read-only access key should refuse with a CliError");
+        assert_eq!(cli_error.payload.code, "access_key_is_read_only");
+        assert_eq!(cli_error.exit_code, 77);
+    }
+
+    #[tokio::test]
+    async fn restore_is_unaffected_when_the_covering_mount_is_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+
+        let mount_dir = dir.path().join("Design");
+        fs::create_dir_all(&mount_dir).unwrap();
+        let mount_dir = fs::canonicalize(&mount_dir).unwrap();
+        let file_path = mount_dir.join("report.md");
+        fs::write(&file_path, "content").unwrap();
+        write_mount(mount_dir.to_str().unwrap(), "folder-1", None, true);
+
+        let result = refuse_if_access_key_restore_is_read_only(file_path.to_str().unwrap()).await;
+
+        restore_home(previous_home);
+
+        assert!(result.is_ok(), "a writable mount must never be refused: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn unmount_of_the_only_key_on_the_machine_requires_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+
+        let mount_dir = dir.path().join("Design");
+        fs::create_dir_all(&mount_dir).unwrap();
+        let mount_dir = fs::canonicalize(&mount_dir).unwrap();
+        write_mount(mount_dir.to_str().unwrap(), "folder-1", Some("mount-token"), true);
+
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        MockDaemon::new()
+            .route("GET", "/status", 200, ACCESS_KEY_STATUS)
+            .spawn(&socket_path, 1);
+
+        let result = cmd_unmount(mount_dir.to_str().unwrap().to_owned(), false, false).await;
+
+        restore_home(previous_home);
+
+        let error = result.unwrap_err();
+        let cli_error = error
+            .downcast_ref::<CliError>()
+            .expect("an unconfirmed destructive unmount should be a CliError");
+        assert_eq!(cli_error.payload.code, "confirmation_required");
+    }
+
+    #[tokio::test]
+    async fn unmount_does_not_warn_when_another_local_mount_still_holds_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+
+        let mount_dir = dir.path().join("Design");
+        fs::create_dir_all(&mount_dir).unwrap();
+        let mount_dir = fs::canonicalize(&mount_dir).unwrap();
+        write_mount(mount_dir.to_str().unwrap(), "folder-1", Some("mount-token-1"), true);
+        let other_dir = dir.path().join("Assets");
+        fs::create_dir_all(&other_dir).unwrap();
+        let other_dir = fs::canonicalize(&other_dir).unwrap();
+        write_mount(other_dir.to_str().unwrap(), "folder-2", Some("mount-token-2"), true);
+
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        MockDaemon::new()
+            .route("GET", "/status", 200, ACCESS_KEY_STATUS)
+            .route("DELETE", "/mount", 204, "")
+            .spawn(&socket_path, 2);
+
+        let result = cmd_unmount(mount_dir.to_str().unwrap().to_owned(), false, false).await;
+
+        restore_home(previous_home);
+
+        assert!(
+            result.is_ok(),
+            "unmounting one of two key-holding mounts must not require confirmation: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unmount_is_unaffected_on_an_account_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+
+        let mount_dir = dir.path().join("Design");
+        fs::create_dir_all(&mount_dir).unwrap();
+        let mount_dir = fs::canonicalize(&mount_dir).unwrap();
+        write_mount(mount_dir.to_str().unwrap(), "folder-1", Some("mount-token"), true);
+
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        MockDaemon::new()
+            .route("GET", "/status", 200, ACCOUNT_STATUS)
+            .route("DELETE", "/mount", 204, "")
+            .spawn(&socket_path, 2);
+
+        let result = cmd_unmount(mount_dir.to_str().unwrap().to_owned(), false, false).await;
+
+        restore_home(previous_home);
+
+        assert!(
+            result.is_ok(),
+            "an account machine's device_token credential must not trigger the warning: {result:?}"
+        );
+    }
+
+    fn mount_status_json(pending_ops: u64, error: Option<&str>) -> String {
+        let error_field = match error {
+            Some(error) => format!(r#","error":"{error}""#),
+            None => String::new(),
+        };
+        format!(
+            r#"{{"path":"/tmp/x","folder_id":"folder-1","name":"Design","can_write":true,"syncing":false,"pending_ops":{pending_ops},"last_synced_at":null,"update_required":false{error_field}}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn sync_settles_as_soon_as_pending_ops_is_zero_and_the_pass_has_no_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let status_body = format!(
+            r#"{{"paused":false,"backend_connected":true,"version":"0.1.0","update_required":false,"mounts":[{}],"credential":"account"}}"#,
+            mount_status_json(0, None)
+        );
+        MockDaemon::new()
+            .route(
+                "POST",
+                "/sync",
+                200,
+                r#"{"creates_submitted":0,"versions_submitted":0,"deletes_submitted":0,"pulled_ops":0,"errors":0}"#,
+            )
+            .route("GET", "/status", 200, status_body)
+            .spawn(&socket_path, 2);
+
+        let result = run_sync_barrier(
+            None,
+            "every mounted folder",
+            None,
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        restore_home(previous_home);
+
+        assert!(result.is_ok(), "an already-settled folder should return immediately: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn sync_times_out_when_pending_ops_never_reaches_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let status_body = format!(
+            r#"{{"paused":false,"backend_connected":true,"version":"0.1.0","update_required":false,"mounts":[{}],"credential":"account"}}"#,
+            mount_status_json(3, None)
+        );
+        MockDaemon::new()
+            .route(
+                "POST",
+                "/sync",
+                200,
+                r#"{"creates_submitted":0,"versions_submitted":0,"deletes_submitted":0,"pulled_ops":0,"errors":0}"#,
+            )
+            .route("GET", "/status", 200, status_body)
+            .spawn(&socket_path, 200);
+
+        let result = run_sync_barrier(
+            None,
+            "every mounted folder",
+            None,
+            Duration::from_millis(300),
+            Duration::from_millis(40),
+        )
+        .await;
+
+        restore_home(previous_home);
+
+        let error = result.unwrap_err();
+        let cli_error = error
+            .downcast_ref::<CliError>()
+            .expect("a barrier that never settles should time out with a CliError");
+        assert_eq!(cli_error.payload.code, "sync_timed_out");
+        assert_eq!(cli_error.exit_code, 75);
+    }
+
+    #[tokio::test]
+    async fn sync_fails_the_barrier_when_a_mount_enters_an_error_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let status_body = format!(
+            r#"{{"paused":false,"backend_connected":true,"version":"0.1.0","update_required":false,"mounts":[{}],"credential":"account"}}"#,
+            mount_status_json(0, Some("quota_exceeded"))
+        );
+        MockDaemon::new()
+            .route(
+                "POST",
+                "/sync",
+                200,
+                r#"{"creates_submitted":0,"versions_submitted":0,"deletes_submitted":0,"pulled_ops":0,"errors":0}"#,
+            )
+            .route("GET", "/status", 200, status_body)
+            .spawn(&socket_path, 2);
+
+        let result = run_sync_barrier(
+            None,
+            "every mounted folder",
+            None,
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        restore_home(previous_home);
+
+        let error = result.unwrap_err();
+        let cli_error = error
+            .downcast_ref::<CliError>()
+            .expect("a mount error should fail the barrier with a CliError");
+        assert_eq!(cli_error.payload.code, "sync_mount_error");
+        assert_eq!(cli_error.exit_code, 1);
+        assert!(cli_error.payload.message.contains("quota_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn sync_retries_after_a_transient_pass_error_and_settles_once_a_pass_comes_back_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let dirty_status_body = format!(
+            r#"{{"paused":false,"backend_connected":true,"version":"0.1.0","update_required":false,"mounts":[{}],"credential":"account"}}"#,
+            mount_status_json(1, None)
+        );
+        let clean_status_body = format!(
+            r#"{{"paused":false,"backend_connected":true,"version":"0.1.0","update_required":false,"mounts":[{}],"credential":"account"}}"#,
+            mount_status_json(0, None)
+        );
+        MockDaemon::new()
+            .route(
+                "POST",
+                "/sync",
+                200,
+                r#"{"creates_submitted":0,"versions_submitted":0,"deletes_submitted":0,"pulled_ops":0,"errors":1}"#,
+            )
+            .route(
+                "POST",
+                "/sync",
+                200,
+                r#"{"creates_submitted":1,"versions_submitted":0,"deletes_submitted":0,"pulled_ops":0,"errors":0}"#,
+            )
+            .route("GET", "/status", 200, dirty_status_body)
+            .route("GET", "/status", 200, clean_status_body)
+            .spawn(&socket_path, 4);
+
+        let result = run_sync_barrier(
+            None,
+            "every mounted folder",
+            None,
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+        )
+        .await;
+
+        restore_home(previous_home);
+
+        let summary = result.expect(
+            "a transient per-pass error must not settle immediately, but a later clean pass must",
+        );
+        assert_eq!(summary.creates_submitted, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_never_settles_when_every_pass_reports_errors_and_times_out_instead_of_exiting_0()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let status_body = format!(
+            r#"{{"paused":false,"backend_connected":true,"version":"0.1.0","update_required":false,"mounts":[{}],"credential":"account"}}"#,
+            mount_status_json(1, None)
+        );
+        MockDaemon::new()
+            .route(
+                "POST",
+                "/sync",
+                200,
+                r#"{"creates_submitted":0,"versions_submitted":0,"deletes_submitted":0,"pulled_ops":0,"errors":1}"#,
+            )
+            .route("GET", "/status", 200, status_body)
+            .spawn(&socket_path, 200);
+
+        let result = run_sync_barrier(
+            None,
+            "every mounted folder",
+            None,
+            Duration::from_millis(300),
+            Duration::from_millis(40),
+        )
+        .await;
+
+        restore_home(previous_home);
+
+        let error = result.expect_err(
+            "a pass that never comes back clean must not exit 0: it must retry until the bound, then fail",
+        );
+        let cli_error = error
+            .downcast_ref::<CliError>()
+            .expect("a barrier that never settles should time out with a CliError");
+        assert_eq!(cli_error.payload.code, "sync_timed_out");
+        assert_eq!(cli_error.exit_code, 75);
     }
 }

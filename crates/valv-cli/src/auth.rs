@@ -31,7 +31,7 @@ pub(crate) struct PairingCallback {
     pub(crate) device_token: String,
 }
 
-pub(crate) async fn cmd_auth_login(args: AuthLoginArgs) -> Result<()> {
+pub(crate) async fn cmd_auth_login(args: AuthLoginArgs, json: bool) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .context("bind local auth callback listener")?;
@@ -60,7 +60,14 @@ pub(crate) async fn cmd_auth_login(args: AuthLoginArgs) -> Result<()> {
         &callback.device_token,
         &args.device_name,
     )?;
-    println!("Signed in as device {}", callback.device_id);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({ "device_id": callback.device_id }))?
+        );
+    } else {
+        println!("Signed in as device {}", callback.device_id);
+    }
     Ok(())
 }
 
@@ -71,7 +78,7 @@ where
     match timeout(timeout_duration, callback).await {
         Ok(result) => result,
         Err(_) => {
-            eprintln!("Timed out waiting for sign-in. Run `valv auth login` again.");
+            eprintln!("Timed out waiting for sign-in. Run `valv login` again.");
             Err(anyhow!("timed out waiting for sign-in"))
         }
     }
@@ -190,7 +197,7 @@ fn default_web_base_url() -> String {
     std::env::var("VALV_WEB_BASE_URL").unwrap_or_else(|_| "https://valvsync.com".to_owned())
 }
 
-fn default_backend_url() -> String {
+pub(crate) fn default_backend_url() -> String {
     std::env::var("VALV_BACKEND_URL").unwrap_or_else(|_| "https://api.valvsync.com".to_owned())
 }
 
@@ -203,13 +210,13 @@ pub(crate) fn default_auth_login_args(open_browser: bool) -> AuthLoginArgs {
     }
 }
 
-fn default_device_name() -> String {
+pub(crate) fn default_device_name() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "Valv Device".to_owned())
 }
 
-fn set_owner_only_permissions(path: &Path) -> Result<()> {
+pub(crate) fn set_owner_only_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

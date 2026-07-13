@@ -1,6 +1,6 @@
 # valv-cli
 
-`valv-cli` builds the `valv` command-line tool. Daemon operations (mount, status, pause/resume, sync, versions, restore) go through the local `valvd` control API; auth and grant commands call the Core backend directly using the configured device token.
+`valv-cli` builds the `valv` command-line tool. Daemon operations (mount, unmount, status, pause/resume, sync, versions, restore) go through the local `valvd` control API; `login` and sharing commands (`share`, `unshare`) call the Core backend directly using the configured device token.
 
 ## Install
 
@@ -29,8 +29,8 @@ The debug binaries are written to `./target/debug/valv` and `./target/debug/valv
 ## Prerequisites
 
 - A running Core backend (hosted at `https://api.valvsync.com` by default, or your own self-hosted instance; see [`../../core/README.md`](../../core/README.md)).
-- A registered device: either `valv auth login` (browser flow) or a manually written `~/.config/valv/config.toml`.
-- A running `valvd` daemon for `mount`, `unmount`, `status`, `pause`, `resume`, `sync`, `versions`, and `restore`.
+- A registered device: either `valv login` (browser flow) or a manually written `~/.config/valv/config.toml`.
+- A running `valvd` daemon for `mount`, `unmount`, `status`, `pause`, `resume`, `sync`, `versions`, and `restore`. Any daemon-bound command starts it automatically; there is no separate install step.
 
 During development, start the daemon in the foreground from `crates/`:
 
@@ -45,10 +45,12 @@ The CLI talks to the daemon over the Unix socket at `~/.local/share/valv/valvd.s
 Preferred: browser-based login writes the config file for you.
 
 ```bash
-valv auth login
+valv login
 ```
 
 By default this opens `https://valvsync.com/login` and stores the resulting `backend_url` and `device_token` against the hosted Core backend at `https://api.valvsync.com`. Pass `--web-base-url`, `--backend-url`, or `--device-name` to point at a self-hosted deployment or set a custom device name, and `--no-open` to print the login URL instead of opening a browser.
+
+There is also a credential-less path for machines that only ever hold a folder-scoped access key: `valv mount <path> --key <token>` writes a bare `config.toml` (no `device_token`) itself and redeems the token directly, with no `login` step at all.
 
 Manual, for self-hosting and development: create `~/.config/valv/config.toml` after registering a device with the Core backend:
 
@@ -62,42 +64,43 @@ The daemon's config may include additional fields such as `device_id`, `device_n
 ## Commands
 
 ```bash
-valv auth login
-valv auth login --web-base-url <url> --backend-url <url> --device-name <name>
-valv auth login --no-open
+valv login
+valv login --web-base-url <url> --backend-url <url> --device-name <name>
+valv login --no-open
 ```
 
-Signs in this device through the browser and writes `config.toml`, or prints the login URL with `--no-open`.
+Signs in this device through the browser and writes `config.toml`, or prints the login URL with `--no-open`. Ensures the daemon itself first, same as every other daemon-bound command.
 
 ```bash
 valv status
 valv status --json
 ```
 
-Prints daemon connectivity, pause state, and an aligned human-readable table of mounted folders (sync state, pending operation count, last sync time, error), or a JSON `DaemonStatus` object with `--json`.
+The one command guaranteed to work with the daemon down. Prints the signed-in principal, daemon connectivity/pause state, and an aligned table of every folder this principal can reach: `folder_id`, `name`, `access`, local `path` (or `not mounted`), and `sync_state`. `--json` returns a JSON object instead.
 
 ```bash
-valv mount <path>
-valv mount <path> --folder <folder-id>
-valv mount <path> --grant <grant-token>
+valv mount <path> --folder <folder-id-or-name>
+valv mount <path> --key <token>
+valv mount <path> --new
 ```
 
-Mounts a new folder at `<path>`, mounts an existing folder by ID, or mounts a folder using a one-time grant token. `--folder` and `--grant` are mutually exclusive.
+Attaches a folder you can already reach by id or name, redeems an access key and attaches the folder it grants, or creates a new folder from `<path>`'s contents. Exactly one of `--folder`, `--key`, `--new` is required.
 
 ```bash
-valv unmount --folder <folder-id>
+valv unmount <path>
+valv unmount <path> --yes
 ```
 
-Unmounts locally only: does not delete the shared folder, its grants, or the locally materialized files.
+Unmounts locally only: does not delete the shared folder, its grants, or the locally materialized files. `--yes` skips the confirmation prompt.
 
 ```bash
 valv pause
 valv resume
 valv sync
-valv sync --folder <folder-id>
+valv sync <path>
 ```
 
-Pauses all sync work, resumes sync work, or asks the daemon to run a sync pass. `--folder` limits the sync request to one folder.
+Pauses all sync work, resumes sync work, or asks the daemon to run sync passes until nothing is pending. `sync` is a barrier: it blocks and retries until a clean pass, or a bounded timeout (exit `75`). Omit `<path>` to settle every mounted folder, or pass one to settle just the folder that covers it.
 
 ```bash
 valv versions <path>
@@ -113,55 +116,50 @@ valv restore <path> <version-id>
 Restores the file at `<path>` to the version id shown by `valv versions <path>`.
 
 ```bash
-valv grants
-valv grants <folder-path>
-valv grants --json
+valv share <path>
 ```
 
-Lists grants for the first mounted folder, or for the mounted folder containing `<folder-path>`. The human table shows `grant_id`, `scope`, `grantee`, `role`, `can_read`, `can_write`; `--json` returns the same data as JSON.
+Lists everyone and everything that can reach the folder covering `<path>`: people, access keys, and pending invites, each with an id, scope, and permission.
 
 ```bash
-valv grant create <node-path> --to <email>
+valv share <path> --to <email> [--read-only]
+valv share <path> --key <name> [--read-only]
 ```
 
-Creates a user invite for the node at `<node-path>` and prints an invite URL. The path must be inside a mounted folder and present in the local mirror.
+Invites a person by email, or mints a named access key for a machine, to the folder covering `<path>`. Read/write is the default; `--read-only` restricts it. The access key's one-time token is printed once and cannot be retrieved again.
 
 ```bash
-valv grant create <node-path> --device <name>
-valv grant create <node-path> --device <name> --read-only
-valv grant create <node-path> --device <name> --write
+valv unshare <path> --to <email> [--yes]
+valv unshare <path> --key <name> [--yes]
+valv unshare <path> --id <id> [--yes]
 ```
 
-Creates a device grant and prints the device token, grant ID, and device ID. Store the device token immediately; it cannot be retrieved again. Grants are writable by default unless `--read-only` is passed; `--write` is accepted for symmetry but is already the default.
+Revokes a person's, machine's, or pending invite's access to the folder covering `<path>`. `--id` (printed by `valv share <path>`) is required under `--json`, since a handle like `--to`/`--key` is a query, not a pinned reference.
 
 ```bash
-valv grant revoke <grant-id>
-```
-
-Revokes an existing grant by ID.
-
-```bash
-valv daemon install
+valv daemon restart
 valv daemon uninstall
 ```
 
-Delegates service installation and removal to the sibling `valvd` binary (or `/usr/local/bin/valvd` if none is found next to `valv`): a launchd LaunchAgent on macOS, a systemd user service on Linux. In development, prefer `./target/debug/valvd run` so logs stay in the foreground.
+Delegates to the sibling `valvd` binary (or `/usr/local/bin/valvd` if none is found next to `valv`): `restart` stops, reinstalls, and verifies the daemon service is serving; `uninstall` stops and removes it. There is no `valv daemon install`: any daemon-bound command installs and starts the daemon itself the first time it runs. In development, prefer `./target/debug/valvd run` so logs stay in the foreground.
 
 ```bash
 valv update
-valv update --check
 ```
 
-Downloads, checksum-verifies, and installs the latest released `valv` (and `valvd`, if a `valvd` sibling binary is present) next to the current binaries, restarting the daemon if it was updated. `--check` reports whether a newer version is available without installing anything. On macOS, if `valv` runs from the Valv app's managed install location, or the registered daemon LaunchAgent points there, `update` prints a notice and leaves app-managed binaries untouched instead.
+Downloads, checksum-verifies, and installs the latest released `valv` (and `valvd`, if a `valvd` sibling binary is present) next to the current binaries, restarting the daemon if it was updated. There is no `--check`: it always applies an available update. On macOS, if `valv` runs from the Valv app's managed install location, or the registered daemon LaunchAgent points there, `update` prints a notice and leaves app-managed binaries untouched instead.
 
-Add the global `--json` flag before the subcommand (`valv --json status`) on `status`, `versions`, and `grants` to get machine-readable output instead of the aligned human table; other commands do not change their output based on `--json`.
+`--json` is a **global** flag honored by every command, and may precede or follow the subcommand (`valv --json status` or `valv status --json`).
 
 ## Troubleshooting
 
-- `Daemon is not running. Start it with: valv daemon install`: no Unix socket was found at `~/.local/share/valv/valvd.sock`. Start `valvd`, or install it as a service with `valv daemon install`.
-- `Not signed in. Run: valv auth login`: no `~/.config/valv/config.toml` was found. Run `valv auth login`, or create the file with `backend_url` and `device_token` set.
-- `Missing backend_url in config.toml` / `Missing device_token in config.toml`: `config.toml` exists but is missing one of the required fields. This is what you get if `valv daemon install` wrote the config template (which leaves `device_token` empty) and you have not signed in yet. Run `valv auth login`.
-- `--folder and --grant are mutually exclusive`: pass only one of `--folder` or `--grant` to `valv mount`.
-- `path is not inside a mounted folder`: use a path under a folder that `valvd` has mounted.
-- `path is not present in the local mirror`: wait for sync to discover the path, or run `valv sync` and retry.
+- `daemon_not_running` (exit `75`): rare, since `ensure_daemon()` normally installs and starts the daemon before any command runs. Retry, or run `valv daemon restart`.
+- `not_configured`: no `~/.config/valv/config.toml` was found. Run `valv login`, or `valv mount <path> --key <token>` if you have an access key.
+- `no_credential`: `config.toml` exists but has no usable `device_token` (and, for bare `share <path>`, the current mount has no token either). Run `valv login`.
+- `mount_source_required`: pass exactly one of `--folder <id|name>`, `--key <token>`, or `--new` to `valv mount`.
+- `path_not_mounted`: use a path under a folder that `valvd` has mounted.
+- `path_not_in_mirror`: run `valv sync` so the daemon populates the mirror, then retry.
+- `backend_unreachable` (exit `75`): the backend couldn't be reached (connection refused, DNS failure, timeout). Retry with backoff.
 - `valvd is managed by the Valv app — update the app instead`: on a machine with the Valv macOS app installed, `valv update` will not replace the app-managed daemon; update through the app.
+
+See [`../../skills/valv-cli-usage/SKILL.md`](../../skills/valv-cli-usage/SKILL.md) for the full error-code reference.

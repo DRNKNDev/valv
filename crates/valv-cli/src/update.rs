@@ -1,4 +1,3 @@
-
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -18,14 +17,28 @@ use crate::daemon::daemon_client;
 #[cfg(target_os = "macos")]
 use crate::paths::{app_managed_bin_dir, launch_agent_plist_path};
 
-const APP_MANAGED_NOTICE: &str = "valvd is managed by the Valv app — update the app instead";
+const APP_MANAGED_NOTICE: &str = "valvd is managed by the Valv app. Update the app instead.";
 const RESTART_POLL_TIMEOUT: Duration = Duration::from_secs(10);
 const RESTART_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-pub(crate) async fn cmd_update(check: bool) -> Result<()> {
+fn emit(json: bool, human_lines: &[String], value: serde_json::Value) {
+    if json {
+        println!("{value}");
+    } else {
+        for line in human_lines {
+            println!("{line}");
+        }
+    }
+}
+
+pub(crate) async fn cmd_update(json: bool) -> Result<()> {
     let guard = check_managed_install_guard()?;
     if guard == ManagedInstallGuard::FullAbort {
-        println!("{APP_MANAGED_NOTICE}");
+        emit(
+            json,
+            &[APP_MANAGED_NOTICE.to_owned()],
+            serde_json::json!({"result": "app_managed"}),
+        );
         return Ok(());
     }
     let daemon_is_app_managed = guard == ManagedInstallGuard::DaemonManaged;
@@ -38,21 +51,13 @@ pub(crate) async fn cmd_update(check: bool) -> Result<()> {
             .await
             .context("failed to resolve the latest valv release")?;
 
-    match plan_update(current_version, &latest_version, check, pinned) {
+    match plan_update(current_version, &latest_version, pinned) {
         UpdatePlan::AlreadyUpToDate => {
-            println!("valv is already up to date ({current_version})");
-            return Ok(());
-        }
-        UpdatePlan::ReportOnly => {
-            if pinned {
-                println!(
-                    "valv {latest_version} is pinned via VALV_VERSION and would be installed. Run 'valv update' to install it."
-                );
-            } else {
-                println!(
-                    "A newer version of valv is available ({latest_version}). Run 'valv update' to install it."
-                );
-            }
+            emit(
+                json,
+                &[format!("valv is already up to date ({current_version})")],
+                serde_json::json!({"result": "up_to_date", "version": current_version}),
+            );
             return Ok(());
         }
         UpdatePlan::Install => {}
@@ -72,8 +77,7 @@ pub(crate) async fn cmd_update(check: bool) -> Result<()> {
     );
 
     let tarball_bytes = download_bytes(&client, &format!("{release_base}/{asset}")).await?;
-    let sha256sums_bytes =
-        download_bytes(&client, &format!("{release_base}/SHA256SUMS")).await?;
+    let sha256sums_bytes = download_bytes(&client, &format!("{release_base}/SHA256SUMS")).await?;
     let minisig_bytes =
         download_bytes(&client, &format!("{release_base}/SHA256SUMS.minisig")).await?;
 
@@ -106,12 +110,48 @@ pub(crate) async fn cmd_update(check: bool) -> Result<()> {
     }
 
     if daemon_is_app_managed {
-        println!("Updated valv: {current_version} -> {latest_version}");
-        println!("{APP_MANAGED_NOTICE}");
+        emit(
+            json,
+            &[
+                format!("Updated valv: {current_version} -> {latest_version}"),
+                APP_MANAGED_NOTICE.to_owned(),
+            ],
+            serde_json::json!({
+                "result": "updated",
+                "from": current_version,
+                "to": latest_version,
+                "valvd_restarted": false,
+                "daemon_app_managed": true,
+            }),
+        );
     } else if valvd_sibling_present {
-        println!("Updated valv and valvd: {current_version} -> {latest_version}");
+        emit(
+            json,
+            &[format!(
+                "Updated valv and valvd: {current_version} -> {latest_version}"
+            )],
+            serde_json::json!({
+                "result": "updated",
+                "from": current_version,
+                "to": latest_version,
+                "valvd_restarted": true,
+                "daemon_app_managed": false,
+            }),
+        );
     } else {
-        println!("Updated valv: {current_version} -> {latest_version} (no valvd sibling found; daemon not restarted)");
+        emit(
+            json,
+            &[format!(
+                "Updated valv: {current_version} -> {latest_version} (no valvd sibling found; daemon not restarted)"
+            )],
+            serde_json::json!({
+                "result": "updated",
+                "from": current_version,
+                "to": latest_version,
+                "valvd_restarted": false,
+                "daemon_app_managed": false,
+            }),
+        );
     }
     Ok(())
 }
@@ -119,21 +159,12 @@ pub(crate) async fn cmd_update(check: bool) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdatePlan {
     AlreadyUpToDate,
-    ReportOnly,
     Install,
 }
 
-fn plan_update(
-    current_version: &str,
-    latest_version: &str,
-    check: bool,
-    pinned: bool,
-) -> UpdatePlan {
+fn plan_update(current_version: &str, latest_version: &str, pinned: bool) -> UpdatePlan {
     if !pinned && !is_newer_version(latest_version, current_version) {
         return UpdatePlan::AlreadyUpToDate;
-    }
-    if check {
-        return UpdatePlan::ReportOnly;
     }
     UpdatePlan::Install
 }
@@ -159,7 +190,6 @@ fn handle_failed_restart(
         }
     }
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedInstallGuard {
@@ -189,7 +219,8 @@ fn check_managed_install_guard() -> Result<ManagedInstallGuard> {
     let app_bin_dir = app_managed_bin_dir().context("failed to resolve app-managed bin dir")?;
     let current_exe = env::current_exe().context("failed to determine current executable path")?;
 
-    let plist_path = launch_agent_plist_path().context("failed to resolve LaunchAgent plist path")?;
+    let plist_path =
+        launch_agent_plist_path().context("failed to resolve LaunchAgent plist path")?;
     let registered_valvd_path = read_registered_valvd_path(&plist_path);
 
     Ok(classify_managed_install(
@@ -237,7 +268,6 @@ fn xml_unescape(value: &str) -> String {
         .replace("&amp;", "&")
 }
 
-
 fn detect_target(os: &str, arch: &str) -> Result<&'static str> {
     match (os, arch) {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
@@ -255,7 +285,10 @@ async fn download_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> 
         .await
         .with_context(|| format!("failed to download {url}"))?;
     if !response.status().is_success() {
-        return Err(anyhow!("failed to download {url}: HTTP {}", response.status()));
+        return Err(anyhow!(
+            "failed to download {url}: HTTP {}",
+            response.status()
+        ));
     }
     Ok(response
         .bytes()
@@ -264,8 +297,13 @@ async fn download_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> 
         .to_vec())
 }
 
-fn verify_tarball_checksum(asset: &str, tarball_bytes: &[u8], sha256sums_bytes: &[u8]) -> Result<()> {
-    let sha256sums = std::str::from_utf8(sha256sums_bytes).context("SHA256SUMS is not valid UTF-8")?;
+fn verify_tarball_checksum(
+    asset: &str,
+    tarball_bytes: &[u8],
+    sha256sums_bytes: &[u8],
+) -> Result<()> {
+    let sha256sums =
+        std::str::from_utf8(sha256sums_bytes).context("SHA256SUMS is not valid UTF-8")?;
     let expected = checksum_for_asset(sha256sums, asset)
         .ok_or_else(|| anyhow!("SHA256SUMS does not contain {asset}"))?;
     let actual = sha256_hex(tarball_bytes);
@@ -295,7 +333,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn extract_tarball(tarball_bytes: &[u8]) -> Result<PathBuf> {
-    let extract_dir = env::temp_dir().join(format!("valv-update-{}", uuid::Uuid::new_v4().simple()));
+    let extract_dir =
+        env::temp_dir().join(format!("valv-update-{}", uuid::Uuid::new_v4().simple()));
     fs::create_dir_all(&extract_dir)
         .with_context(|| format!("failed to create {}", extract_dir.display()))?;
     let tarball_path = extract_dir.join("download.tar.gz");
@@ -315,7 +354,6 @@ fn extract_tarball(tarball_bytes: &[u8]) -> Result<PathBuf> {
     let _ = fs::remove_file(&tarball_path);
     Ok(extract_dir)
 }
-
 
 #[derive(Debug, Clone)]
 pub(crate) struct SwapBackup {
@@ -401,8 +439,11 @@ impl BinarySwap for UnixBinarySwap {
     fn rollback(&self, backup: &SwapBackup) -> Result<()> {
         rename_atomic(&backup.valv_backup, &backup.valv_current)
             .context("failed to roll back valv binary")?;
-        if let (Some(valvd_current), Some(valvd_backup)) = (&backup.valvd_current, &backup.valvd_backup) {
-            rename_atomic(valvd_backup, valvd_current).context("failed to roll back valvd binary")?;
+        if let (Some(valvd_current), Some(valvd_backup)) =
+            (&backup.valvd_current, &backup.valvd_backup)
+        {
+            rename_atomic(valvd_backup, valvd_current)
+                .context("failed to roll back valvd binary")?;
         }
         Ok(())
     }
@@ -458,7 +499,6 @@ fn platform_binary_swap() -> UnixBinarySwap {
 fn platform_binary_swap() -> WindowsBinarySwap {
     WindowsBinarySwap
 }
-
 
 #[cfg(target_os = "macos")]
 fn restart_daemon() -> Result<()> {
@@ -552,49 +592,24 @@ mod tests {
     #[test]
     fn plan_update_reports_already_up_to_date() {
         assert_eq!(
-            plan_update("0.2.0", "0.2.0", false, false),
+            plan_update("0.2.0", "0.2.0", false),
             UpdatePlan::AlreadyUpToDate
         );
         assert_eq!(
-            plan_update("0.2.0", "0.1.0", false, false),
+            plan_update("0.2.0", "0.1.0", false),
             UpdatePlan::AlreadyUpToDate
         );
     }
 
     #[test]
-    fn plan_update_check_reports_without_installing() {
-        assert_eq!(
-            plan_update("0.1.0", "0.2.0", true, false),
-            UpdatePlan::ReportOnly
-        );
-    }
-
-    #[test]
-    fn plan_update_installs_when_newer_and_not_check() {
-        assert_eq!(
-            plan_update("0.1.0", "0.2.0", false, false),
-            UpdatePlan::Install
-        );
+    fn plan_update_installs_when_newer() {
+        assert_eq!(plan_update("0.1.0", "0.2.0", false), UpdatePlan::Install);
     }
 
     #[test]
     fn plan_update_pin_installs_regardless_of_version_comparison() {
-        assert_eq!(
-            plan_update("0.2.0", "0.2.0", false, true),
-            UpdatePlan::Install
-        );
-        assert_eq!(
-            plan_update("0.2.0", "0.1.0", false, true),
-            UpdatePlan::Install
-        );
-    }
-
-    #[test]
-    fn plan_update_pin_with_check_reports_without_installing() {
-        assert_eq!(
-            plan_update("0.2.0", "0.1.0", true, true),
-            UpdatePlan::ReportOnly
-        );
+        assert_eq!(plan_update("0.2.0", "0.2.0", true), UpdatePlan::Install);
+        assert_eq!(plan_update("0.2.0", "0.1.0", true), UpdatePlan::Install);
     }
 
     #[test]
@@ -741,10 +756,7 @@ mod tests {
 
         assert_eq!(fs::read(install_dir.join("valv")).unwrap(), b"new valv");
         assert_eq!(fs::read(install_dir.join("valvd")).unwrap(), b"new valvd");
-        assert_eq!(
-            fs::read(install_dir.join("valv.old")).unwrap(),
-            b"old valv"
-        );
+        assert_eq!(fs::read(install_dir.join("valv.old")).unwrap(), b"old valv");
 
         swap.rollback(&backup).unwrap();
 
@@ -812,7 +824,11 @@ mod tests {
         let missing_staged_valvd = install_dir.join("staged-valvd-missing");
 
         let swap = UnixBinarySwap;
-        let result = swap.swap(install_dir, &staged_valv, Some(missing_staged_valvd.as_path()));
+        let result = swap.swap(
+            install_dir,
+            &staged_valv,
+            Some(missing_staged_valvd.as_path()),
+        );
 
         assert!(result.is_err());
         assert_eq!(

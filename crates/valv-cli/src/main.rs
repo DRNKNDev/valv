@@ -2,6 +2,7 @@ mod app;
 mod auth;
 mod config;
 mod daemon;
+mod error;
 mod grants;
 mod paths;
 mod table;
@@ -15,14 +16,18 @@ use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 #[cfg(test)]
 static LOOPBACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// HOME is process-global; this serializes tests that override it for a real config/socket path.
+#[cfg(test)]
+pub(crate) static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
     match app::run().await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("{}", format_error_chain(&error));
-            ExitCode::FAILURE
+        Err(failure) => {
+            tracing::debug!("{}", format_error_chain(&failure.error));
+            error::report(&failure.error, failure.json)
         }
     }
 }
@@ -43,15 +48,22 @@ mod tests {
     use anyhow::anyhow;
 
     use super::*;
-    use crate::daemon::DAEMON_NOT_RUNNING;
 
     #[test]
     fn format_error_chain_includes_context_and_root_cause() {
-        let error =
-            anyhow!(DAEMON_NOT_RUNNING).context("failed to create daemon client for status");
+        let error = anyhow!("daemon socket connect refused")
+            .context("failed to create daemon client for status");
         let output = format_error_chain(&error);
 
         assert!(output.contains("failed to create daemon client for status"));
-        assert!(output.contains(DAEMON_NOT_RUNNING));
+        assert!(output.contains("daemon socket connect refused"));
+    }
+
+    #[test]
+    fn format_error_chain_never_names_the_deleted_install_command() {
+        let error = crate::error::CliError::daemon_not_running();
+        let output = format_error_chain(&anyhow!(error));
+
+        assert!(!output.contains("valv daemon install"));
     }
 }
