@@ -27,6 +27,40 @@ pub struct AccountStatus {
     pub current_period_end: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Credential {
+    Account,
+    AccessKey,
+    None,
+    Pending,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalType {
+    Account,
+    AccessKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrincipalScope {
+    pub folder_id: String,
+    pub folder_name: String,
+    pub scope_label: String,
+    pub can_write: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrincipalStatus {
+    #[serde(rename = "type")]
+    pub principal_type: PrincipalType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    pub scopes: Vec<PrincipalScope>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub paused: bool,
@@ -40,6 +74,9 @@ pub struct DaemonStatus {
     pub latest_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_available: Option<bool>,
+    pub credential: Credential,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<PrincipalStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

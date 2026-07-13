@@ -21,7 +21,10 @@ use valv_sync::{
         versions::{self, upsert_version, LocalVersion},
     },
     protocol::{
-        ipc::{AccountStatus, SyncRequest, SyncSummary},
+        ipc::{
+            AccountStatus, PrincipalScope, PrincipalStatus, PrincipalType, SyncRequest,
+            SyncSummary,
+        },
         sync::{manifest_content_hash, ChunkRef, WsPushNotification},
     },
     storage::download_chunks,
@@ -35,7 +38,8 @@ use valv_sync::{
 };
 
 use crate::{
-    error::{backend_response_or_error, DaemonError},
+    control::compute_credential,
+    error::{backend_response_or_error, is_unauthenticated, require_token, DaemonError},
     DaemonState, MountState,
 };
 
@@ -94,7 +98,15 @@ async fn account_status_loop(state: DaemonState) {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         ticker.tick().await;
 
-        let outcome = poll_account_status_once(&state).await;
+        // Runs first so this tick can discover a device_token is actually a
+        // legacy access key before deciding whether to poll account/usage.
+        poll_principal_status_once(&state).await;
+        let outcome = if compute_credential(&state).await == valv_sync::protocol::ipc::Credential::Account {
+            poll_account_status_once(&state).await
+        } else {
+            *state.account.lock().await = None;
+            AccountPollOutcome::Unchanged
+        };
         period = if matches!(outcome, AccountPollOutcome::NotFound) {
             not_found_period
         } else {
@@ -111,9 +123,12 @@ enum AccountPollOutcome {
 }
 
 async fn poll_account_status_once(state: &DaemonState) -> AccountPollOutcome {
-    if state.config.backend_url.is_empty() || state.config.device_token.is_empty() {
+    if state.config.backend_url.is_empty() {
         return AccountPollOutcome::Unchanged;
     }
+    let Some(device_token) = non_empty_device_token(state) else {
+        return AccountPollOutcome::Unchanged;
+    };
 
     let response = state
         .client
@@ -121,7 +136,7 @@ async fn poll_account_status_once(state: &DaemonState) -> AccountPollOutcome {
             "{}/account/usage",
             valv_sync::api_base(&state.config.backend_url)
         ))
-        .bearer_auth(&state.config.device_token)
+        .bearer_auth(device_token)
         .send()
         .await;
     let response = match response {
@@ -150,6 +165,125 @@ async fn poll_account_status_once(state: &DaemonState) -> AccountPollOutcome {
         Err(error) => {
             tracing::warn!(error = %error, "account status poll returned an error");
             AccountPollOutcome::Unchanged
+        }
+    }
+}
+
+fn non_empty_device_token(state: &DaemonState) -> Option<&str> {
+    state
+        .config
+        .device_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+}
+
+async fn distinct_credential_tokens(state: &DaemonState) -> Vec<String> {
+    let mut tokens = Vec::new();
+    if let Some(token) = non_empty_device_token(state) {
+        tokens.push(token.to_owned());
+    }
+    let mounts = state.mounts.lock().await;
+    for mount in mounts.iter() {
+        if let Some(token) = &mount.mount_token {
+            if !tokens.contains(token) {
+                tokens.push(token.clone());
+            }
+        }
+    }
+    tokens
+}
+
+async fn mark_credential_rejected(state: &DaemonState, token: &str) {
+    if non_empty_device_token(state) == Some(token) {
+        state.device_token_rejected.store(true, Ordering::Release);
+    }
+    let mounts = state.mounts.lock().await;
+    for mount in mounts.iter() {
+        if mount.mount_token.as_deref() == Some(token) {
+            mount.rejected.store(true, Ordering::Release);
+        }
+    }
+}
+
+async fn clear_credential_rejected(state: &DaemonState, token: &str) {
+    if non_empty_device_token(state) == Some(token) {
+        state.device_token_rejected.store(false, Ordering::Release);
+    }
+    let mounts = state.mounts.lock().await;
+    for mount in mounts.iter() {
+        if mount.mount_token.as_deref() == Some(token) {
+            mount.rejected.store(false, Ordering::Release);
+        }
+    }
+}
+
+async fn poll_principal_status_once(state: &DaemonState) {
+    if state.config.backend_url.is_empty() {
+        return;
+    }
+    let tokens = distinct_credential_tokens(state).await;
+    if tokens.is_empty() {
+        *state.principal.lock().await = None;
+        return;
+    }
+
+    let mut principal_type: Option<PrincipalType> = None;
+    let mut email: Option<String> = None;
+    let mut scopes: Vec<PrincipalScope> = Vec::new();
+    let mut resolved_any = false;
+
+    for token in &tokens {
+        let response = state
+            .client
+            .get(format!("{}/me", valv_sync::api_base(&state.config.backend_url)))
+            .bearer_auth(token)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(error = %error, "principal poll failed");
+                continue;
+            }
+        };
+        if response.status() == StatusCode::UNAUTHORIZED {
+            mark_credential_rejected(state, token).await;
+            continue;
+        }
+        let principal = match backend_response_or_error(response).await {
+            Ok(response) => match response.json::<PrincipalStatus>().await {
+                Ok(principal) => principal,
+                Err(error) => {
+                    tracing::warn!(error = %error, "principal response decode failed");
+                    continue;
+                }
+            },
+            Err(error) => {
+                tracing::warn!(error = %error, "principal poll returned an error");
+                continue;
+            }
+        };
+        clear_credential_rejected(state, token).await;
+        resolved_any = true;
+        match principal.principal_type {
+            PrincipalType::Account => {
+                principal_type = Some(PrincipalType::Account);
+                email = principal.email.or(email);
+            }
+            PrincipalType::AccessKey => {
+                principal_type.get_or_insert(PrincipalType::AccessKey);
+                scopes.extend(principal.scopes);
+            }
+        }
+    }
+
+    if resolved_any {
+        if let Some(principal_type) = principal_type {
+            *state.principal.lock().await = Some(PrincipalStatus {
+                principal_type,
+                email,
+                scopes,
+            });
         }
     }
 }
@@ -225,8 +359,15 @@ fn apply_update_check_outcome(
 }
 
 pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState) {
+    let Some(token) = mount.effective_token(&state.config).map(str::to_owned) else {
+        tracing::warn!(
+            folder_id = %mount.folder_id,
+            path = %mount.path,
+            "mount has no usable credential; not spawning sync tasks"
+        );
+        return;
+    };
     let (notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(32);
-    let token = mount.effective_token(&state.config).to_owned();
 
     let sync_state = state.clone();
     let sync_mount = mount.clone();
@@ -337,11 +478,14 @@ async fn sync_loop(
 }
 
 async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
+    let Some(token) = mount.effective_token(&state.config).map(str::to_owned) else {
+        end_mount_sync(state, &mount.folder_id, Some("mount_has_no_credential".to_owned())).await;
+        return;
+    };
     let _sync_guard = mount.sync_lock.lock().await;
     begin_mount_sync(state, &mount.folder_id).await;
     let result = {
         let mut conn = state.db.lock().await;
-        let token = mount.effective_token(&state.config).to_owned();
         pull_delta(
             &state.client,
             &state.config.backend_url,
@@ -354,6 +498,7 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
     let error = match result {
         Ok((_, pulled)) => {
             state.backend_health.record_success();
+            clear_credential_rejected(state, &token).await;
             let was_paused = pause_watchers(state);
             let cleanup_error = cleanup_deleted_mount_paths(state, mount)
                 .await
@@ -371,6 +516,9 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
             if is_update_required(&err).is_some() {
                 state.backend_health.record_success();
                 mark_mount_update_required(state, &mount.folder_id).await;
+            } else if is_unauthenticated(&err) {
+                state.backend_health.record_success();
+                mark_credential_rejected(state, &token).await;
             } else {
                 state.backend_health.record_failure();
             }
@@ -385,13 +533,18 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
 }
 
 async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary {
+    let mut summary = SyncSummary::default();
+    let Some(token) = mount.effective_token(&state.config).map(str::to_owned) else {
+        summary.errors += 1;
+        end_mount_sync(state, &mount.folder_id, Some("mount_has_no_credential".to_owned())).await;
+        return summary;
+    };
     let _sync_guard = mount.sync_lock.lock().await;
     begin_mount_sync(state, &mount.folder_id).await;
     if mount.update_required {
         mount.update_required_flag.store(true, Ordering::Release);
     }
 
-    let mut summary = SyncSummary::default();
     let push_result = push_local_with_update_required(
         PathBuf::from(&mount.path).as_path(),
         &mount.folder_id,
@@ -399,7 +552,7 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
         &state.db,
         &state.client,
         &state.config.backend_url,
-        mount.effective_token(&state.config),
+        &token,
         &state.config.device_name,
         &mount.update_required_flag,
     )
@@ -407,6 +560,7 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
     match push_result {
         Ok(push_summary) => {
             merge_push_summary(&mut summary, &push_summary);
+            clear_credential_rejected(state, &token).await;
             set_mount_pending_ops(
                 state,
                 &mount.folder_id,
@@ -428,6 +582,12 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
                 end_mount_sync(state, &mount.folder_id, Some(error.to_string())).await;
                 return summary;
             }
+            if is_unauthenticated(&error) {
+                state.backend_health.record_success();
+                mark_credential_rejected(state, &token).await;
+            } else {
+                state.backend_health.record_failure();
+            }
             tracing::error!(
                 folder_id = %mount.folder_id,
                 error = %error,
@@ -439,7 +599,6 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
 
     let pull_result = {
         let mut conn = state.db.lock().await;
-        let token = mount.effective_token(&state.config).to_owned();
         pull_delta(
             &state.client,
             &state.config.backend_url,
@@ -452,6 +611,7 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
     let error = match pull_result {
         Ok((pulled_ops, pulled)) => {
             state.backend_health.record_success();
+            clear_credential_rejected(state, &token).await;
             summary.pulled_ops = pulled_ops;
             let was_paused = pause_watchers(state);
             if let Err(error) =
@@ -479,6 +639,9 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
             if is_update_required(&error).is_some() {
                 state.backend_health.record_success();
                 mark_mount_update_required(state, &mount.folder_id).await;
+            } else if is_unauthenticated(&error) {
+                state.backend_health.record_success();
+                mark_credential_rejected(state, &token).await;
             } else {
                 state.backend_health.record_failure();
             }
@@ -844,7 +1007,7 @@ async fn download_verified_version(
     version_id: &str,
 ) -> anyhow::Result<(RemoteVersion, Vec<u8>)> {
     let version = fetch_remote_version(state, mount, node_id, version_id).await?;
-    let token = mount.effective_token(&state.config).to_owned();
+    let token = require_token(mount.effective_token(&state.config))?;
     let bytes = download_chunks(
         &state.client,
         &state.config.backend_url,
@@ -1176,7 +1339,7 @@ async fn fetch_remote_version(
     node_id: &str,
     version_id: &str,
 ) -> anyhow::Result<RemoteVersion> {
-    let token = mount.effective_token(&state.config).to_owned();
+    let token = require_token(mount.effective_token(&state.config))?;
     let versions = state
         .client
         .get(format!(
@@ -1311,6 +1474,8 @@ mod tests {
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            principal: Arc::new(Mutex::new(None)),
+            device_token_rejected: Arc::new(AtomicBool::new(false)),
             update_status: Arc::new(Mutex::new(Default::default())),
             backend_health: Arc::new(crate::BackendHealth::default()),
             pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -1320,7 +1485,7 @@ mod tests {
             config: DaemonConfig {
                 backend_url: "http://127.0.0.1:1".to_owned(),
                 device_id: "device-1".to_owned(),
-                device_token: "token".to_owned(),
+                device_token: Some("token".to_owned()),
                 device_name: "Test Device".to_owned(),
                 mounts: Vec::new(),
             },
@@ -2028,6 +2193,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_principal_status_once_resolves_access_key_and_its_scope() {
+        let mut state = test_state();
+        state.config.device_token = None;
+        let mount = test_access_key_mount("mount-token-1");
+        *state.mounts.lock().await = vec![mount];
+        state.config.backend_url = account_usage_server(
+            "200 OK",
+            r#"{"type":"access_key","scopes":[{"folder_id":"folder-1","folder_name":"Design","scope_label":"Design","can_write":true}]}"#,
+        )
+        .await;
+
+        poll_principal_status_once(&state).await;
+
+        let principal = state.principal.lock().await.clone().unwrap();
+        assert_eq!(principal.principal_type, PrincipalType::AccessKey);
+        assert!(principal.email.is_none());
+        assert_eq!(principal.scopes.len(), 1);
+        assert_eq!(principal.scopes[0].folder_name, "Design");
+    }
+
+    #[tokio::test]
+    async fn poll_principal_status_once_marks_mount_rejected_on_401() {
+        let mut state = test_state();
+        state.config.device_token = None;
+        let mount = test_access_key_mount("mount-token-1");
+        let rejected_flag = mount.rejected.clone();
+        *state.mounts.lock().await = vec![mount];
+        state.config.backend_url =
+            account_usage_server("401 Unauthorized", r#"{"error":"unauthenticated"}"#).await;
+
+        poll_principal_status_once(&state).await;
+
+        assert!(rejected_flag.load(Ordering::Acquire));
+        assert!(state.principal.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn poll_principal_status_once_clears_stale_principal_when_no_tokens_remain() {
+        let mut state = test_state();
+        state.config.device_token = None;
+        *state.principal.lock().await = Some(PrincipalStatus {
+            principal_type: PrincipalType::AccessKey,
+            email: None,
+            scopes: Vec::new(),
+        });
+
+        poll_principal_status_once(&state).await;
+
+        assert!(state.principal.lock().await.is_none());
+    }
+
+    fn test_access_key_mount(mount_token: &str) -> MountState {
+        MountState {
+            path: "/sync".to_owned(),
+            folder_id: "folder-1".to_owned(),
+            grant_id: Some("grant-1".to_owned()),
+            scope_node_id: Some("scope-1".to_owned()),
+            mount_token: Some(mount_token.to_owned()),
+            can_write: true,
+            name: "Test Folder".to_owned(),
+            active_syncs: 0,
+            pending_ops: 0,
+            last_synced_at: None,
+            update_required: false,
+            update_required_flag: Arc::new(AtomicBool::new(false)),
+            rejected: Arc::new(AtomicBool::new(false)),
+            error: None,
+            sync_lock: Arc::new(Mutex::new(())),
+            cursor_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[tokio::test]
     async fn backend_health_tracks_pull_outage_recovery_and_ignores_apply_failure() {
         let dir = Path::new("/tmp").join(format!(
             "valvd-health-test-{}",
@@ -2212,6 +2450,7 @@ mod tests {
             last_synced_at: None,
             update_required: false,
             update_required_flag: Arc::new(AtomicBool::new(false)),
+            rejected: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(tokio::sync::Notify::new()),

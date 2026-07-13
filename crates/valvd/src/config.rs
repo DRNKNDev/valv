@@ -13,7 +13,7 @@ use valv_sync::{config::toml_escape, persistence::mounts};
 pub(crate) struct DaemonConfig {
     pub(crate) backend_url: String,
     pub(crate) device_id: String,
-    pub(crate) device_token: String,
+    pub(crate) device_token: Option<String>,
     pub(crate) device_name: String,
     #[serde(default)]
     pub(crate) mounts: Vec<MountConfig>,
@@ -78,19 +78,20 @@ pub(crate) fn ensure_config_template() -> Result<()> {
 
     let backend_url = prompt_value("Backend URL", "https://api.valvsync.com")?;
     let device_name = prompt_value("Device name", &default_device_name())?;
-    let contents = format!(
+    fs::write(&path, config_template(&backend_url, &device_name))?;
+    set_owner_only_permissions(&path)?;
+    Ok(())
+}
+
+fn config_template(backend_url: &str, device_name: &str) -> String {
+    format!(
         r#"backend_url = "{}"
-device_id = ""
-device_token = ""
 device_name = "{}"
 mounts = []
 "#,
-        toml_escape(&backend_url),
-        toml_escape(&device_name)
-    );
-    fs::write(&path, contents)?;
-    set_owner_only_permissions(&path)?;
-    Ok(())
+        toml_escape(backend_url),
+        toml_escape(device_name)
+    )
 }
 
 fn prompt_value(label: &str, default: &str) -> Result<String> {
@@ -109,16 +110,18 @@ fn prompt_value(label: &str, default: &str) -> Result<String> {
 fn parse_config(text: &str) -> Result<DaemonConfig> {
     let raw: RawDaemonConfig = toml::from_str(text)?;
     let backend_url = required_config_value(raw.backend_url, "backend_url")?;
-    let device_id = required_config_value(raw.device_id, "device_id")?;
-    let device_token = required_config_value(raw.device_token, "device_token")?;
 
     Ok(DaemonConfig {
         backend_url,
-        device_id,
-        device_token,
+        device_id: raw.device_id.unwrap_or_default(),
+        device_token: non_empty(raw.device_token),
         device_name: raw.device_name.unwrap_or_else(default_device_name),
         mounts: raw.mounts,
     })
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 fn required_config_value(value: Option<String>, key: &str) -> Result<String> {
@@ -180,6 +183,54 @@ pub(crate) fn prune_old_logs(log_dir: &Path) -> Result<()> {
 
 pub(crate) fn socket_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("valvd.sock"))
+}
+
+pub(crate) fn wait_for_daemon_socket(timeout: std::time::Duration) -> Result<bool> {
+    Ok(wait_for_daemon_socket_at(&socket_path()?, timeout))
+}
+
+pub(crate) fn wait_for_daemon_socket_at(path: &Path, timeout: std::time::Duration) -> bool {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        time::Instant,
+    };
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(mut stream) = UnixStream::connect(path) {
+            let request = b"GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            if stream.write_all(request).is_ok() {
+                let mut buf = [0u8; 32];
+                if let Ok(count) = stream.read(&mut buf) {
+                    if buf[..count].starts_with(b"HTTP/1.1 200") {
+                        return true;
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+pub(crate) fn fetch_daemon_status() -> Option<valv_sync::protocol::ipc::DaemonStatus> {
+    fetch_daemon_status_at(&socket_path().ok()?)
+}
+
+pub(crate) fn fetch_daemon_status_at(path: &Path) -> Option<valv_sync::protocol::ipc::DaemonStatus> {
+    use std::{io::{Read, Write}, os::unix::net::UnixStream};
+
+    let mut stream = UnixStream::connect(path).ok()?;
+    stream
+        .write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let body = response.split_once("\r\n\r\n")?.1;
+    serde_json::from_str(body).ok()
 }
 
 // Shared with the sandboxed macOS Xcode targets (Valv/ValvFileProvider/ValvFinderSync),
@@ -252,16 +303,69 @@ device_token = "token"
     }
 
     #[test]
-    fn config_missing_device_token_returns_actionable_error() {
-        let err = parse_config(
+    fn config_with_backend_url_only_parses() {
+        let config = parse_config(
             r#"
 backend_url = "https://api.valv.dev"
-device_id = "device"
 "#,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err.to_string().contains("Missing device_token"));
+        assert_eq!(config.backend_url, "https://api.valv.dev");
+        assert_eq!(config.device_id, "");
+        assert!(config.device_token.is_none());
+    }
+
+    #[test]
+    fn config_with_legacy_device_id_parses_and_ignores_it() {
+        let config = parse_config(
+            r#"
+backend_url = "https://api.valv.dev"
+device_id = "legacy-device"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.device_id, "legacy-device");
+        assert!(config.device_token.is_none());
+    }
+
+    #[test]
+    fn config_with_empty_device_token_is_treated_as_absent() {
+        let config = parse_config(
+            r#"
+backend_url = "https://api.valv.dev"
+device_token = ""
+"#,
+        )
+        .unwrap();
+
+        assert!(config.device_token.is_none());
+    }
+
+    #[test]
+    fn config_with_device_token_parses_it_as_present() {
+        let config = parse_config(
+            r#"
+backend_url = "https://api.valv.dev"
+device_token = "token"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.device_token.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn ensure_config_template_emits_neither_credential_key() {
+        let contents = config_template("https://api.valv.dev", "Test Device");
+
+        assert!(!contents.contains("device_id"));
+        assert!(!contents.contains("device_token"));
+
+        let config = parse_config(&contents).unwrap();
+        assert_eq!(config.device_id, "");
+        assert!(config.device_token.is_none());
     }
 
     #[cfg(target_os = "macos")]
@@ -414,5 +518,94 @@ mounts = []
         conn.execute_batch(include_str!("../../valv-sync/src/persistence/schema.sql"))
             .unwrap();
         conn
+    }
+
+    #[test]
+    fn wait_for_daemon_socket_at_succeeds_once_status_is_served() {
+        use std::{
+            io::{Read, Write},
+            os::unix::net::UnixListener,
+        };
+
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("valvd.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 256];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+        });
+
+        let served = wait_for_daemon_socket_at(&socket_path, std::time::Duration::from_secs(2));
+
+        assert!(served);
+    }
+
+    #[test]
+    fn wait_for_daemon_socket_at_times_out_when_nothing_is_listening() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("valvd.sock");
+
+        let served =
+            wait_for_daemon_socket_at(&socket_path, std::time::Duration::from_millis(300));
+
+        assert!(!served);
+    }
+
+    #[test]
+    fn wait_for_daemon_socket_at_times_out_when_daemon_exits_immediately_after_binding() {
+        use std::os::unix::net::UnixListener;
+
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("valvd.sock");
+        {
+            let _listener = UnixListener::bind(&socket_path).unwrap();
+        }
+
+        let served =
+            wait_for_daemon_socket_at(&socket_path, std::time::Duration::from_millis(300));
+
+        assert!(!served);
+    }
+
+    #[test]
+    fn fetch_daemon_status_at_parses_the_credential_field() {
+        use std::{
+            io::{Read, Write},
+            os::unix::net::UnixListener,
+        };
+
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("valvd.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 256];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"paused":false,"backend_connected":true,"version":"0.1.0","update_required":false,"mounts":[],"credential":"none"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let status = fetch_daemon_status_at(&socket_path).unwrap();
+
+        assert_eq!(status.credential, valv_sync::protocol::ipc::Credential::None);
+    }
+
+    #[test]
+    fn fetch_daemon_status_at_returns_none_when_nothing_is_listening() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("valvd.sock");
+
+        assert!(fetch_daemon_status_at(&socket_path).is_none());
     }
 }

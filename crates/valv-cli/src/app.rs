@@ -499,7 +499,7 @@ fn delegate_daemon(command: DaemonCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use valv_sync::protocol::ipc::{MountStatus, VersionEntry};
+    use valv_sync::protocol::ipc::{Credential, MountStatus, VersionEntry};
 
     #[test]
     fn status_json_round_trips_without_human_table_text() {
@@ -524,6 +524,8 @@ mod tests {
             account: None,
             latest_version: None,
             update_available: None,
+            credential: Credential::None,
+            principal: None,
         };
 
         let output = status_json(&status).unwrap();

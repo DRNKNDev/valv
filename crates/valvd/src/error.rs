@@ -113,6 +113,19 @@ impl From<tokio::task::JoinError> for DaemonError {
     }
 }
 
+pub(crate) fn is_unauthenticated(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::status)
+        == Some(reqwest::StatusCode::UNAUTHORIZED)
+}
+
+pub(crate) fn require_token(token: Option<&str>) -> Result<String, DaemonError> {
+    token
+        .map(str::to_owned)
+        .ok_or_else(|| DaemonError::BadRequest("mount_has_no_credential".to_owned()))
+}
+
 pub(crate) async fn backend_response_or_error(
     response: reqwest::Response,
 ) -> Result<reqwest::Response, DaemonError> {

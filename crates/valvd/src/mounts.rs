@@ -15,7 +15,7 @@ use valv_sync::{
 };
 
 use crate::{
-    error::{backend_response_or_error, DaemonError},
+    error::{backend_response_or_error, require_token, DaemonError},
     tasks::{cancel_tasks_for_mount, materialize_mount_files, spawn_tasks_for_mount},
     DaemonState, MountState,
 };
@@ -44,11 +44,12 @@ pub(crate) async fn post_mount(
     }
 
     let resolved = resolve_mount(&state, &req).await?;
-    let token = resolved
-        .mount_token
-        .as_deref()
-        .unwrap_or(&state.config.device_token)
-        .to_owned();
+    let token = require_token(
+        resolved
+            .mount_token
+            .as_deref()
+            .or(state.config.device_token.as_deref()),
+    )?;
     let local_name = {
         let mut conn = state.db.lock().await;
         mount_store::upsert_mount(
@@ -96,6 +97,7 @@ pub(crate) async fn post_mount(
         last_synced_at: None,
         update_required: false,
         update_required_flag: Arc::new(AtomicBool::new(false)),
+        rejected: Arc::new(AtomicBool::new(false)),
         error: None,
         sync_lock: Arc::new(Mutex::new(())),
         cursor_notify: Arc::new(tokio::sync::Notify::new()),
@@ -231,6 +233,7 @@ async fn resolve_mount(
         });
     }
 
+    let device_token = require_token(state.config.device_token.as_deref())?;
     let name = Path::new(&req.path)
         .file_name()
         .and_then(|name| name.to_str())
@@ -242,7 +245,7 @@ async fn resolve_mount(
             "{}/folders",
             valv_sync::api_base(&state.config.backend_url)
         ))
-        .bearer_auth(&state.config.device_token)
+        .bearer_auth(device_token)
         .json(&serde_json::json!({ "name": name }))
         .send()
         .await?;
@@ -402,6 +405,7 @@ mod tests {
             last_synced_at: None,
             update_required: false,
             update_required_flag: Arc::new(AtomicBool::new(false)),
+            rejected: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(tokio::sync::Notify::new()),
@@ -428,6 +432,8 @@ mod tests {
             mounts: Arc::new(Mutex::new(mounts)),
             tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            principal: Arc::new(Mutex::new(None)),
+            device_token_rejected: Arc::new(AtomicBool::new(false)),
             update_status: Arc::new(Mutex::new(Default::default())),
             backend_health: Arc::new(crate::BackendHealth::default()),
             pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -437,7 +443,7 @@ mod tests {
             config: crate::DaemonConfig {
                 backend_url: "http://127.0.0.1:1".to_owned(),
                 device_id: "device-1".to_owned(),
-                device_token: "token".to_owned(),
+                device_token: Some("token".to_owned()),
                 device_name: "Test Device".to_owned(),
                 mounts: Vec::new(),
             },
@@ -487,5 +493,151 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), DaemonError::NotFound(_)));
+    }
+
+    fn credential_less_state(backend_url: String) -> DaemonState {
+        let conn = memory_db();
+        DaemonState {
+            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fs_events_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mounts: Arc::new(Mutex::new(Vec::new())),
+            tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            account: Arc::new(Mutex::new(None)),
+            principal: Arc::new(Mutex::new(None)),
+            device_token_rejected: Arc::new(AtomicBool::new(false)),
+            update_status: Arc::new(Mutex::new(Default::default())),
+            backend_health: Arc::new(crate::BackendHealth::default()),
+            pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            deferred_deletes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            db: Arc::new(Mutex::new(conn)),
+            client: reqwest::Client::new(),
+            config: crate::DaemonConfig {
+                backend_url,
+                device_id: String::new(),
+                device_token: None,
+                device_name: "Test Device".to_owned(),
+                mounts: Vec::new(),
+            },
+        }
+    }
+
+    async fn mount_grant_server(
+        folder_id: String,
+        scope_node_id: String,
+        scope_name: String,
+        can_write: bool,
+    ) -> String {
+        use tokio::{io::AsyncReadExt, net::TcpListener};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0; 4096];
+                let bytes_read = match stream.read(&mut buffer).await {
+                    Ok(count) => count,
+                    Err(_) => continue,
+                };
+                let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+                let first_line = request.lines().next().unwrap_or_default();
+                let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+
+                if path == "/api/grants" {
+                    let body = serde_json::json!([{
+                        "grant_id": "grant-1",
+                        "folder_id": folder_id,
+                        "scope_node_id": scope_node_id,
+                        "can_write": can_write,
+                    }])
+                    .to_string();
+                    respond(&mut stream, "200 OK", &body).await;
+                    continue;
+                }
+                if path == format!("/api/folders/{folder_id}/tree") {
+                    let body = serde_json::json!({
+                        "nodes": [
+                            {
+                                "node_id": format!("{folder_id}-root"),
+                                "parent_id": null,
+                                "name": "",
+                                "type": "folder",
+                                "current_version_id": null,
+                                "server_seq": 0,
+                                "deleted_at": null,
+                            },
+                            {
+                                "node_id": scope_node_id,
+                                "parent_id": format!("{folder_id}-root"),
+                                "name": scope_name,
+                                "type": "folder",
+                                "current_version_id": null,
+                                "server_seq": 0,
+                                "deleted_at": null,
+                            },
+                        ],
+                        "up_to_seq": 0,
+                    })
+                    .to_string();
+                    respond(&mut stream, "200 OK", &body).await;
+                    continue;
+                }
+                respond(&mut stream, "404 Not Found", "{}").await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn respond(stream: &mut tokio::net::TcpStream, status_line: &str, body: &str) {
+        use tokio::io::AsyncWriteExt;
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    }
+
+    #[tokio::test]
+    async fn post_mount_with_grant_token_on_credential_less_daemon_starts_syncing_without_restart()
+    {
+        let grant_token = "grant-token-xyz".to_owned();
+        let folder_id = "folder-1".to_owned();
+        let scope_node_id = "scope-1".to_owned();
+        let backend_url = mount_grant_server(
+            folder_id.clone(),
+            scope_node_id.clone(),
+            "Design".to_owned(),
+            true,
+        )
+        .await;
+        let state = credential_less_state(backend_url);
+        let mount_dir = tempfile::tempdir().unwrap();
+        let mount_path = mount_dir.path().join("design").to_string_lossy().to_string();
+
+        let response = post_mount(
+            State(state.clone()),
+            Json(MountRequest {
+                path: mount_path.clone(),
+                folder_id: None,
+                grant_token: Some(grant_token),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.folder_id, folder_id);
+
+        let mounts = state.mounts.lock().await;
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].mount_token.as_deref(), Some("grant-token-xyz"));
+        drop(mounts);
+        assert!(state.tasks.lock().await.contains_key(&mount_path));
+
+        assert!(state.config.device_token.is_none());
+
+        cancel_tasks_for_mount(&state, &mount_path).await;
     }
 }

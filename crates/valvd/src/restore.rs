@@ -11,7 +11,7 @@ use valv_sync::{
 };
 
 use crate::{
-    error::{backend_response_or_error, DaemonError},
+    error::{backend_response_or_error, require_token, DaemonError},
     path_resolution::{resolve_path_to_node, PathResolutionError, ResolvedPath},
     DaemonState,
 };
@@ -24,7 +24,7 @@ pub(crate) async fn post_versions(
         return Err(DaemonError::BadRequest("local_path is required".to_owned()));
     }
     let resolved = resolve_local_path(&state, &req.local_path).await?;
-    let token = resolved.mount.effective_token(&state.config).to_owned();
+    let token = require_token(resolved.mount.effective_token(&state.config))?;
     let response = state
         .client
         .get(format!(
@@ -65,7 +65,7 @@ pub(crate) async fn post_restore(
         };
         node.server_seq
     };
-    let token = resolved.mount.effective_token(&state.config).to_owned();
+    let token = require_token(resolved.mount.effective_token(&state.config))?;
     let response = state
         .client
         .post(format!(
@@ -207,6 +207,7 @@ mod tests {
             last_synced_at: None,
             update_required: false,
             update_required_flag: Arc::new(AtomicBool::new(false)),
+            rejected: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
@@ -223,6 +224,8 @@ mod tests {
             mounts: Arc::new(Mutex::new(vec![mount])),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            principal: Arc::new(Mutex::new(None)),
+            device_token_rejected: Arc::new(AtomicBool::new(false)),
             update_status: Arc::new(Mutex::new(Default::default())),
             backend_health: Arc::new(crate::BackendHealth::default()),
             pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -232,7 +235,7 @@ mod tests {
             config: DaemonConfig {
                 backend_url,
                 device_id: "device-1".to_owned(),
-                device_token: "token".to_owned(),
+                device_token: Some("token".to_owned()),
                 device_name: "Test Device".to_owned(),
                 mounts: Vec::new(),
             },

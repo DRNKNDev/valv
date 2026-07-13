@@ -30,7 +30,7 @@ use tokio::{
 use tracing_subscriber::{filter::LevelFilter, prelude::*, EnvFilter};
 use valv_sync::{
     persistence::{mounts as mount_store, open_db},
-    protocol::ipc::{AccountStatus, MountStatus},
+    protocol::ipc::{AccountStatus, MountStatus, PrincipalStatus},
 };
 
 mod config;
@@ -88,6 +88,8 @@ struct DaemonState {
     // respawns that mount's own tasks instead of every persisted mount's.
     tasks: Arc<Mutex<HashMap<String, Vec<JoinHandle<()>>>>>,
     account: Arc<Mutex<Option<AccountStatus>>>,
+    principal: Arc<Mutex<Option<PrincipalStatus>>>,
+    device_token_rejected: Arc<AtomicBool>,
     update_status: Arc<Mutex<UpdateStatus>>,
     backend_health: Arc<BackendHealth>,
     pending_uploads: Arc<Mutex<HashSet<String>>>,
@@ -144,6 +146,7 @@ struct MountState {
     last_synced_at: Option<String>,
     update_required: bool,
     update_required_flag: Arc<AtomicBool>,
+    rejected: Arc<AtomicBool>,
     error: Option<String>,
     // Serializes pull_mount_once/full_sync_mount for this mount so a background
     // pull can't mutate the local mirror mid-flight through an explicit sync's
@@ -243,6 +246,7 @@ async fn run() -> Result<()> {
             last_synced_at: None,
             update_required: false,
             update_required_flag: Arc::new(AtomicBool::new(false)),
+            rejected: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
@@ -255,6 +259,8 @@ async fn run() -> Result<()> {
         mounts: Arc::new(Mutex::new(mount_states)),
         tasks: Arc::new(Mutex::new(HashMap::new())),
         account: Arc::new(Mutex::new(None)),
+        principal: Arc::new(Mutex::new(None)),
+        device_token_rejected: Arc::new(AtomicBool::new(false)),
         update_status: Arc::new(Mutex::new(UpdateStatus::default())),
         backend_health: Arc::new(BackendHealth::default()),
         pending_uploads: Arc::new(Mutex::new(HashSet::new())),
@@ -437,8 +443,10 @@ async fn shutdown_signal() -> Result<()> {
 }
 
 impl MountState {
-    pub(crate) fn effective_token<'a>(&'a self, config: &'a DaemonConfig) -> &'a str {
-        self.mount_token.as_deref().unwrap_or(&config.device_token)
+    pub(crate) fn effective_token<'a>(&'a self, config: &'a DaemonConfig) -> Option<&'a str> {
+        self.mount_token
+            .as_deref()
+            .or_else(|| config.device_token.as_deref())
     }
 
     pub(crate) fn status(&self) -> MountStatus {
@@ -488,6 +496,8 @@ mod tests {
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            principal: Arc::new(Mutex::new(None)),
+            device_token_rejected: Arc::new(AtomicBool::new(false)),
             update_status: Arc::new(Mutex::new(Default::default())),
             backend_health: Arc::new(BackendHealth::default()),
             pending_uploads: Arc::new(Mutex::new(HashSet::new())),
@@ -497,7 +507,7 @@ mod tests {
             config: DaemonConfig {
                 backend_url: "http://127.0.0.1:1".to_owned(),
                 device_id: "device-1".to_owned(),
-                device_token: "token-1".to_owned(),
+                device_token: Some("token-1".to_owned()),
                 device_name: "Test Device".to_owned(),
                 mounts: Vec::new(),
             },

@@ -547,6 +547,7 @@ fn daemon_status_matches_version(status: &DaemonStatus, target_version: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use valv_sync::protocol::ipc::Credential;
 
     #[test]
     fn plan_update_reports_already_up_to_date() {
@@ -918,6 +919,8 @@ mod tests {
             account: None,
             latest_version: None,
             update_available: None,
+            credential: Credential::None,
+            principal: None,
         };
         assert!(daemon_status_matches_version(&status, "0.2.0"));
         assert!(!daemon_status_matches_version(&status, "0.1.0"));

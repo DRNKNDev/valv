@@ -40,7 +40,7 @@ use valv_sync::{
 };
 
 use crate::{
-    error::{backend_response_or_error, DaemonError},
+    error::{backend_response_or_error, require_token, DaemonError},
     tasks::mark_mount_update_required,
     DaemonState, MountState,
 };
@@ -218,7 +218,7 @@ pub(crate) async fn fp_content(
             size: chunk.length,
         })
         .collect::<Vec<_>>();
-    let token = mount.effective_token(&state.config).to_owned();
+    let token = require_token(mount.effective_token(&state.config))?;
     let batch = state
         .client
         .post(format!(
@@ -304,7 +304,7 @@ pub(crate) async fn fp_delete(
         let mount = resolve_mount_for_folder_id(&state, &node.folder_id).await?;
         (
             mount.clone(),
-            mount.effective_token(&state.config).to_owned(),
+            require_token(mount.effective_token(&state.config))?,
         )
     };
     let response = submit_op_daemon_for_mount(
@@ -348,7 +348,7 @@ pub(crate) async fn fp_move(
         let mount = resolve_mount_for_folder_id(&state, &node.folder_id).await?;
         (
             mount.clone(),
-            mount.effective_token(&state.config).to_owned(),
+            require_token(mount.effective_token(&state.config))?,
             node,
         )
     };
@@ -441,7 +441,7 @@ pub(crate) async fn fp_share(
         let mount = resolve_mount_for_folder_id(&state, &node.folder_id).await?;
         (
             node.folder_id,
-            mount.effective_token(&state.config).to_owned(),
+            require_token(mount.effective_token(&state.config))?,
         )
     };
     let invite = state
@@ -733,7 +733,7 @@ async fn resolve_upload_context(
         .unwrap_or(parent.server_seq);
     Ok(UploadContext {
         folder_id: parent.folder_id,
-        token: mount.effective_token(&state.config).to_owned(),
+        token: require_token(mount.effective_token(&state.config))?,
         create_first,
         based_on_seq,
         parent_id,
@@ -1093,6 +1093,7 @@ mod fp_watch_tests {
             last_synced_at: None,
             update_required: false,
             update_required_flag: Arc::new(AtomicBool::new(false)),
+            rejected: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
@@ -1119,6 +1120,8 @@ mod fp_watch_tests {
             mounts: Arc::new(Mutex::new(vec![mount])),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            principal: Arc::new(Mutex::new(None)),
+            device_token_rejected: Arc::new(AtomicBool::new(false)),
             update_status: Arc::new(Mutex::new(Default::default())),
             backend_health: Arc::new(crate::BackendHealth::default()),
             pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -1128,7 +1131,7 @@ mod fp_watch_tests {
             config: DaemonConfig {
                 backend_url: "http://127.0.0.1:1".to_owned(),
                 device_id: "device-1".to_owned(),
-                device_token: "token".to_owned(),
+                device_token: Some("token".to_owned()),
                 device_name: "Test Device".to_owned(),
                 mounts: Vec::new(),
             },
@@ -1506,6 +1509,7 @@ mod fp_error_tests {
             last_synced_at: None,
             update_required: false,
             update_required_flag: Arc::new(AtomicBool::new(false)),
+            rejected: Arc::new(AtomicBool::new(false)),
             error: None,
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
@@ -1533,6 +1537,8 @@ mod fp_error_tests {
             mounts: Arc::new(Mutex::new(vec![mount])),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
+            principal: Arc::new(Mutex::new(None)),
+            device_token_rejected: Arc::new(AtomicBool::new(false)),
             update_status: Arc::new(Mutex::new(Default::default())),
             backend_health: Arc::new(crate::BackendHealth::default()),
             pending_uploads: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -1542,7 +1548,7 @@ mod fp_error_tests {
             config: DaemonConfig {
                 backend_url,
                 device_id: "device-1".to_owned(),
-                device_token: "token".to_owned(),
+                device_token: Some("token".to_owned()),
                 device_name: "Test Device".to_owned(),
                 mounts: Vec::new(),
             },

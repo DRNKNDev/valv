@@ -124,6 +124,7 @@ fn status_requires_notice_bypass(status: &DaemonStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use valv_sync::protocol::ipc::Credential;
 
     #[test]
     fn should_skip_notice_when_escape_hatch_is_set() {
@@ -206,6 +207,8 @@ mod tests {
             account: None,
             latest_version: None,
             update_available: None,
+            credential: Credential::None,
+            principal: None,
         };
         assert!(!status_requires_notice_bypass(&status));
 

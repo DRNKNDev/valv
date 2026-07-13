@@ -20,6 +20,21 @@ export interface AccountStatus {
   current_period_end: string | null;
 }
 
+export type Credential = "account" | "access_key" | "none" | "pending" | "rejected";
+
+export interface PrincipalScope {
+  folder_id: string;
+  folder_name: string;
+  scope_label: string;
+  can_write: boolean;
+}
+
+export interface PrincipalStatus {
+  type: "account" | "access_key";
+  email?: string;
+  scopes: PrincipalScope[];
+}
+
 export interface DaemonStatus {
   paused: boolean;
   backend_connected: boolean;
@@ -29,6 +44,8 @@ export interface DaemonStatus {
   account?: AccountStatus;
   latest_version?: string;
   update_available?: boolean;
+  credential: Credential;
+  principal?: PrincipalStatus;
 }
 
 export interface NodePathResponse {

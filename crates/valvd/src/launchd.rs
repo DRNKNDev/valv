@@ -2,13 +2,16 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
+    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
+use valv_sync::protocol::ipc::Credential;
 
 use crate::config::{self, home_dir};
 
 const LAUNCH_AGENT_LABEL: &str = "dev.drnkn.valvd";
+const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) fn install_daemon() -> Result<()> {
     config::ensure_config_template()?;
@@ -22,7 +25,57 @@ pub(crate) fn install_daemon() -> Result<()> {
     let valvd_path = config::resolve_valvd_path()?;
     write_launch_agent_plist(&plist_path, &valvd_path)?;
     run_launchctl("bootstrap", &plist_path, true)?;
+
+    // `RunAtLoad`/`KeepAlive` report a successful load, not a successful
+    // serve: a crash-looping daemon still "bootstraps" cleanly.
+    if !config::wait_for_daemon_socket(SOCKET_WAIT_TIMEOUT)? {
+        return Err(startup_failure());
+    }
+
+    println!("Installed valvd launch agent at {}", plist_path.display());
+    print_credential_state();
     Ok(())
+}
+
+fn print_credential_state() {
+    if let Some(Credential::None) = config::fetch_daemon_status().map(|status| status.credential) {
+        println!();
+        println!("valvd is running, but this machine has no key yet. Next:");
+        println!("  valv mount <path> --grant <token>   (headless / access key)");
+        println!("  valv auth login                      (sign in to an account)");
+    }
+}
+
+fn startup_failure() -> anyhow::Error {
+    let mut message = "valvd failed to start: launchd reports the launch agent loaded, \
+         but the daemon never began serving its socket."
+        .to_owned();
+    if let Some(tail) = last_stderr_lines() {
+        message.push_str("\n\nLast stderr output:\n");
+        message.push_str(&tail);
+    }
+    if let Ok(log_dir) = config::log_dir() {
+        message.push_str(&format!(
+            "\n\nInspect it at: {}",
+            log_dir.join("valvd.stderr.log").display()
+        ));
+    }
+    anyhow!(message)
+}
+
+fn last_stderr_lines() -> Option<String> {
+    let log_dir = config::log_dir().ok()?;
+    let text = fs::read_to_string(log_dir.join("valvd.stderr.log")).ok()?;
+    let tail = text
+        .lines()
+        .rev()
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!tail.is_empty()).then_some(tail)
 }
 
 pub(crate) fn uninstall_daemon() -> Result<()> {
@@ -150,5 +203,15 @@ mod tests {
         assert!(plist.contains("<string>/Users/tester/Library/Logs/Valv/valvd.stdout.log</string>"));
         assert!(plist.contains("<string>/Users/tester/Library/Logs/Valv/valvd.stderr.log</string>"));
         assert!(!plist.contains("/tmp"));
+    }
+
+    #[test]
+    fn startup_failure_names_the_log_path_and_never_claims_success() {
+        let error = startup_failure();
+        let message = error.to_string();
+
+        assert!(message.contains("valvd.stderr.log"));
+        assert!(message.contains("failed to start"));
+        assert!(!message.to_lowercase().contains("installed"));
     }
 }
