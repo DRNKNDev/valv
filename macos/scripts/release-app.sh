@@ -94,7 +94,7 @@ current_project_version="$(printf '%s\n' "${app_build_settings}" | awk -F'= ' '/
 appcast_path="${oss_root}/macos/appcast.xml"
 previous_build_number=0
 if [[ -f "${appcast_path}" ]]; then
-  latest_from_appcast="$(grep -o 'sparkle:version="[0-9]\+"' "${appcast_path}" | grep -o '[0-9]\+' | sort -n | tail -1 || true)"
+  latest_from_appcast="$(grep -oE 'sparkle:version(="|>)[0-9]+' "${appcast_path}" | grep -oE '[0-9]+' | sort -n | tail -1 || true)"
   [[ -n "${latest_from_appcast}" ]] && previous_build_number="${latest_from_appcast}"
 fi
 (( current_project_version > previous_build_number )) ||
