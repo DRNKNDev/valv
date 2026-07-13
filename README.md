@@ -35,12 +35,12 @@ Windows, Intel macOS, and Linux arm64 are not supported yet.
 ## First Folder
 
 ```bash
-valv auth login
-valv mount ~/Valv
+valv login
+valv mount ~/Valv --new
 valv status
 ```
 
-`auth login` opens a browser to pair this device against the hosted backend (or your own, with `--backend-url`). `mount` creates a synced folder, and `status` reports daemon connectivity and per-folder sync state. See [`crates/valv-cli/README.md`](./crates/valv-cli/README.md) for the full command reference, including `grant create`, `versions`, `restore`, and `update`.
+`login` opens a browser to pair this device against the hosted backend (or your own, with `--backend-url`). `mount --new` creates a synced folder, and `status` reports daemon connectivity and per-folder sync state. See [`crates/valv-cli/README.md`](./crates/valv-cli/README.md) for the full command reference, including `share`, `versions`, `restore`, and `update`.
 
 ## Implemented Highlights
 
@@ -52,7 +52,7 @@ valv status
 - Version history and restore per file
 - Automatic conflict copies instead of silent overwrites
 - Chunk-level integrity verification
-- JSON output on `status`, `versions`, and `grants` for scripting/automation
+- JSON output on every command (global `--json` flag) for scripting/automation
 - Signed, checksum-verified CLI/daemon updates and a signed, notarized, Sparkle-updated macOS app
 
 ## Self-Hosting

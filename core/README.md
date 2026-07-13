@@ -49,14 +49,14 @@ curl -s -b /tmp/valv-cookies.txt \
   http://localhost:4747/auth/device
 ```
 
-The second command returns `{ "device_id": "...", "token": "..." }`. Store those values with `valv auth login` (preferred) or by writing `~/.config/valv/config.toml` directly, as described in [`../crates/README.md`](../crates/README.md).
+The second command returns `{ "device_id": "...", "token": "..." }`. Store those values with `valv login` (preferred) or by writing `~/.config/valv/config.toml` directly, as described in [`../crates/README.md`](../crates/README.md).
 
 ## Self-Hosting Limitations
 
 This repository provides the backend API and the CLI/daemon/app clients that talk to it. It does not include:
 
 - A Docker Compose stack or a production container image.
-- A web UI for accepting invites. `POST /folders/:id/invites` and `valv grant create --to <email>` produce an invite URL of the form `{backend_url}/invites/{token}/accept`; that URL is a backend API endpoint that must be called with `POST` (for example from a script or your own frontend), not a page a browser can open directly. Device grants created with `valv grant create --device <name>` do not have this limitation: they print a device token directly.
+- A web UI for accepting invites. `POST /folders/:id/invites` and `valv share <path> --to <email>` produce an invite URL of the form `{backend_url}/invites/{token}/accept`; that URL is a backend API endpoint that must be called with `POST` (for example from a script or your own frontend), not a page a browser can open directly. Access keys created with `valv share <path> --key <name>` do not have this limitation: they print a one-time token directly.
 
 ## Tests
 
