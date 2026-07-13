@@ -3,6 +3,35 @@
     <channel>
         <title>Valv</title>
         <item>
+            <title>0.2.1</title>
+            <pubDate>Mon, 13 Jul 2026 12:42:47 +0700</pubDate>
+            <sparkle:version>2</sparkle:version>
+            <sparkle:shortVersionString>0.2.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.2</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[Sharing from Finder, and a File Provider that no longer hangs or loses its domain.
+
+## macOS app
+
+- Share a folder straight from Finder: a new Valv Finder Extension adds a share action, backed by an in-app share window
+- Mounted folders now present as symlinks, so Finder and command-line tools resolve them consistently
+- Finder enumeration no longer hangs: the root container is answered locally instead of falling through to a node lookup that returned `node_not_found`
+- The File Provider domain is reconciled on every signed-in launch, so an install whose signed-in state outlived its domain repairs itself instead of showing an empty mount
+- Onboarding now stops on a File Provider registration failure rather than landing you signed in with nothing mounted
+- Reworked menu-bar dropdown and sign-out flow
+- Onboarding hero uses the brand icon
+- Requires `valvd` 0.2.0 or newer: v0.1.0 registers none of the `/fp/*` routes the File Provider extension calls, so the old floor passed the compatibility gate and every Finder operation then 404'd
+
+## Daemon (`valvd`) and CLI (`valv`)
+
+- New `GET /nodes/by-path` route, with a matching `nodeIdForPath` method in DaemonKit
+- Cross-folder moves are rejected with `409 cross_folder_move_rejected` instead of orphaning the node from both folders
+- Config errors now point at `valv auth login`, which is what actually writes `device_token` — the old hint dead-ended at `daemon install`, whose template leaves the token empty]]></description>
+            <enclosure url="https://github.com/DRNKNDev/valv/releases/download/v0.2.1/Valv-0.2.1.dmg" length="15255383" type="application/octet-stream" sparkle:edSignature="zmNbVUl6JCJNTVbr0oSudb1/RZ7/wR8vL/FvUuSA314kIuicWiyWh7re/OlaIy+8o94mGAbzb75GY5c8IuwXBQ=="/>
+            <sparkle:deltas>
+                <enclosure url="https://github.com/DRNKNDev/valv/releases/download/v0.2.1/Valv2-1.delta" sparkle:deltaFrom="1" length="1275126" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977840" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="bnw6+HbvKxd8+6hT8L3RgrksrAtjciboNDumc9y9QCHrLzJecWN2AHvXFU9CTt4lX/6WqfpNOhUvl+LfKTjcCw=="/>
+            </sparkle:deltas>
+        </item>
+        <item>
             <title>0.2.0</title>
             <pubDate>Thu, 09 Jul 2026 21:47:39 +0700</pubDate>
             <sparkle:version>1</sparkle:version>
