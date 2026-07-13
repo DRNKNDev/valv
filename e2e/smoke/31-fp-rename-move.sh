@@ -68,19 +68,19 @@ mkdir -p "${mount_a}/dir-a" "${mount_a}/dir-b"
 printf 'rename via fp\n' > "${mount_a}/dir-a/rename-me.txt"
 printf 'collision target\n' > "${mount_a}/dir-b/existing.txt"
 printf 'stale base\n' > "${mount_a}/stale.txt"
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 
 start_daemon HOME_B DAEMON_PID_B
 mount_b="${TMPDIR}/mount-31-b"
 mount_folder "$HOME_B" "$mount_b" --folder "$folder_id" >/dev/null
-sync_mount "$HOME_B" "$folder_id"
+sync_mount "$HOME_B"
 
 rename_node_id=$(get_node_id_at_path "$folder_id" "/dir-a/rename-me.txt")
 rename_seq=$(node_seq_at_path "$folder_id" "/dir-a/rename-me.txt")
 fp_move_expect_200 HOME_A "{\"node_id\":\"${rename_node_id}\",\"based_on_seq\":${rename_seq},\"new_name\":\"renamed-via-fp.txt\"}" >/dev/null
 wait_for_node_at_path "$folder_id" "/dir-a/renamed-via-fp.txt"
 
-sync_mount "$HOME_B" "$folder_id"
+sync_mount "$HOME_B"
 assert_path_present "${mount_b}/dir-a/renamed-via-fp.txt"
 assert_path_absent "${mount_b}/dir-a/rename-me.txt"
 
@@ -89,7 +89,7 @@ dir_b_id=$(get_node_id_at_path "$folder_id" "/dir-b")
 fp_move_expect_200 HOME_A "{\"node_id\":\"${rename_node_id}\",\"based_on_seq\":${move_seq},\"new_parent_id\":\"${dir_b_id}\"}" >/dev/null
 wait_for_node_at_path "$folder_id" "/dir-b/renamed-via-fp.txt"
 
-sync_mount "$HOME_B" "$folder_id"
+sync_mount "$HOME_B"
 assert_path_present "${mount_b}/dir-b/renamed-via-fp.txt"
 assert_path_absent "${mount_b}/dir-a/renamed-via-fp.txt"
 
@@ -105,8 +105,8 @@ stale_seq=$(node_seq_at_path "$folder_id" "/stale.txt")
 submit_remote_new_version "$folder_id" "$stale_node_id" "$stale_seq" "content from B\n"
 fp_move_expect_error HOME_A "{\"node_id\":\"${stale_node_id}\",\"based_on_seq\":${stale_seq},\"new_name\":\"stale-renamed.txt\"}" 409 "superseded"
 
-sync_mount "$HOME_A" "$folder_id"
-sync_mount "$HOME_B" "$folder_id"
+sync_mount "$HOME_A"
+sync_mount "$HOME_B"
 assert_path_present "${mount_a}/stale.txt"
 assert_path_absent "${mount_a}/stale-renamed.txt"
 assert_file_contains "${mount_a}/stale.txt" "content from B"

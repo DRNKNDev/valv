@@ -19,17 +19,17 @@ printf 'deep\n' > "${mount_path}/tree/a/deep.txt"
 printf 'other\n' > "${mount_path}/tree/b/other.txt"
 printf 'keep\n' > "${mount_path}/sibling-kept.txt"
 HOME="$HOME_A" "$VALV_BIN" resume >/dev/null
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 
 HOME="$HOME_A" "$VALV_BIN" pause >/dev/null
 rm -rf "${mount_path}/tree"
 HOME="$HOME_A" "$VALV_BIN" resume >/dev/null
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 wait_for_deleted_node_at_path "$folder_id" "/tree"
 wait_for_no_live_node_at_path "$folder_id" "/tree/a"
 wait_for_no_live_node_at_path "$folder_id" "/tree/a/deep.txt"
 
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 assert_path_absent "${mount_path}/tree"
 
 assert_node_at_path "$folder_id" "/sibling-kept.txt"
@@ -39,6 +39,6 @@ HOME="$HOME_A" "$VALV_BIN" pause >/dev/null
 rm "${mount_path}/sibling-kept.txt"
 printf 'new content\n' > "${mount_path}/sibling-kept.txt"
 HOME="$HOME_A" "$VALV_BIN" resume >/dev/null
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 assert_node_at_path "$folder_id" "/sibling-kept.txt"
 assert_live_node_count_at_path "$folder_id" "/sibling-kept.txt" 1

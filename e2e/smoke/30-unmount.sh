@@ -13,7 +13,7 @@ mount_a="${TMPDIR}/mount-30-unmount"
 folder_id=$(mount_folder "$HOME_A" "$mount_a")
 
 echo "hello unmount" > "${mount_a}/keep-me.txt"
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 assert_node_at_path "$folder_id" "/keep-me.txt"
 
 # DELETE /mount unmounts locally only - no backend endpoint is called, and the

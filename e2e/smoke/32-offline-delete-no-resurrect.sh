@@ -51,14 +51,14 @@ start_daemon HOME_A DAEMON_PID_A
 mount_a="${TMPDIR}/mount-32-a"
 folder_id=$(mount_folder "$HOME_A" "$mount_a")
 printf 'original content\n' > "${mount_a}/shared.txt"
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 assert_file_contains "${mount_a}/shared.txt" "original content"
 node_id=$(node_id_at_path "$folder_id" "/shared.txt")
 
 start_daemon HOME_B DAEMON_PID_B
 mount_b="${TMPDIR}/mount-32-b"
 mount_folder "$HOME_B" "$mount_b" --folder "$folder_id" >/dev/null
-sync_mount "$HOME_B" "$folder_id"
+sync_mount "$HOME_B"
 assert_file_contains "${mount_b}/shared.txt" "original content"
 
 # Device A goes offline and deletes its local copy. The delete is never
@@ -69,7 +69,7 @@ rm "${mount_a}/shared.txt"
 # Device B edits the same file and pushes a new version before A's delete
 # ever reaches the server.
 printf 'edited by B while A was offline\n' > "${mount_b}/shared.txt"
-sync_mount "$HOME_B" "$folder_id"
+sync_mount "$HOME_B"
 edited_version=$(node_version_at_path "$folder_id" "/shared.txt")
 [ -n "$edited_version" ] || fail "expected a new version id for /shared.txt after B's edit"
 
@@ -85,7 +85,7 @@ sleep 1
 # far behind - this is the "receives both the pre-existing tombstone-eligible
 # state and the other device's edit" case from the task.
 printf 'trigger\n' > "${mount_b}/trigger.txt"
-sync_mount "$HOME_B" "$folder_id"
+sync_mount "$HOME_B"
 
 wait_for_local_node_version "$HOME_A" "$node_id" "$edited_version" 30
 
@@ -102,7 +102,7 @@ assert_path_absent "${mount_a}/shared.txt"
 # is acceptable here - what matters is that nothing resurrected during the
 # pure background-only phase asserted above. If the file does reappear, it
 # must be with B's real, correct content - never stale or corrupt.
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 if [ -e "${mount_a}/shared.txt" ]; then
   assert_file_contains "${mount_a}/shared.txt" "edited by B while A was offline"
 else

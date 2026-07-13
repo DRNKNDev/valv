@@ -7,6 +7,13 @@ fail() {
   exit 1
 }
 
+SMOKE_SKIP_STATUS=99
+
+skip() {
+  printf 'SKIP: %s\n' "$*"
+  exit "$SMOKE_SKIP_STATUS"
+}
+
 api() {
   local method="$1"
   local path="$2"
@@ -137,48 +144,9 @@ stop_daemon() {
   printf -v "$pid_var" ''
 }
 
-wait_for_idle() {
-  local home_dir="${1:-$HOME_A}"
-  local folder_id="${2:-}"
-  local mount_path=""
-  if [ -n "$folder_id" ]; then
-    mount_path=$(sqlite3 "${home_dir}/.local/share/valv/sync.db" "SELECT path FROM mounts WHERE folder_id = '${folder_id}' LIMIT 1" 2>/dev/null || true)
-  fi
-  local deadline=$((SECONDS + 30))
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    local status
-    status=$(HOME="$home_dir" "$VALV_BIN" status 2>/dev/null || true)
-    if [ -n "$status" ]; then
-      # `valv status` prints a space-aligned table (see valv-cli print_table):
-      # a "Connected/Disconnected" line, a header row, a dashes row, then one
-      # data row per mount: `<path> <syncing> <pending_ops> <last_synced_at> <error>`.
-      # Parse the syncing column ($2) for the mount's row with default (whitespace)
-      # field splitting — the header/dashes/status lines never match an exact path.
-      if [ -n "$mount_path" ]; then
-        local syncing
-        syncing=$(printf '%s\n' "$status" | awk -v path="$mount_path" '$1 == path { print $2; exit }')
-        if [ -n "$syncing" ] && [ "$syncing" != "true" ]; then
-          return 0
-        fi
-      elif ! printf '%s\n' "$status" | awk '$2 == "true" { found = 1 } END { exit(found ? 0 : 1) }'; then
-        return 0
-      fi
-    fi
-    sleep 0.5
-  done
-  HOME="$home_dir" "$VALV_BIN" status >&2 || true
-  fail "daemon did not become idle within 30s"
-}
-
 sync_mount() {
   local home_dir="${1:-$HOME_A}"
-  local folder_id="${2:-}"
-  if [ -n "$folder_id" ]; then
-    HOME="$home_dir" "$VALV_BIN" sync --folder "$folder_id" >/dev/null
-  else
-    HOME="$home_dir" "$VALV_BIN" sync >/dev/null
-  fi
-  wait_for_idle "$home_dir" "$folder_id"
+  HOME="$home_dir" "$VALV_BIN" sync >/dev/null
 }
 
 mount_folder() {
@@ -186,9 +154,12 @@ mount_folder() {
   local mount_path="$2"
   shift 2
   mkdir -p "$mount_path"
-  local output
-  output=$(HOME="$home_dir" "$VALV_BIN" mount "$mount_path" "$@")
-  printf '%s\n' "$output" | node -e "const fs = require('fs'); const text = fs.readFileSync(0, 'utf8'); const m = text.match(/folder ([^ :]+)/); if (!m) process.exit(1); process.stdout.write(m[1]);"
+  local args=("$@")
+  if [ "${#args[@]}" -eq 0 ]; then
+    args=(--new)
+  fi
+  HOME="$home_dir" "$VALV_BIN" --json mount "$mount_path" "${args[@]}" \
+    | json_eval "process.stdout.write(data.folder_id)"
 }
 
 assert_bucket_key() {

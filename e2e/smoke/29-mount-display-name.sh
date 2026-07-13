@@ -12,7 +12,7 @@ trap 'stop_daemon DAEMON_PID_A; stop_daemon DAEMON_PID_B' EXIT
 start_daemon HOME_A DAEMON_PID_A
 mount_a="${TMPDIR}/mount-29-design-docs"
 folder_id=$(mount_folder "$HOME_A" "$mount_a")
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 
 # Whole-folder mount: name resolves via the GET /folders/:id fallback (the
 # folder's root node always has an empty name by construction), matching the
@@ -23,14 +23,14 @@ if [ "$whole_folder_name" != "mount-29-design-docs" ]; then
 fi
 
 mkdir -p "${mount_a}/Drafts"
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 drafts_node_id=$(get_node_id_at_path "$folder_id" "/Drafts")
 grant=$(api POST "/api/folders/${folder_id}/grants" "{\"scope_node_id\":\"${drafts_node_id}\",\"name\":\"Drafts Smoke Device\",\"can_read\":true,\"can_write\":true}")
 grant_token=$(printf '%s' "$grant" | json_eval 'process.stdout.write(data.token)')
 
 start_daemon HOME_B DAEMON_PID_B
 mount_b="${TMPDIR}/mount-29-b"
-mount_folder "$HOME_B" "$mount_b" --grant "$grant_token" >/dev/null
+mount_folder "$HOME_B" "$mount_b" --key "$grant_token" >/dev/null
 
 # Subfolder-scoped mount: name resolves entirely from the local mirror (the
 # scope node's own name), with no GET /folders/:id call needed.

@@ -14,7 +14,7 @@ mount_a="${TMPDIR}/mount-28-a"
 folder_id=$(mount_folder "$HOME_A" "$mount_a")
 mkdir -p "${mount_a}/docs"
 printf 'shared content\n' > "${mount_a}/docs/notes.txt"
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 
 notes_node_id=$(get_node_id_at_path "$folder_id" "/docs/notes.txt")
 docs_node_id=$(get_node_id_at_path "$folder_id" "/docs")
@@ -40,7 +40,7 @@ fi
 start_daemon HOME_B DAEMON_PID_B
 mount_b="${TMPDIR}/mount-28-b"
 mount_folder "$HOME_B" "$mount_b" --folder "$folder_id" >/dev/null
-sync_mount "$HOME_B" "$folder_id"
+sync_mount "$HOME_B"
 
 since_seq=$(daemon GET "/fp/anchor?folder_id=${folder_id}" HOME_B | json_eval 'process.stdout.write(String(data.server_seq))')
 watch_out="${TMPDIR}/28-watch-output.json"
@@ -49,7 +49,7 @@ watch_out="${TMPDIR}/28-watch-output.json"
 watch_pid=$!
 
 printf 'a new file from device A\n' > "${mount_a}/from-a.txt"
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 
 watch_started=$SECONDS
 wait "$watch_pid"

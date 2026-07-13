@@ -12,7 +12,7 @@ start_daemon HOME_A DAEMON_PID_A
 mount_a="${TMPDIR}/mount-27-a"
 folder_id=$(mount_folder "$HOME_A" "$mount_a")
 mkdir -p "${mount_a}/shared"
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 
 scope_node_id=$(get_node_id_at_path "$folder_id" "/shared")
 grant=$(api POST "/api/folders/${folder_id}/grants" "{\"scope_node_id\":\"${scope_node_id}\",\"name\":\"Read Only Smoke\",\"can_read\":true,\"can_write\":false}")

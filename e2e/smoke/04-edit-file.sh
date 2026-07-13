@@ -13,9 +13,9 @@ mount_path="${TMPDIR}/mount-04-a"
 folder_id=$(mount_folder "$HOME_A" "$mount_path")
 file="${mount_path}/notes.txt"
 printf 'hello\n' > "$file"
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 printf 'world\n' >> "$file"
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 
 node_id=$(node_id_at_path "$folder_id" "/notes.txt")
 versions=$(api GET "/api/folders/${folder_id}/versions/${node_id}")

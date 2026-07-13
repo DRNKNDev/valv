@@ -13,7 +13,7 @@ start_daemon HOME_A DAEMON_PID_A
 mount_path="${TMPDIR}/mount-02-a"
 folder_id=$(mount_folder "$HOME_A" "$mount_path")
 printf 'hello world\n' > "${mount_path}/hello.txt"
-sync_mount "$HOME_A" "$folder_id"
+sync_mount "$HOME_A"
 
 assert_node_at_path "$folder_id" "/hello.txt"
 chunk_hash=$(first_chunk_hash_for_path "$folder_id" "/hello.txt")
