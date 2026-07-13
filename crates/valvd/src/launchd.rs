@@ -41,8 +41,8 @@ fn print_credential_state() {
     if let Some(Credential::None) = config::fetch_daemon_status().map(|status| status.credential) {
         println!();
         println!("valvd is running, but this machine has no key yet. Next:");
-        println!("  valv mount <path> --grant <token>   (headless / access key)");
-        println!("  valv auth login                      (sign in to an account)");
+        println!("  valv mount <path> --key <token>   (headless / access key)");
+        println!("  valv login                        (sign in to an account)");
     }
 }
 

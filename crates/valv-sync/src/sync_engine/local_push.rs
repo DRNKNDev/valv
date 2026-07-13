@@ -26,7 +26,7 @@ use crate::{
         RenamePayload, SubmitOpRequest, SubmitOpResponse,
     },
     sync_engine::{
-        op_submit::{submit_op, upload_then_submit_new_version},
+        op_submit::{is_op_forbidden, submit_op, upload_then_submit_new_version},
         update_required::{is_update_required, UpdateRequired},
     },
 };
@@ -38,6 +38,14 @@ pub struct PushSummary {
     pub deletes_submitted: u64,
     pub skipped: u64,
     pub errors: u64,
+    pub forbidden: bool,
+}
+
+fn record_push_error(summary: &mut PushSummary, error: &anyhow::Error) {
+    summary.errors += 1;
+    if is_op_forbidden(error) {
+        summary.forbidden = true;
+    }
 }
 
 pub async fn push_local(
@@ -392,7 +400,7 @@ async fn process_moved_entry(
                     "push_local: failed to submit move for {}: {error}",
                     entry.abs_path.display()
                 );
-                summary.errors += 1;
+                record_push_error(summary, &error);
                 deferred_delete_node_ids.insert(node.node_id);
                 return Ok(true);
             }
@@ -430,7 +438,7 @@ async fn process_moved_entry(
                     "push_local: failed to submit rename for {}: {error}",
                     entry.abs_path.display()
                 );
-                summary.errors += 1;
+                record_push_error(summary, &error);
                 deferred_delete_node_ids.insert(node.node_id);
                 return Ok(true);
             }
@@ -654,7 +662,7 @@ async fn submit_deletes_for_missing(
                         "push_local: failed to submit delete for {}: {error}",
                         path.display()
                     );
-                    summary.errors += 1;
+                    record_push_error(summary, &error);
                 }
             }
         }
@@ -764,7 +772,7 @@ async fn create_entry(
                 "push_local: failed to submit create for {}: {error}",
                 entry.abs_path.display()
             );
-            summary.errors += 1;
+            record_push_error(summary, &error);
             return Ok(());
         }
     };
@@ -817,7 +825,7 @@ async fn create_entry(
                             "push_local: failed to upload content for {}: {error}",
                             entry.abs_path.display()
                         );
-                        summary.errors += 1;
+                        record_push_error(summary, &error);
                     }
                 }
             }
@@ -909,7 +917,7 @@ async fn process_existing_file(summary: &mut PushSummary, file: ExistingFile<'_>
                 "push_local: failed to submit new version for {}: {error}",
                 file.abs_path.display()
             );
-            summary.errors += 1;
+            record_push_error(summary, &error);
         }
     }
     Ok(())
@@ -1239,6 +1247,35 @@ mod tests {
         assert_eq!(requests.len(), 3);
         assert_eq!(summary.errors, 1);
         assert_eq!(summary.creates_submitted, 1);
+        assert!(!summary.forbidden);
+    }
+
+    #[tokio::test]
+    async fn push_local_marks_summary_forbidden_on_403() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"").unwrap();
+        let db = seeded_db();
+        let (backend_url, server) = local_push_server(vec![MockOp::Forbidden]).await;
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(summary.errors, 1);
+        assert!(summary.forbidden);
     }
 
     #[tokio::test]
@@ -2137,6 +2174,7 @@ mod tests {
         Applied { node_id: String, server_seq: i64 },
         Superseded,
         Error,
+        Forbidden,
         TransportError,
     }
 
@@ -2178,6 +2216,9 @@ mod tests {
                         }
                         MockOp::Error => {
                             write_response(&mut stream, "500 Internal Server Error", b"{}").await;
+                        }
+                        MockOp::Forbidden => {
+                            write_response(&mut stream, "403 Forbidden", b"{}").await;
                         }
                         MockOp::TransportError => {}
                     }

@@ -3,10 +3,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Error, Result};
 use reqwest::StatusCode;
 use rusqlite::{params, Connection};
 use serde_json::Value;
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
@@ -19,6 +20,16 @@ use crate::{
     storage::upload_chunks,
     sync_engine::update_required::{update_required_from_response, UpdateRequired},
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("authorization failed submitting op for folder {folder_id}")]
+pub struct OpForbidden {
+    pub folder_id: String,
+}
+
+pub fn is_op_forbidden(error: &Error) -> bool {
+    error.downcast_ref::<OpForbidden>().is_some()
+}
 
 pub async fn submit_op(
     client: &reqwest::Client,
@@ -39,9 +50,9 @@ pub async fn submit_op(
         return Err(update_required_from_response(response).await);
     }
     if response.status() == reqwest::StatusCode::FORBIDDEN {
-        return Err(anyhow!(
-            "authorization failed submitting op for folder {folder_id}"
-        ));
+        return Err(anyhow!(OpForbidden {
+            folder_id: folder_id.to_owned(),
+        }));
     }
     let body = response.error_for_status()?.json::<Value>().await?;
     parse_submit_op_response_body(body)

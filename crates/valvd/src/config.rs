@@ -59,7 +59,9 @@ pub(crate) fn merge_config_mounts(conn: &Connection, config_mounts: &[MountConfi
 pub(crate) fn load_config(path: &Path) -> Result<DaemonConfig> {
     let text = fs::read_to_string(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
-            anyhow!("Config not found. Run: valv daemon install")
+            anyhow!(
+                "Config not found. Run: valv login, or valv mount <path> --key <token> if you were given an access key."
+            )
         } else {
             err.into()
         }

@@ -557,8 +557,10 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
         &mount.update_required_flag,
     )
     .await;
+    let mut push_forbidden = false;
     match push_result {
         Ok(push_summary) => {
+            push_forbidden = push_summary.forbidden;
             merge_push_summary(&mut summary, &push_summary);
             clear_credential_rejected(state, &token).await;
             set_mount_pending_ops(
@@ -614,6 +616,7 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
             clear_credential_rejected(state, &token).await;
             summary.pulled_ops = pulled_ops;
             let was_paused = pause_watchers(state);
+            let mut apply_error = None;
             if let Err(error) =
                 apply_pulled_fs_changes(state, mount, pulled, MaterializeScope::Full).await
             {
@@ -623,7 +626,9 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
                     "apply pulled filesystem changes failed"
                 );
                 summary.errors += 1;
+                apply_error = Some(error.to_string());
             }
+            let mut materialize_error = None;
             if let Err(error) = materialize_mount_files(state, mount).await {
                 tracing::error!(
                     folder_id = %mount.folder_id,
@@ -631,9 +636,10 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
                     "materialize files failed"
                 );
                 summary.errors += 1;
+                materialize_error = Some(error.to_string());
             }
             resume_watchers_after_debounce(state, was_paused).await;
-            None
+            apply_error.or(materialize_error)
         }
         Err(error) => {
             if is_update_required(&error).is_some() {
@@ -650,9 +656,14 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
         }
     };
 
-    set_mount_pending_ops(state, &mount.folder_id, 0).await;
+    let mount_error = error.clone().or_else(|| {
+        push_forbidden
+            .then(|| "a write to this mount was refused: insufficient permission".to_owned())
+    });
+
+    set_mount_pending_ops(state, &mount.folder_id, summary.errors).await;
     let pull_succeeded = error.is_none();
-    end_mount_sync(state, &mount.folder_id, error).await;
+    end_mount_sync(state, &mount.folder_id, mount_error).await;
     if pull_succeeded {
         mount.cursor_notify.notify_waiters();
     }
@@ -2397,6 +2408,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forbidden_push_sets_mount_error_even_though_pull_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"alpha").unwrap();
+        let mut state = test_state();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        {
+            let conn = state.db.lock().await;
+            mounts::upsert_mount(&conn, &mount.path, &mount.folder_id, None, None, None, true)
+                .unwrap();
+            nodes::upsert_node(
+                &conn,
+                &LocalNode {
+                    node_id: "root-node".into(),
+                    folder_id: mount.folder_id.clone(),
+                    parent_id: None,
+                    name: "Mount".into(),
+                    node_type: "folder".into(),
+                    current_version_id: None,
+                    server_seq: 0,
+                    deleted_at: None,
+                },
+            )
+            .unwrap();
+        }
+        *state.mounts.lock().await = vec![mount.clone()];
+        let (backend_url, server) = push_forbidden_server().await;
+        state.config.backend_url = backend_url;
+
+        let summary = full_sync_mount(&state, &mount).await;
+        let requests = server.await.unwrap();
+        let status = crate::control::get_status(State(state)).await.unwrap().0;
+
+        assert_eq!(summary.errors, 1);
+        assert!(requests.contains(&"POST /api/folders/folder-1/ops".to_owned()));
+        assert!(status.mounts[0].error.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_persistent_materialize_failure_sets_a_durable_mount_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        {
+            let conn = state.db.lock().await;
+            mounts::upsert_mount(&conn, &mount.path, &mount.folder_id, None, None, None, true)
+                .unwrap();
+            nodes::upsert_node(
+                &conn,
+                &LocalNode {
+                    node_id: "root-node".into(),
+                    folder_id: mount.folder_id.clone(),
+                    parent_id: None,
+                    name: "Mount".into(),
+                    node_type: "folder".into(),
+                    current_version_id: None,
+                    server_seq: 0,
+                    deleted_at: None,
+                },
+            )
+            .unwrap();
+        }
+        *state.mounts.lock().await = vec![mount.clone()];
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+        state.config.backend_url = delta_server(vec![
+            r#"{"ops":[{"server_seq":1,"node_id":"remote-folder","op_type":"create","op_payload":{"node_id":"remote-folder","parent_id":"root-node","name":"remote-folder","type":"folder"},"actor_device_id":"other-device","applied_at":"2026-07-06T00:00:00Z"}],"up_to_seq":0}"#,
+        ])
+        .await;
+
+        let summary = full_sync_mount(&state, &mount).await;
+        let status = crate::control::get_status(State(state)).await.unwrap().0;
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(summary.errors, 1);
+        assert!(status.mounts[0].error.is_some());
+        assert_eq!(status.mounts[0].pending_ops, 1);
+    }
+
+    #[tokio::test]
     async fn update_required_push_short_circuits_when_mount_already_halted() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), b"alpha").unwrap();
@@ -2553,6 +2646,98 @@ mod tests {
             requests
         });
         (format!("http://{addr}"), server)
+    }
+
+    async fn push_forbidden_server() -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            while let Ok(Ok((mut stream, _))) =
+                timeout(Duration::from_millis(200), listener.accept()).await
+            {
+                let (request_line, _body) = read_http_request(&mut stream).await;
+                requests.push(request_line.clone());
+                if request_line == "POST /api/folders/folder-1/ops" {
+                    write_http_response(&mut stream, "403 Forbidden", b"{}").await;
+                } else if request_line == "GET /api/folders/folder-1/ops?since=0" {
+                    write_http_response(&mut stream, "200 OK", br#"{"ops":[],"up_to_seq":0}"#)
+                        .await;
+                } else {
+                    write_http_response(&mut stream, "404 Not Found", b"{}").await;
+                }
+            }
+            requests
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    async fn push_transient_failure_server() -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            while let Ok(Ok((mut stream, _))) =
+                timeout(Duration::from_millis(200), listener.accept()).await
+            {
+                let (request_line, _body) = read_http_request(&mut stream).await;
+                requests.push(request_line.clone());
+                if request_line == "POST /api/folders/folder-1/ops" {
+                    write_http_response(&mut stream, "503 Service Unavailable", b"{}").await;
+                } else if request_line == "GET /api/folders/folder-1/ops?since=0" {
+                    write_http_response(&mut stream, "200 OK", br#"{"ops":[],"up_to_seq":0}"#)
+                        .await;
+                } else {
+                    write_http_response(&mut stream, "404 Not Found", b"{}").await;
+                }
+            }
+            requests
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    #[tokio::test]
+    async fn a_transient_push_failure_leaves_pending_ops_nonzero_and_no_mount_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"alpha").unwrap();
+        let mut state = test_state();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        {
+            let conn = state.db.lock().await;
+            mounts::upsert_mount(&conn, &mount.path, &mount.folder_id, None, None, None, true)
+                .unwrap();
+            nodes::upsert_node(
+                &conn,
+                &LocalNode {
+                    node_id: "root-node".into(),
+                    folder_id: mount.folder_id.clone(),
+                    parent_id: None,
+                    name: "Mount".into(),
+                    node_type: "folder".into(),
+                    current_version_id: None,
+                    server_seq: 0,
+                    deleted_at: None,
+                },
+            )
+            .unwrap();
+        }
+        *state.mounts.lock().await = vec![mount.clone()];
+        let (backend_url, server) = push_transient_failure_server().await;
+        state.config.backend_url = backend_url;
+
+        let summary = full_sync_mount(&state, &mount).await;
+        let _ = server.await.unwrap();
+        let status = crate::control::get_status(State(state)).await.unwrap().0;
+
+        assert_eq!(summary.errors, 1);
+        assert_eq!(
+            status.mounts[0].pending_ops, 1,
+            "a pass with errors must not report pending_ops == 0: that is what the CLI's sync barrier reads as settled"
+        );
+        assert!(
+            status.mounts[0].error.is_none(),
+            "a transient push failure is retryable, not a persistent mount error"
+        );
     }
 
     async fn read_http_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
