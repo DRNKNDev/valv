@@ -50,7 +50,29 @@ Manages a launchd agent (`dev.drnkn.valvd`) on macOS or a systemd user service (
     valv pause
     valv resume
 
-`--folder` and `--grant` on `mount` are mutually exclusive: omit both to create a new folder, `--folder` to mount an existing one, `--grant` to mount a shared folder from an invite token. `unmount --folder` is required.
+`--folder` and `--grant` on `mount` are mutually exclusive: omit both to create a new folder, `--folder` to mount an existing one, `--grant` to mount a shared folder using an access key (from `grant create --device`, or "Add Access Key..." in the macOS app). An invite token does not work here: accepting an invite requires signing in as a user in a browser, not a device credential. `unmount --folder` is required.
+
+## Headless machines (access keys)
+
+    valv daemon install
+    valv mount <path> --grant <token>
+
+No `valv auth login`, no hand-edited `config.toml`. `daemon install` writes only `backend_url`, `device_name`, and `mounts = []`; it no longer writes empty `device_id`/`device_token` placeholders, and `valvd` no longer requires either to start. It starts credential-less, idles, and begins syncing the moment `mount --grant` hands it a token, no restart needed.
+
+This makes two kinds of machine:
+
+- An **account machine** holds a `device_token` belonging to a signed-in user (written only by `valv auth login`).
+- An **access-key machine** holds no account at all, only a folder-scoped, ownerless, revocable credential redeemed by `mount --grant <token>` (minted by `grant create --device`, or "Add Access Key..." in the macOS app). The token is stored on that mount only, never promoted into `device_token`, so a second mount on the same box can't silently inherit the wrong scope.
+
+`mount --grant` is the one command that needs no existing config or credential: the token on the command line is the credential.
+
+What an access-key machine cannot do, enforced server-side with a stable 403 code:
+
+- Mint another access key or send an invite: `access_key_cannot_issue_keys`, `access_key_cannot_invite_people`.
+- Revoke anything, including its own grant: `access_key_cannot_revoke`.
+- List who else a folder is shared with: `access_key_cannot_list_grants`. It sees only its own access, via `GET /grants`.
+
+The `valv` CLI does not yet turn these into a clean local refusal; `grant create`, `grants`, and `grant revoke` still hard-require a `device_token` (see the error table below), so none of them are runnable from an access-key-only machine at all today. The codes above matter when something calls the backend directly with the access key as the bearer token.
 
 ## Versions and restore
 
@@ -67,6 +89,12 @@ Paths are canonicalized before the call. `restore` reports one result: `applied`
 
 `grant create` requires exactly one of `--to` (email invite, prints an invite URL) or `--device` (prints a one-time device token, grant id, and device id: capture it, it is not shown again). Write access is the default; pass `--read-only` for read-only.
 
+### Sharing management is incomplete on the CLI
+
+The backend can now show and manage everything shared from a folder: who has access (invited users and access keys, not just the caller's own), pending invites, and key rotation. `valv grants` has not caught up. It still reads the self-scoped `GET /grants` and filters client-side by folder, so it only ever shows the calling principal's own access, never a full "who has this folder" list, and it has no way to see or cancel a pending invite. `grant create` and `grant revoke` are unchanged too. Do not tell a user `valv grants` can show them their collaborators; it cannot yet. Pointing the CLI at the folder-scoped endpoints is a later change, not this one.
+
+The macOS app is ahead of the CLI here: its "Manage Folders & Sharing" window reads the folder-scoped grants list, so its "Shared With" table can show invited collaborators and access keys with working Revoke, plus a Regenerate action per key and pending invites with Cancel. Its device-provisioning button is "Add Access Key..." (renamed from "Add Device...").
+
 ## Update
 
     valv update
@@ -76,11 +104,13 @@ Self-updates `valv` and the sibling `valvd` from GitHub releases, verifying chec
 
 ## Error to fix
 
+`Not signed in` and `Missing device_token` only come from `grant create`, `grants`, and `grant revoke`, the three commands that still call the backend directly with an account's `device_token`. `mount`, `unmount`, `status`, `pause`, `resume`, `sync`, `versions`, `restore`, and `daemon` all go through the daemon socket instead and need no `device_token` at all, so a machine with none (an access-key-only setup, see "Headless machines" above) never hits either error for those commands.
+
 | Error | Fix |
 | --- | --- |
 | `Daemon is not running` / `DAEMON_NOT_RUNNING` | `valv daemon install`, then retry. |
-| `Not signed in. Run: valv auth login` | `valv auth login`. Only `auth login` populates `device_token`. |
-| `Missing device_token in config.toml` | `valv auth login`. Means a config template exists (usually written by `valv daemon install`) but no token. `daemon install` does not sign you in. |
+| `Not signed in. Run: valv auth login` | Only from `grant create`/`grants`/`grant revoke`. `valv auth login`, the only command that populates `device_token`. Not the fix for a headless access-key machine, which has no `device_token` by design and does not run these commands. |
+| `Missing device_token in config.toml` | Same three commands only. Means `config.toml` exists (often written by `valv daemon install`) but has no `device_token`, which `daemon install` no longer writes even as a placeholder. `valv auth login` fixes it if you actually want a full account on this machine; do not run it just because a mount is working fine off an access key. |
 | `--folder and --grant are mutually exclusive` | Pass only one, or neither to create a new folder. |
 | `path is not inside a mounted folder` | Mount the parent folder first, or pass a path under an existing mount. |
 | `path is not present in the local mirror` | Run `valv sync` so the daemon populates the mirror, then retry. |
