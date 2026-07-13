@@ -39,10 +39,16 @@ usage() {
 Usage:
   APPLE_TEAM_ID="TEAMID" \
   NOTARY_PROFILE="valv-notary" \
+  VALV_RELEASE_NOTES_FILE="/path/to/notes.md" \
     macos/scripts/release-app.sh v0.1.0
 
-Produces Valv-<version>.dmg (signed + notarized + stapled) and uploads it plus
-its SHA-256 to the <tag> GitHub Release on ${VALV_GITHUB_REPO:-DRNKNDev/valv}.
+Produces Valv-<version>.dmg (signed + notarized + stapled) and uploads it, its
+SHA-256, and any Sparkle deltas to the <tag> GitHub Release on
+${VALV_GITHUB_REPO:-DRNKNDev/valv}.
+
+VALV_RELEASE_NOTES_FILE is the markdown shown in the in-app update dialog. It
+may be a trimmed version of the GitHub Release body (see
+tooling/release/release-notes.md).
 USAGE
 }
 
@@ -188,15 +194,6 @@ digest="$(sha256_file "${dmg_path}")"
 checksum_file="${work_dir}/Valv-${version}.dmg.sha256"
 echo "${digest}  Valv-${version}.dmg" > "${checksum_file}"
 
-echo "==> Uploading to ${repo} ${tag}"
-gh release upload "${tag}" \
-  --repo "${repo}" \
-  --clobber \
-  "${dmg_path}" \
-  "${checksum_file}"
-
-echo "Published Valv-${version}.dmg (sha256 ${digest}) to ${repo} ${tag}"
-
 generate_appcast_bin="$(command -v generate_appcast 2>/dev/null || find "${HOME}/Library/Developer/Xcode/DerivedData" -name generate_appcast -path '*sparkle*' 2>/dev/null | head -1)"
 [[ -x "${generate_appcast_bin}" ]] || fail "generate_appcast not found on PATH or in DerivedData Sparkle artifacts (build the app once so SPM resolves Sparkle's tools)"
 
@@ -205,19 +202,58 @@ mkdir -p "${dmg_archive_dir}"
 echo "==> Archiving Valv-${version}.dmg into the local release archive (${dmg_archive_dir})"
 cp "${dmg_path}" "${dmg_archive_dir}/Valv-${version}.dmg"
 
+appcast_output="${dmg_archive_dir}/appcast.xml"
+if [[ ! -f "${appcast_output}" && -f "${appcast_path}" ]]; then
+  cp "${appcast_path}" "${appcast_output}"
+fi
+
+notes_file="${VALV_RELEASE_NOTES_FILE:-}"
+if [[ -n "${notes_file}" ]]; then
+  [[ -f "${notes_file}" ]] || fail "VALV_RELEASE_NOTES_FILE not found: ${notes_file}"
+  cp "${notes_file}" "${dmg_archive_dir}/Valv-${version}.md"
+  echo "==> Release notes staged as Valv-${version}.md"
+else
+  echo "valv release-app: VALV_RELEASE_NOTES_FILE unset - ${tag}'s appcast item will have no description" >&2
+fi
+
 echo "==> Generating signed appcast entry"
-generate_appcast_args=("${dmg_archive_dir}")
+generate_appcast_args=("${dmg_archive_dir}" --embed-release-notes)
 if [[ -n "${SPARKLE_ED_KEY_FILE:-}" ]]; then
   generate_appcast_args+=(--ed-key-file "${SPARKLE_ED_KEY_FILE}")
 fi
 generate_appcast_args+=(--download-url-prefix "${SPARKLE_DOWNLOAD_URL_PREFIX:-https://github.com/${repo}/releases/download/${tag}/}")
 "${generate_appcast_bin}" "${generate_appcast_args[@]}"
 
-appcast_output="${dmg_archive_dir}/appcast.xml"
 [[ -f "${appcast_output}" ]] || fail "generate_appcast did not produce ${appcast_output}"
+
+# --download-url-prefix applies this tag's prefix to every archive in the dir, so
+# each past release's DMG is served from the tag that actually carries it.
+sed -i '' -E \
+  's#(releases/download/)v[0-9][^/]*/Valv-([0-9][^/]*)\.dmg#\1v\2/Valv-\2.dmg#g' \
+  "${appcast_output}"
 
 cp "${appcast_output}" "${appcast_path}"
 echo "==> Wrote ${appcast_path}"
+
+echo "==> Uploading to ${repo} ${tag}"
+upload_files=("${dmg_path}" "${checksum_file}")
+while IFS= read -r delta; do
+  upload_files+=("${delta}")
+done < <(find "${dmg_archive_dir}" -maxdepth 1 -name "Valv${current_project_version}-*.delta")
+gh release upload "${tag}" \
+  --repo "${repo}" \
+  --clobber \
+  "${upload_files[@]}"
+
+echo "Published Valv-${version}.dmg (sha256 ${digest}) to ${repo} ${tag}"
+
+echo "==> Verifying every ${tag} enclosure resolves to an uploaded asset"
+assets="$(gh release view "${tag}" --repo "${repo}" --json assets --jq '.assets[].name')"
+while IFS= read -r asset; do
+  [[ -z "${asset}" ]] && continue
+  grep -qx "${asset}" <<<"${assets}" ||
+    fail "appcast references ${asset} under ${tag}, but no such asset exists on the release"
+done < <(grep -oE "releases/download/${tag}/[^\"]+" "${appcast_path}" | sed -E 's#.*/##')
 
 cat <<STEPS
 
