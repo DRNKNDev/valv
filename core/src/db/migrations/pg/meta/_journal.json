@@ -29,6 +29,20 @@
       "when": 1783328749130,
       "tag": "0003_foamy_stranger",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1783938680068,
+      "tag": "0004_folder_grants_attribution",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1783947334752,
+      "tag": "0005_folder_invites_surrogate_id",
+      "breakpoints": true
     }
   ]
 }

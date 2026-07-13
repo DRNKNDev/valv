@@ -1,0 +1,2 @@
+ALTER TABLE "folder_invites" ADD COLUMN "invite_id" uuid DEFAULT gen_random_uuid() NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "folder_invites_invite_id_unique" ON "folder_invites" USING btree ("invite_id");

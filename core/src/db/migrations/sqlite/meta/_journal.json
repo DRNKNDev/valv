@@ -29,6 +29,20 @@
       "when": 1783328756835,
       "tag": "0003_oval_ink",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1783938686167,
+      "tag": "0004_folder_grants_attribution",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1783947347851,
+      "tag": "0005_folder_invites_surrogate_id",
+      "breakpoints": true
     }
   ]
 }

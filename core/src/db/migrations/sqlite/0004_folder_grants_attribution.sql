@@ -1,0 +1,3 @@
+ALTER TABLE `folder_grants` ADD `name` text;--> statement-breakpoint
+ALTER TABLE `folder_grants` ADD `created_by_user_id` text;--> statement-breakpoint
+CREATE UNIQUE INDEX `folder_grants_folder_name_unique` ON `folder_grants` (`folder_id`,`name`) WHERE "folder_grants"."device_id" IS NOT NULL;

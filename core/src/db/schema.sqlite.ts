@@ -158,12 +158,14 @@ export const folderGrants = sqliteTable(
       .references(() => nodes.nodeId),
     userId: text("user_id"),
     deviceId: text("device_id").references(() => devices.deviceId),
+    name: text("name"),
     role: text("role", { enum: ["owner", "collaborator"] })
       .notNull()
       .default("collaborator"),
     canRead: integer("can_read", { mode: "boolean" }).notNull().default(true),
     canWrite: integer("can_write", { mode: "boolean" }).notNull().default(true),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().default(sqliteNowMs),
+    createdByUserId: text("created_by_user_id"),
   },
   (table) => [
     check(
@@ -176,26 +178,34 @@ export const folderGrants = sqliteTable(
       table.userId,
       table.deviceId,
     ),
+    uniqueIndex("folder_grants_folder_name_unique")
+      .on(table.folderId, table.name)
+      .where(sql`${table.deviceId} IS NOT NULL`),
   ],
 );
 
-export const folderInvites = sqliteTable("folder_invites", {
-  inviteToken: text("invite_token").primaryKey(),
-  folderId: text("folder_id")
-    .notNull()
-    .references(() => sharedFolders.folderId),
-  scopeNodeId: text("scope_node_id")
-    .notNull()
-    .references(() => nodes.nodeId),
-  invitedEmail: text("invited_email").notNull(),
-  invitedByUserId: text("invited_by_user_id").notNull(),
-  canWrite: integer("can_write", { mode: "boolean" }).notNull().default(true),
-  status: text("status", { enum: ["pending", "accepted", "revoked", "expired"] })
-    .notNull()
-    .default("pending"),
-  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().default(sqliteNowMs),
-  expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
-});
+export const folderInvites = sqliteTable(
+  "folder_invites",
+  {
+    inviteId: text("invite_id").notNull(),
+    inviteToken: text("invite_token").primaryKey(),
+    folderId: text("folder_id")
+      .notNull()
+      .references(() => sharedFolders.folderId),
+    scopeNodeId: text("scope_node_id")
+      .notNull()
+      .references(() => nodes.nodeId),
+    invitedEmail: text("invited_email").notNull(),
+    invitedByUserId: text("invited_by_user_id").notNull(),
+    canWrite: integer("can_write", { mode: "boolean" }).notNull().default(true),
+    status: text("status", { enum: ["pending", "accepted", "revoked", "expired"] })
+      .notNull()
+      .default("pending"),
+    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().default(sqliteNowMs),
+    expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
+  },
+  (table) => [uniqueIndex("folder_invites_invite_id_unique").on(table.inviteId)],
+);
 
 export const opLog = sqliteTable(
   "op_log",

@@ -162,12 +162,14 @@ export const folderGrants = pgTable(
       .references(() => nodes.nodeId),
     userId: text("user_id"),
     deviceId: uuid("device_id").references(() => devices.deviceId),
+    name: text("name"),
     role: text("role", { enum: ["owner", "collaborator"] })
       .notNull()
       .default("collaborator"),
     canRead: boolean("can_read").notNull().default(true),
     canWrite: boolean("can_write").notNull().default(true),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    createdByUserId: text("created_by_user_id"),
   },
   (table) => [
     check(
@@ -180,26 +182,34 @@ export const folderGrants = pgTable(
       table.userId,
       table.deviceId,
     ),
+    uniqueIndex("folder_grants_folder_name_unique")
+      .on(table.folderId, table.name)
+      .where(sql`${table.deviceId} IS NOT NULL`),
   ],
 );
 
-export const folderInvites = pgTable("folder_invites", {
-  inviteToken: text("invite_token").primaryKey(),
-  folderId: uuid("folder_id")
-    .notNull()
-    .references(() => sharedFolders.folderId),
-  scopeNodeId: uuid("scope_node_id")
-    .notNull()
-    .references(() => nodes.nodeId),
-  invitedEmail: text("invited_email").notNull(),
-  invitedByUserId: text("invited_by_user_id").notNull(),
-  canWrite: boolean("can_write").notNull().default(true),
-  status: text("status", { enum: ["pending", "accepted", "revoked", "expired"] })
-    .notNull()
-    .default("pending"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
-});
+export const folderInvites = pgTable(
+  "folder_invites",
+  {
+    inviteId: uuid("invite_id").notNull().defaultRandom(),
+    inviteToken: text("invite_token").primaryKey(),
+    folderId: uuid("folder_id")
+      .notNull()
+      .references(() => sharedFolders.folderId),
+    scopeNodeId: uuid("scope_node_id")
+      .notNull()
+      .references(() => nodes.nodeId),
+    invitedEmail: text("invited_email").notNull(),
+    invitedByUserId: text("invited_by_user_id").notNull(),
+    canWrite: boolean("can_write").notNull().default(true),
+    status: text("status", { enum: ["pending", "accepted", "revoked", "expired"] })
+      .notNull()
+      .default("pending"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [uniqueIndex("folder_invites_invite_id_unique").on(table.inviteId)],
+);
 
 export const opLog = pgTable(
   "op_log",
