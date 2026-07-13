@@ -248,7 +248,7 @@ final class DaemonManager: ObservableObject {
                 try await cleanInstallOperation(overwriteExisting)
             } else {
                 try copyBundledBinariesToStableLocation()
-                try await runValvDaemonInstall()
+                try await runValvdDaemonInstall()
             }
             installError = nil
             isManagedByValv = true
@@ -270,9 +270,10 @@ final class DaemonManager: ObservableObject {
         }
     }
 
-    private func runValvDaemonInstall() async throws {
-        let valvPath = stableBinDirectory.appendingPathComponent("valv").path
-        try await run(executable: valvPath, arguments: ["daemon", "install"])
+    // `valv daemon install` no longer exists; invoke `valvd daemon install` directly.
+    private func runValvdDaemonInstall() async throws {
+        let valvdPath = stableBinDirectory.appendingPathComponent("valvd").path
+        try await run(executable: valvdPath, arguments: ["daemon", "install"])
     }
 
     private func readRegisteredBinaryPath() -> String? {
