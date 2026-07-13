@@ -18,7 +18,7 @@ describe("folder routes", () => {
     const createdRoot = db.nodes.find((node) => node.folderId === db.sharedFolders[0]?.folderId && node.parentId === null);
     expect(createdRoot).toBeDefined();
     expect(db.folderGrants).toHaveLength(1);
-    expect(db.folderGrants[0]).toMatchObject({ userId: "user-1", deviceId: null, role: "owner" });
+    expect(db.folderGrants[0]).toMatchObject({ userId: "user-1", deviceId: null, role: "owner", createdByUserId: "user-1" });
     expect(db.folderGrants[0]?.scopeNodeId).toBe(createdRoot?.nodeId);
   });
 
@@ -33,7 +33,8 @@ describe("folder routes", () => {
     });
 
     expect(response.status).toBe(200);
-    expect(db.folderGrants[0]).toMatchObject({ userId: "user-1", deviceId: null, role: "owner" });
+    expect(db.folderGrants[0]).toMatchObject({ userId: "user-1", deviceId: null, role: "owner", createdByUserId: "user-1" });
+    expect(db.folderGrants[0]?.createdByUserId).not.toBe("device-1");
   });
 
   it("fires onFolderCreated with the new folder, owner, and grant", async () => {
@@ -141,6 +142,94 @@ describe("folder routes", () => {
     const deviceGrant = (await deviceResponse.json()).find((item: any) => item.grant_id === "grant-device");
     expect(userGrant).toMatchObject({ user_id: "user-1", device_id: null, grantee_email: "alice@example.com", device_name: null });
     expect(deviceGrant).toMatchObject({ user_id: null, device_id: "device-1", grantee_email: null, device_name: "CI Agent" });
+  });
+
+  it("GET /grants includes name from folder_grants", async () => {
+    const db = new LifecycleDb();
+    db.folderGrants.push(grant("grant-user", { userId: "user-1", scopeNodeId: "root", name: "build-01" }));
+
+    const response = await metadataAppFor(db, { type: "user", userId: "user-1" }).request("/grants");
+    const body = await response.json();
+
+    expect(body[0]).toMatchObject({ name: "build-01" });
+  });
+
+  it("GET /folders/:id/grants returns every grant on the folder, and a collaborator-provisioned key carries that collaborator's created_by_email", async () => {
+    const db = new LifecycleDb();
+    db.users.push({ id: "owner-1", email: "owner@example.com" });
+    db.users.push({ id: "collab-1", email: "collab@example.com" });
+    db.folderGrants.push(grant("grant-owner", { userId: "owner-1", scopeNodeId: "root", role: "owner", createdByUserId: "owner-1" }));
+    db.folderGrants.push(grant("grant-collab", { userId: "collab-1", scopeNodeId: "root", createdByUserId: "owner-1" }));
+    await db.createAgentGrantForRoute({
+      folderId: "folder-1",
+      scopeNodeId: "root",
+      deviceId: "device-1",
+      grantId: "grant-key",
+      tokenHash: "hash",
+      name: "build-01",
+      canRead: true,
+      canWrite: true,
+      createdByUserId: "collab-1",
+    });
+    db.authorizedScopes.add("root");
+
+    const response = await metadataAppFor(db, { type: "user", userId: "owner-1" }).request("/folders/folder-1/grants");
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toHaveLength(3);
+    const ownerRow = body.find((item: any) => item.grant_id === "grant-owner");
+    const collabRow = body.find((item: any) => item.grant_id === "grant-collab");
+    const keyRow = body.find((item: any) => item.grant_id === "grant-key");
+    expect(ownerRow).toMatchObject({ grantee_email: "owner@example.com", created_by_email: "owner@example.com" });
+    expect(collabRow).toMatchObject({ grantee_email: "collab@example.com", created_by_email: "owner@example.com" });
+    expect(keyRow).toMatchObject({ name: "build-01", device_id: "device-1", created_by_email: "collab@example.com" });
+  });
+
+  it("GET /folders/:id/grants returns 403 insufficient_permission for a read-only user", async () => {
+    const db = new LifecycleDb();
+    db.authorizeScope("root", { canWrite: false });
+
+    const response = await metadataAppFor(db, { type: "user", userId: "user-1" }).request("/folders/folder-1/grants");
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({ error: "insufficient_permission" });
+  });
+
+  it("GET /folders/:id/grants returns 403 access_key_cannot_list_grants for an access key, with no email in the body", async () => {
+    const db = new LifecycleDb();
+    db.users.push({ id: "owner-1", email: "owner@example.com" });
+    db.devices.push({ deviceId: "agent-1", userId: null, name: "Agent", tokenHash: "hash" });
+    db.folderGrants.push(grant("grant-owner", { userId: "owner-1", scopeNodeId: "root" }));
+    db.folderGrants.push(grant("grant-agent", { deviceId: "agent-1", scopeNodeId: "root", canWrite: true }));
+    const app = metadataAppFor(db, { type: "device", deviceId: "agent-1" });
+
+    const response = await app.request("/folders/folder-1/grants", { headers: { authorization: "Bearer device-token" } });
+    const text = await response.text();
+
+    expect(response.status).toBe(403);
+    expect(JSON.parse(text)).toEqual({ error: "access_key_cannot_list_grants" });
+    expect(text).not.toContain("owner@example.com");
+  });
+
+  it("GET /folders/:id/grants resolves a human-registered device to its user", async () => {
+    const db = new LifecycleDb();
+    db.devices.push({ deviceId: "mac-1", userId: "user-1", name: "Mac", tokenHash: "hash" });
+    db.folderGrants.push(grant("grant-owner", { userId: "user-1", scopeNodeId: "root" }));
+    const app = metadataAppFor(db, { type: "device", deviceId: "mac-1" });
+
+    const response = await app.request("/folders/folder-1/grants", { headers: { authorization: "Bearer device-token" } });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.map((item: any) => item.grant_id)).toContain("grant-owner");
+  });
+
+  it("GET /folders/:id/grants returns 404 for an unknown folder", async () => {
+    const response = await metadataAppFor(new LifecycleDb(), { type: "user", userId: "user-1" }).request("/folders/unknown-folder/grants");
+
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toEqual({ error: "folder_not_found" });
   });
 
   it("GET /folders/:id returns the folder's name for an authorized principal", async () => {

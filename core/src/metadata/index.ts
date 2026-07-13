@@ -8,6 +8,7 @@ import type { MetadataHub, MetadataVariables } from "./common.js";
 import { registerFolderRoutes } from "./folders.js";
 import { registerGrantRoutes, type OnGrantCreated } from "./grants.js";
 import { registerInviteRoutes } from "./invites.js";
+import { registerMeRoutes } from "./me.js";
 import { registerDeltaRoutes } from "./delta.js";
 import { registerOpRoutes, type CommittedOp } from "./ops.js";
 import { registerVersionRoutes } from "./versions.js";
@@ -33,6 +34,7 @@ export function createMetadataRouter(opts: CreateMetadataRouterOptions): Hono<{ 
   router.use("*", createAuthMiddleware(opts.auth));
   registerFolderRoutes(router, opts.auth, opts.onFolderCreated);
   registerInviteRoutes(router, opts.auth, opts.sendInviteEmail);
+  registerMeRoutes(router, opts.auth);
   registerGrantRoutes(router, opts.auth, {
     onGrantCreated: opts.onGrantCreated,
     onGrantDeviceCreated: opts.onGrantDeviceCreated,

@@ -11,12 +11,15 @@ export type FolderGrant = {
   scopeNodeId: string;
   userId: string | null;
   deviceId: string | null;
+  name: string | null;
   role: "owner" | "collaborator";
   canRead: boolean;
   canWrite: boolean;
+  createdByUserId: string | null;
 };
 
 export type FolderInvite = {
+  inviteId: string;
   inviteToken: string;
   folderId: string;
   scopeNodeId: string;
@@ -25,7 +28,35 @@ export type FolderInvite = {
   canWrite: boolean;
   status: "pending" | "accepted" | "revoked" | "expired";
   expiresAt: Date;
+  createdAt?: Date;
 };
+
+export class UniqueConstraintError extends Error {
+  code = "23505";
+  constraint: string;
+
+  constructor(constraint: string) {
+    super(`duplicate key value violates unique constraint "${constraint}"`);
+    this.name = "UniqueConstraintError";
+    this.constraint = constraint;
+  }
+}
+
+function extractEqValue(condition: unknown): string | undefined {
+  if (!condition || typeof condition !== "object" || !("queryChunks" in condition)) {
+    return undefined;
+  }
+  const chunks = (condition as { queryChunks: unknown[] }).queryChunks;
+  for (const chunk of chunks) {
+    if (chunk && typeof chunk === "object" && "value" in chunk) {
+      const value = (chunk as { value: unknown }).value;
+      if (typeof value === "string") {
+        return value;
+      }
+    }
+  }
+  return undefined;
+}
 
 export class LifecycleDb implements CoreDb {
   insert: CoreDb["insert"] = (table: unknown) => ({
@@ -64,28 +95,55 @@ export class LifecycleDb implements CoreDb {
             scopeNodeId: String(value.scopeNodeId),
             userId: value.userId === null || value.userId === undefined ? undefined : String(value.userId),
             deviceId: value.deviceId === null || value.deviceId === undefined ? undefined : String(value.deviceId),
+            name: value.name === null || value.name === undefined ? undefined : String(value.name),
             role: value.role as "owner" | "collaborator" | undefined,
             canRead: Boolean(value.canRead),
             canWrite: Boolean(value.canWrite),
+            createdByUserId:
+              value.createdByUserId === null || value.createdByUserId === undefined ? undefined : String(value.createdByUserId),
           }),
         );
       }
     },
   });
-  update: CoreDb["update"] = () => ({
-    set: (values: Partial<{ tokenHash: string }>) => ({
-      where: async () => {
-        if (values.tokenHash !== undefined) {
+  update: CoreDb["update"] = (table: unknown) => ({
+    set: (values: Partial<{ tokenHash: string; status: string }>) => ({
+      where: async (condition?: unknown) => {
+        if (table === pgSchema.devices) {
+          const deviceId = extractEqValue(condition);
           for (const device of this.devices) {
-            device.tokenHash = values.tokenHash;
+            if (deviceId !== undefined && device.deviceId !== deviceId) {
+              continue;
+            }
+            if (values.tokenHash !== undefined) {
+              device.tokenHash = values.tokenHash;
+            }
+          }
+          return;
+        }
+        if (table === pgSchema.folderInvites) {
+          const inviteToken = extractEqValue(condition);
+          for (const invite of this.folderInvites) {
+            if (inviteToken !== undefined && invite.inviteToken !== inviteToken) {
+              continue;
+            }
+            if (values.status !== undefined) {
+              invite.status = values.status as FolderInvite["status"];
+            }
           }
         }
       },
     }),
   });
-  delete: CoreDb["delete"] = () => ({
-    where: async () => {
-      this.folderGrants = [];
+  delete: CoreDb["delete"] = (table: unknown) => ({
+    where: async (condition?: unknown) => {
+      if (table === pgSchema.folderGrants) {
+        const grantId = extractEqValue(condition);
+        if (grantId === undefined) {
+          return;
+        }
+        this.folderGrants = this.folderGrants.filter((item) => item.grantId !== grantId);
+      }
     },
   });
   execute: CoreDb["execute"];
@@ -189,7 +247,13 @@ export class LifecycleDb implements CoreDb {
     this.sharedFolders.push({ folderId: opts.folderId, name: opts.name, ownerUserId: opts.ownerUserId });
     this.nodes.push({ nodeId: opts.rootNodeId, folderId: opts.folderId, parentId: null, name: "", type: "folder" });
     this.folderGrants.push(
-      grant(opts.grantId, { userId: opts.ownerUserId, scopeNodeId: opts.rootNodeId, folderId: opts.folderId, role: "owner" }),
+      grant(opts.grantId, {
+        userId: opts.ownerUserId,
+        scopeNodeId: opts.rootNodeId,
+        folderId: opts.folderId,
+        role: "owner",
+        createdByUserId: opts.ownerUserId,
+      }),
     );
   }
 
@@ -210,12 +274,36 @@ export class LifecycleDb implements CoreDb {
         can_write: item.canWrite,
         user_id: item.userId,
         device_id: item.deviceId,
+        name: item.name,
         grantee_email: item.userId ? this.users.find((user) => user.id === item.userId)?.email ?? null : null,
         device_name: item.deviceId ? this.devices.find((device) => device.deviceId === item.deviceId)?.name ?? null : null,
       }));
   }
 
+  async listFolderGrantsForRoute(folderId: string): Promise<unknown[]> {
+    return this.folderGrants
+      .filter((item) => item.folderId === folderId)
+      .map((item) => ({
+        grant_id: item.grantId,
+        folder_id: item.folderId,
+        scope_node_id: item.scopeNodeId,
+        role: item.role,
+        can_read: item.canRead,
+        can_write: item.canWrite,
+        user_id: item.userId,
+        device_id: item.deviceId,
+        name: item.name,
+        grantee_email: item.userId ? this.users.find((user) => user.id === item.userId)?.email ?? null : null,
+        device_name: item.deviceId ? this.devices.find((device) => device.deviceId === item.deviceId)?.name ?? null : null,
+        created_by_user_id: item.createdByUserId,
+        created_by_email: item.createdByUserId
+          ? this.users.find((user) => user.id === item.createdByUserId)?.email ?? null
+          : null,
+      }));
+  }
+
   async createInviteForRoute(opts: {
+    inviteId: string;
     inviteToken: string;
     folderId: string;
     scopeNodeId: string;
@@ -224,12 +312,36 @@ export class LifecycleDb implements CoreDb {
     canWrite: boolean;
     expiresAt: Date;
   }): Promise<{ folderName: string }> {
-    this.folderInvites.push({ ...opts, status: "pending" });
+    this.folderInvites.push({ ...opts, status: "pending", createdAt: new Date() });
     return { folderName: "Projects" };
   }
 
   async getInviteForRoute(inviteToken: string): Promise<FolderInvite | undefined> {
     return this.folderInvites.find((item) => item.inviteToken === inviteToken);
+  }
+
+  async getInviteByIdForRoute(inviteId: string): Promise<FolderInvite | undefined> {
+    return this.folderInvites.find((item) => item.inviteId === inviteId);
+  }
+
+  async listFolderInvitesForRoute(folderId: string): Promise<unknown[]> {
+    const now = Date.now();
+    return this.folderInvites
+      .filter((item) => item.folderId === folderId && item.status === "pending" && item.expiresAt.getTime() > now)
+      .map((item) => ({
+        invite_id: item.inviteId,
+        invited_email: item.invitedEmail,
+        scope_node_id: item.scopeNodeId,
+        can_write: item.canWrite,
+        created_at: item.createdAt ?? new Date(),
+        expires_at: item.expiresAt,
+        created_by_user_id: item.invitedByUserId,
+        created_by_email: this.users.find((user) => user.id === item.invitedByUserId)?.email ?? null,
+      }));
+  }
+
+  async deleteInviteForRoute(inviteId: string): Promise<void> {
+    this.folderInvites = this.folderInvites.filter((item) => item.inviteId !== inviteId);
   }
 
   async acceptInviteForRoute(opts: {
@@ -238,13 +350,19 @@ export class LifecycleDb implements CoreDb {
     folderId: string;
     scopeNodeId: string;
     canWrite: boolean;
+    invitedByUserId: string;
   }): Promise<void> {
     const invite = this.folderInvites.find((item) => item.inviteToken === opts.inviteToken);
     if (!invite || invite.status === "accepted") {
       return;
     }
     this.folderGrants.push(
-      grant(`accepted-${opts.inviteToken}`, { userId: opts.userId, scopeNodeId: opts.scopeNodeId, canWrite: opts.canWrite }),
+      grant(`accepted-${opts.inviteToken}`, {
+        userId: opts.userId,
+        scopeNodeId: opts.scopeNodeId,
+        canWrite: opts.canWrite,
+        createdByUserId: opts.invitedByUserId,
+      }),
     );
     invite.status = "accepted";
   }
@@ -258,15 +376,24 @@ export class LifecycleDb implements CoreDb {
     name: string;
     canRead: boolean;
     canWrite: boolean;
+    createdByUserId: string | undefined;
   }): Promise<void> {
+    const nameTaken = this.folderGrants.some(
+      (item) => item.folderId === opts.folderId && item.deviceId !== null && item.name === opts.name,
+    );
+    if (nameTaken) {
+      throw new UniqueConstraintError("folder_grants_folder_name_unique");
+    }
     this.devices.push({ deviceId: opts.deviceId, userId: null, name: opts.name, tokenHash: opts.tokenHash });
     this.folderGrants.push(
       grant(opts.grantId, {
         folderId: opts.folderId,
         scopeNodeId: opts.scopeNodeId,
         deviceId: opts.deviceId,
+        name: opts.name,
         canRead: opts.canRead,
         canWrite: opts.canWrite,
+        createdByUserId: opts.createdByUserId,
       }),
     );
   }
@@ -282,6 +409,77 @@ export class LifecycleDb implements CoreDb {
 
   async deleteGrantForRoute(grantId: string): Promise<void> {
     this.folderGrants = this.folderGrants.filter((item) => item.grantId !== grantId);
+  }
+
+  async regenerateGrantForRoute(opts: {
+    oldGrantId: string;
+    newDeviceId: string;
+    newGrantId: string;
+    tokenHash: string;
+    createdByUserId: string | undefined;
+    onBeforeCommit?: (info: { folderId: string; scopeNodeId: string; deviceId: string; grantId: string }) => Promise<void>;
+  }): Promise<{ folderId: string; scopeNodeId: string; name: string | null; canRead: boolean; canWrite: boolean } | undefined> {
+    const old = this.folderGrants.find((item) => item.grantId === opts.oldGrantId);
+    if (!old || old.deviceId === null) {
+      return undefined;
+    }
+    const oldDevice = this.devices.find((item) => item.deviceId === old.deviceId);
+    const priorTokenHash = oldDevice?.tokenHash;
+    const priorGrant = { ...old };
+
+    this.folderGrants = this.folderGrants.filter((item) => item.grantId !== opts.oldGrantId);
+    if (oldDevice) {
+      oldDevice.tokenHash = `revoked:${opts.oldGrantId}`;
+    }
+    this.devices.push({ deviceId: opts.newDeviceId, userId: null, name: old.name ?? "Agent", tokenHash: opts.tokenHash });
+    this.folderGrants.push(
+      grant(opts.newGrantId, {
+        folderId: old.folderId,
+        scopeNodeId: old.scopeNodeId,
+        deviceId: opts.newDeviceId,
+        name: old.name ?? undefined,
+        canRead: old.canRead,
+        canWrite: old.canWrite,
+        createdByUserId: opts.createdByUserId,
+      }),
+    );
+
+    if (opts.onBeforeCommit) {
+      try {
+        await opts.onBeforeCommit({ folderId: old.folderId, scopeNodeId: old.scopeNodeId, deviceId: opts.newDeviceId, grantId: opts.newGrantId });
+      } catch (error) {
+        this.folderGrants = this.folderGrants.filter((item) => item.grantId !== opts.newGrantId);
+        this.devices = this.devices.filter((item) => item.deviceId !== opts.newDeviceId);
+        if (oldDevice && priorTokenHash !== undefined) {
+          oldDevice.tokenHash = priorTokenHash;
+        }
+        this.folderGrants.push(priorGrant);
+        throw error;
+      }
+    }
+    return { folderId: old.folderId, scopeNodeId: old.scopeNodeId, name: old.name, canRead: old.canRead, canWrite: old.canWrite };
+  }
+
+  async resolvePrincipalStatusForRoute(principal: Principal): Promise<{
+    type: "account" | "access_key";
+    email?: string;
+    scopes: Array<{ folder_id: string; folder_name: string; scope_label: string; can_write: boolean }>;
+  }> {
+    const effectiveUserId = principal.type === "user" ? principal.userId : this.devices.find((d) => d.deviceId === principal.deviceId)?.userId;
+    if (effectiveUserId) {
+      return { type: "account", email: this.users.find((user) => user.id === effectiveUserId)?.email, scopes: [] };
+    }
+    const deviceId = (principal as { type: "device"; deviceId: string }).deviceId;
+    const scopes = this.folderGrants
+      .filter((item) => item.deviceId === deviceId)
+      .map((item) => {
+        const folder = this.sharedFolders.find((f) => f.folderId === item.folderId);
+        const rootNodeId = this.nodes.find((node) => node.folderId === item.folderId && node.parentId === null)?.nodeId;
+        const node = this.nodes.find((n) => n.nodeId === item.scopeNodeId);
+        const scopeLabel = item.scopeNodeId === rootNodeId ? (folder?.name ?? "") : (node?.name ?? folder?.name ?? "");
+        return { folder_id: item.folderId, folder_name: folder?.name ?? "", scope_label: scopeLabel, can_write: item.canWrite };
+      });
+    return { type: "access_key", scopes };
   }
 }
 
@@ -327,9 +525,11 @@ export function grant(
     scopeNodeId: string;
     userId?: string;
     deviceId?: string;
+    name?: string;
     role?: "owner" | "collaborator";
     canRead?: boolean;
     canWrite?: boolean;
+    createdByUserId?: string;
   },
 ): FolderGrant {
   return {
@@ -338,8 +538,10 @@ export function grant(
     scopeNodeId: opts.scopeNodeId,
     userId: opts.userId ?? null,
     deviceId: opts.deviceId ?? null,
+    name: opts.name ?? null,
     role: opts.role ?? "collaborator",
     canRead: opts.canRead ?? true,
     canWrite: opts.canWrite ?? true,
+    createdByUserId: opts.createdByUserId ?? null,
   };
 }

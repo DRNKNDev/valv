@@ -32,6 +32,7 @@ describe("invite routes", () => {
   it("accepts invites idempotently and grants the accepting user", async () => {
     const db = new LifecycleDb();
     db.folderInvites.push({
+      inviteId: "invite-1",
       inviteToken: "token-1",
       folderId: "folder-1",
       scopeNodeId: "root",
@@ -50,6 +51,8 @@ describe("invite routes", () => {
     expect(second.status).toBe(200);
     expect(db.folderGrants).toHaveLength(1);
     expect(db.folderGrants[0]).toMatchObject({ userId: "user-2", deviceId: null, scopeNodeId: "root", canWrite: true });
+    expect(db.folderGrants[0]?.createdByUserId).toBe("user-1");
+    expect(db.folderGrants[0]?.createdByUserId).not.toBe("user-2");
   });
 
   it("rejects invite creation from a read-only grant holder", async () => {
@@ -142,13 +145,14 @@ describe("invite routes", () => {
     });
 
     expect(response.status).toBe(403);
-    await expect(response.json()).resolves.toEqual({ error: "agent_devices_cannot_create_invites" });
+    await expect(response.json()).resolves.toEqual({ error: "access_key_cannot_invite_people" });
     expect(db.folderInvites).toHaveLength(0);
   });
 
   it("accepting a read-only invite grants a read-only, not read-write, scope", async () => {
     const db = new LifecycleDb();
     db.folderInvites.push({
+      inviteId: "invite-readonly",
       inviteToken: "readonly-token",
       folderId: "folder-1",
       scopeNodeId: "root",
@@ -169,6 +173,7 @@ describe("invite routes", () => {
   it("rejects expired invites with 410", async () => {
     const db = new LifecycleDb();
     db.folderInvites.push({
+      inviteId: "invite-expired",
       inviteToken: "expired",
       folderId: "folder-1",
       scopeNodeId: "root",
@@ -185,5 +190,159 @@ describe("invite routes", () => {
 
     expect(response.status).toBe(410);
     expect(db.folderGrants).toHaveLength(0);
+  });
+
+  it("GET /folders/:id/invites lists pending invites and excludes accepted and expired ones", async () => {
+    const db = new LifecycleDb();
+    db.users.push({ id: "user-1", email: "owner@example.com" });
+    db.folderInvites.push({
+      inviteId: "invite-pending",
+      inviteToken: "pending-token",
+      folderId: "folder-1",
+      scopeNodeId: "root",
+      invitedEmail: "pending@example.com",
+      invitedByUserId: "user-1",
+      canWrite: true,
+      status: "pending",
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    db.folderInvites.push({
+      inviteId: "invite-accepted",
+      inviteToken: "accepted-token",
+      folderId: "folder-1",
+      scopeNodeId: "root",
+      invitedEmail: "accepted@example.com",
+      invitedByUserId: "user-1",
+      canWrite: true,
+      status: "accepted",
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    db.folderInvites.push({
+      inviteId: "invite-expired",
+      inviteToken: "expired-token",
+      folderId: "folder-1",
+      scopeNodeId: "root",
+      invitedEmail: "expired@example.com",
+      invitedByUserId: "user-1",
+      canWrite: true,
+      status: "pending",
+      expiresAt: new Date(Date.now() - 60_000),
+    });
+    db.authorizedScopes.add("root");
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" });
+
+    const response = await app.request("/folders/folder-1/invites");
+    const body = await response.json();
+    const text = JSON.stringify(body);
+
+    expect(response.status).toBe(200);
+    expect(body).toHaveLength(1);
+    expect(body[0]).toMatchObject({
+      invite_id: "invite-pending",
+      invited_email: "pending@example.com",
+      created_by_email: "owner@example.com",
+    });
+    expect(body[0].invite_id).not.toBe("pending-token");
+    expect(text).not.toContain("pending-token");
+    expect(text).not.toContain("invite_token");
+  });
+
+  it("GET /folders/:id/invites returns 403 access_key_cannot_list_grants for an access key, with no invited email in the body", async () => {
+    const db = new LifecycleDb();
+    db.devices.push({ deviceId: "agent-1", userId: null, name: "Agent", tokenHash: "hash" });
+    db.folderGrants.push(grant("grant-agent", { deviceId: "agent-1", scopeNodeId: "root", canWrite: true }));
+    db.folderInvites.push({
+      inviteId: "invite-1",
+      inviteToken: "pending-token",
+      folderId: "folder-1",
+      scopeNodeId: "root",
+      invitedEmail: "secret@example.com",
+      invitedByUserId: "user-1",
+      canWrite: true,
+      status: "pending",
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    const app = metadataAppFor(db, { type: "device", deviceId: "agent-1" });
+
+    const response = await app.request("/folders/folder-1/invites", { headers: { authorization: "Bearer device-token" } });
+    const text = await response.text();
+
+    expect(response.status).toBe(403);
+    expect(JSON.parse(text)).toEqual({ error: "access_key_cannot_list_grants" });
+    expect(text).not.toContain("secret@example.com");
+  });
+
+  it("DELETE /folders/:id/invites/:inviteId cancels a pending invite", async () => {
+    const db = new LifecycleDb();
+    db.folderInvites.push({
+      inviteId: "invite-1",
+      inviteToken: "pending-token",
+      folderId: "folder-1",
+      scopeNodeId: "root",
+      invitedEmail: "friend@example.com",
+      invitedByUserId: "user-1",
+      canWrite: true,
+      status: "pending",
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    db.authorizedScopes.add("root");
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" });
+
+    const response = await app.request("/folders/folder-1/invites/invite-1", { method: "DELETE" });
+
+    expect(response.status).toBe(204);
+    expect(db.folderInvites).toHaveLength(0);
+
+    const accept = await app.request("/invites/pending-token/accept", { method: "POST" });
+    expect(accept.status).toBe(404);
+  });
+
+  it("DELETE /folders/:id/invites/:inviteId returns 409 for an already-accepted invite", async () => {
+    const db = new LifecycleDb();
+    db.folderInvites.push({
+      inviteId: "invite-1",
+      inviteToken: "accepted-token",
+      folderId: "folder-1",
+      scopeNodeId: "root",
+      invitedEmail: "friend@example.com",
+      invitedByUserId: "user-1",
+      canWrite: true,
+      status: "accepted",
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    db.authorizedScopes.add("root");
+    const app = metadataAppFor(db, { type: "user", userId: "user-1" });
+
+    const response = await app.request("/folders/folder-1/invites/invite-1", { method: "DELETE" });
+
+    expect(response.status).toBe(409);
+    expect(db.folderInvites).toHaveLength(1);
+  });
+
+  it("DELETE /folders/:id/invites/:inviteId returns 403 access_key_cannot_revoke for an access key", async () => {
+    const db = new LifecycleDb();
+    db.devices.push({ deviceId: "agent-1", userId: null, name: "Agent", tokenHash: "hash" });
+    db.folderGrants.push(grant("grant-agent", { deviceId: "agent-1", scopeNodeId: "root", canWrite: true }));
+    db.folderInvites.push({
+      inviteId: "invite-1",
+      inviteToken: "pending-token",
+      folderId: "folder-1",
+      scopeNodeId: "root",
+      invitedEmail: "friend@example.com",
+      invitedByUserId: "user-1",
+      canWrite: true,
+      status: "pending",
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    const app = metadataAppFor(db, { type: "device", deviceId: "agent-1" });
+
+    const response = await app.request("/folders/folder-1/invites/invite-1", {
+      method: "DELETE",
+      headers: { authorization: "Bearer device-token" },
+    });
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({ error: "access_key_cannot_revoke" });
+    expect(db.folderInvites).toHaveLength(1);
   });
 });

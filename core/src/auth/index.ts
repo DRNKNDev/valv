@@ -29,6 +29,7 @@ export type CoreDb = {
   update: any;
   delete: any;
   execute?: any;
+  run?: any;
   transaction?: any;
 };
 

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { Context } from "hono";
 
 import type { AuthVariables, CoreAuth, CoreSchema, Principal } from "../auth/index.js";
@@ -22,11 +22,32 @@ export function newId(): string {
   return randomUUID();
 }
 
-export async function inTransaction<T>(auth: CoreAuth, fn: (tx: CoreAuth["db"]) => Promise<T>): Promise<T> {
+export async function inTransaction<T>(
+  auth: CoreAuth,
+  fn: (tx: CoreAuth["db"]) => Promise<T>,
+  opts: { atomicOnSqlite?: boolean } = {},
+): Promise<T> {
   if (typeof auth.db.transaction === "function" && supportsForUpdate(auth.schema)) {
     return auth.db.transaction(fn);
   }
+  if (opts.atomicOnSqlite && auth.schema === sqliteSchema && typeof auth.db.run === "function") {
+    return inRawSqliteTransaction(auth, fn);
+  }
   return fn(auth.db);
+}
+
+// better-sqlite3's db.transaction() requires a sync callback and throws on a promise, hence the hand-rolled BEGIN/COMMIT/ROLLBACK.
+async function inRawSqliteTransaction<T>(auth: CoreAuth, fn: (tx: CoreAuth["db"]) => Promise<T>): Promise<T> {
+  await auth.db.run(sql`BEGIN IMMEDIATE`);
+  let result: T;
+  try {
+    result = await fn(auth.db);
+  } catch (error) {
+    await auth.db.run(sql`ROLLBACK`);
+    throw error;
+  }
+  await auth.db.run(sql`COMMIT`);
+  return result;
 }
 
 export function supportsForUpdate(schema: CoreSchema): boolean {
@@ -85,6 +106,34 @@ function hasDeviceUserRouteLoader(db: CoreAuth["db"]): db is CoreAuth["db"] & {
   return "getDeviceUserIdForRoute" in db;
 }
 
+export async function requireUserBackedPrincipal(
+  auth: CoreAuth,
+  ctx: Context<{ Variables: MetadataVariables }>,
+  principal: Principal,
+  errorCode: string,
+): Promise<string | Response> {
+  const userId = await resolveEffectiveUserId(auth, principal);
+  if (!userId) {
+    return ctx.json({ error: errorCode }, 403);
+  }
+  return userId;
+}
+
+export async function resolveEmailsByUserId(
+  auth: CoreAuth,
+  userIds: Iterable<string | null | undefined>,
+): Promise<Map<string, string>> {
+  const ids = [...new Set([...userIds].filter((id): id is string => Boolean(id)))];
+  if (ids.length === 0) {
+    return new Map();
+  }
+  const rows = await auth.db
+    .select({ id: auth.schema.user.id, email: auth.schema.user.email })
+    .from(auth.schema.user)
+    .where(inArray(auth.schema.user.id, ids));
+  return new Map(rows.map((row: { id: string; email: string }) => [row.id, row.email]));
+}
+
 export async function assertGrant(
   auth: CoreAuth,
   nodeId: string,
@@ -111,4 +160,4 @@ export function toIso(value: Date | number | string | null): string | null {
   return new Date(value).toISOString();
 }
 
-export { and, desc, eq };
+export { and, desc, eq, gt, inArray };

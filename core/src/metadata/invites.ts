@@ -8,16 +8,31 @@ import {
   and,
   eq,
   getFolderRoot,
+  gt,
   inTransaction,
   newId,
   requirePrincipal,
-  resolveEffectiveUserId,
+  requireUserBackedPrincipal,
+  resolveEmailsByUserId,
+  toIso,
   type MetadataVariables,
 } from "./common.js";
 import { checkGrant } from "./authz.js";
 
+type InviteRecord = {
+  inviteId: string;
+  inviteToken: string;
+  folderId: string;
+  scopeNodeId: string;
+  invitedByUserId: string;
+  canWrite: boolean;
+  status: "pending" | "accepted" | "revoked" | "expired";
+  expiresAt: Date;
+};
+
 type InviteRouteStore = {
   createInviteForRoute?: (opts: {
+    inviteId: string;
     inviteToken: string;
     folderId: string;
     scopeNodeId: string;
@@ -26,20 +41,17 @@ type InviteRouteStore = {
     canWrite: boolean;
     expiresAt: Date;
   }) => Promise<{ folderName: string }>;
-  getInviteForRoute?: (inviteToken: string) => Promise<{
-    inviteToken: string;
-    folderId: string;
-    scopeNodeId: string;
-    canWrite: boolean;
-    status: "pending" | "accepted" | "revoked" | "expired";
-    expiresAt: Date;
-  } | undefined>;
+  getInviteForRoute?: (inviteToken: string) => Promise<InviteRecord | undefined>;
+  getInviteByIdForRoute?: (inviteId: string) => Promise<InviteRecord | undefined>;
+  listFolderInvitesForRoute?: (folderId: string) => Promise<unknown[]>;
+  deleteInviteForRoute?: (inviteId: string) => Promise<void>;
   acceptInviteForRoute?: (opts: {
     inviteToken: string;
     userId: string;
     folderId: string;
     scopeNodeId: string;
     canWrite: boolean;
+    invitedByUserId: string;
   }) => Promise<void>;
 };
 
@@ -68,23 +80,22 @@ export function registerInviteRoutes(
       return ctx.json({ error: grant.reason }, 403);
     }
 
-    const invitedByUserId = await resolveEffectiveUserId(auth, principal);
-    if (!invitedByUserId) {
-      return ctx.json({ error: "agent_devices_cannot_create_invites" }, 403);
+    const ownerCheck = await requireUserBackedPrincipal(auth, ctx, principal, "access_key_cannot_invite_people");
+    if (ownerCheck instanceof Response) {
+      return ownerCheck;
     }
+    const invitedByUserId = ownerCheck;
 
-    // Defaults to true (read-write) to preserve existing behavior for callers that
-    // don't pass this field. Gated on the caller's own write capability above, not on
-    // what's being requested for the invite - same principle as POST
-    // /folders/:id/grants's can_write (folder-grants spec).
     const canWrite = typeof body.can_write === "boolean" ? body.can_write : true;
 
+    const inviteId = newId();
     const inviteToken = randomBytes(32).toString("base64url");
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     let folderName = "folder";
 
     if (hasInviteRouteStore(auth.db) && auth.db.createInviteForRoute) {
       const created = await auth.db.createInviteForRoute({
+        inviteId,
         inviteToken,
         folderId,
         scopeNodeId,
@@ -103,6 +114,7 @@ export function registerInviteRoutes(
         .limit(1);
       folderName = folders[0]?.name ?? folderName;
       await tx.insert(auth.schema.folderInvites).values({
+        inviteId,
         inviteToken,
         folderId,
         scopeNodeId,
@@ -160,6 +172,7 @@ export function registerInviteRoutes(
         folderId: invite.folderId,
         scopeNodeId: invite.scopeNodeId,
         canWrite: invite.canWrite,
+        invitedByUserId: invite.invitedByUserId,
       });
     } else {
       await inTransaction(auth, async (tx) => {
@@ -172,6 +185,7 @@ export function registerInviteRoutes(
         role: "collaborator",
         canRead: true,
         canWrite: invite.canWrite,
+        createdByUserId: invite.invitedByUserId,
       });
       await tx
         .update(auth.schema.folderInvites)
@@ -187,8 +201,114 @@ export function registerInviteRoutes(
 
     return ctx.json({ accepted: true });
   });
+
+  router.get("/folders/:id/invites", async (ctx) => {
+    const principal = requirePrincipal(ctx);
+    const folderId = ctx.req.param("id");
+    const rootNodeId = await getFolderRoot(auth, folderId);
+    if (!rootNodeId) {
+      return ctx.json({ error: "folder_not_found" }, 404);
+    }
+
+    const ownerCheck = await requireUserBackedPrincipal(auth, ctx, principal, "access_key_cannot_list_grants");
+    if (ownerCheck instanceof Response) {
+      return ownerCheck;
+    }
+
+    const grant = await checkGrant(auth.db, rootNodeId, principal, "write", auth.schema);
+    if (!grant.granted) {
+      return ctx.json({ error: grant.reason }, 403);
+    }
+
+    if (hasInviteRouteStore(auth.db) && auth.db.listFolderInvitesForRoute) {
+      return ctx.json(await auth.db.listFolderInvitesForRoute(folderId));
+    }
+
+    const rows = await auth.db
+      .select({
+        invite_id: auth.schema.folderInvites.inviteId,
+        invited_email: auth.schema.folderInvites.invitedEmail,
+        scope_node_id: auth.schema.folderInvites.scopeNodeId,
+        can_write: auth.schema.folderInvites.canWrite,
+        created_at: auth.schema.folderInvites.createdAt,
+        expires_at: auth.schema.folderInvites.expiresAt,
+        created_by_user_id: auth.schema.folderInvites.invitedByUserId,
+      })
+      .from(auth.schema.folderInvites)
+      .where(
+        and(
+          eq(auth.schema.folderInvites.folderId, folderId),
+          eq(auth.schema.folderInvites.status, "pending"),
+          gt(auth.schema.folderInvites.expiresAt, new Date()),
+        ),
+      );
+
+    const creatorEmails = await resolveEmailsByUserId(
+      auth,
+      rows.map((row: { created_by_user_id: string | null }) => row.created_by_user_id),
+    );
+    return ctx.json(
+      rows.map((row: { created_by_user_id: string | null; created_at: unknown; expires_at: unknown }) => ({
+        ...row,
+        created_at: toIso(row.created_at as Date),
+        expires_at: toIso(row.expires_at as Date),
+        created_by_email: row.created_by_user_id ? (creatorEmails.get(row.created_by_user_id) ?? null) : null,
+      })),
+    );
+  });
+
+  router.delete("/folders/:id/invites/:inviteId", async (ctx) => {
+    const principal = requirePrincipal(ctx);
+    const folderId = ctx.req.param("id");
+    const inviteId = ctx.req.param("inviteId");
+    const rootNodeId = await getFolderRoot(auth, folderId);
+    if (!rootNodeId) {
+      return ctx.json({ error: "folder_not_found" }, 404);
+    }
+
+    const ownerCheck = await requireUserBackedPrincipal(auth, ctx, principal, "access_key_cannot_revoke");
+    if (ownerCheck instanceof Response) {
+      return ownerCheck;
+    }
+
+    const grant = await checkGrant(auth.db, rootNodeId, principal, "write", auth.schema);
+    if (!grant.granted) {
+      return ctx.json({ error: grant.reason }, 403);
+    }
+
+    const invite =
+      hasInviteRouteStore(auth.db) && auth.db.getInviteByIdForRoute
+        ? await auth.db.getInviteByIdForRoute(inviteId)
+        : (
+            await auth.db
+              .select()
+              .from(auth.schema.folderInvites)
+              .where(eq(auth.schema.folderInvites.inviteId, inviteId))
+              .limit(1)
+          )[0];
+    if (!invite || invite.folderId !== folderId) {
+      return ctx.json({ error: "invite_not_found" }, 404);
+    }
+    if (invite.status === "accepted") {
+      return ctx.json({ error: "invite_already_accepted" }, 409);
+    }
+
+    if (hasInviteRouteStore(auth.db) && auth.db.deleteInviteForRoute) {
+      await auth.db.deleteInviteForRoute(inviteId);
+    } else {
+      await auth.db.delete(auth.schema.folderInvites).where(eq(auth.schema.folderInvites.inviteId, inviteId));
+    }
+    return ctx.body(null, 204);
+  });
 }
 
 function hasInviteRouteStore(db: CoreAuth["db"]): db is CoreAuth["db"] & InviteRouteStore {
-  return "createInviteForRoute" in db || "getInviteForRoute" in db || "acceptInviteForRoute" in db;
+  return (
+    "createInviteForRoute" in db ||
+    "getInviteForRoute" in db ||
+    "getInviteByIdForRoute" in db ||
+    "acceptInviteForRoute" in db ||
+    "listFolderInvitesForRoute" in db ||
+    "deleteInviteForRoute" in db
+  );
 }

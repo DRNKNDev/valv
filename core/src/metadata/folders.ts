@@ -10,8 +10,10 @@ import {
   inTransaction,
   newId,
   requirePrincipal,
+  requireUserBackedPrincipal,
   resolveDeviceUserId,
   resolveEffectiveUserId,
+  resolveEmailsByUserId,
 } from "./common.js";
 
 type FolderRouteStore = {
@@ -23,6 +25,7 @@ type FolderRouteStore = {
     ownerUserId: string;
   }) => Promise<void>;
   listGrantsForRoute?: (principal: { type: "user"; userId: string } | { type: "device"; deviceId: string }) => Promise<unknown[]>;
+  listFolderGrantsForRoute?: (folderId: string) => Promise<unknown[]>;
   getDeviceUserIdForRoute?: (deviceId: string) => Promise<string | undefined>;
   getFolderForRoute?: (folderId: string) => Promise<{ name: string } | undefined>;
 };
@@ -73,6 +76,7 @@ export function registerFolderRoutes(
           role: "owner",
           canRead: true,
           canWrite: true,
+          createdByUserId: ownerUserId,
         });
       });
     }
@@ -110,6 +114,7 @@ export function registerFolderRoutes(
         can_write: auth.schema.folderGrants.canWrite,
         user_id: auth.schema.folderGrants.userId,
         device_id: auth.schema.folderGrants.deviceId,
+        name: auth.schema.folderGrants.name,
         grantee_email: auth.schema.user.email,
         device_name: auth.schema.devices.name,
       })
@@ -118,6 +123,60 @@ export function registerFolderRoutes(
       .leftJoin(auth.schema.devices, eq(auth.schema.devices.deviceId, auth.schema.folderGrants.deviceId))
       .where(principalCondition);
     return ctx.json(rows);
+  });
+
+  router.get("/folders/:id/grants", async (ctx) => {
+    const principal = requirePrincipal(ctx);
+    const folderId = ctx.req.param("id");
+    const rootNodeId = await getFolderRoot(auth, folderId);
+    if (!rootNodeId) {
+      return ctx.json({ error: "folder_not_found" }, 404);
+    }
+
+    const ownerCheck = await requireUserBackedPrincipal(auth, ctx, principal, "access_key_cannot_list_grants");
+    if (ownerCheck instanceof Response) {
+      return ownerCheck;
+    }
+
+    const grant = await checkGrant(auth.db, rootNodeId, principal, "write", auth.schema);
+    if (!grant.granted) {
+      return ctx.json({ error: grant.reason }, 403);
+    }
+
+    if (hasFolderRouteStore(auth.db) && auth.db.listFolderGrantsForRoute) {
+      return ctx.json(await auth.db.listFolderGrantsForRoute(folderId));
+    }
+
+    const rows = await auth.db
+      .select({
+        grant_id: auth.schema.folderGrants.grantId,
+        folder_id: auth.schema.folderGrants.folderId,
+        scope_node_id: auth.schema.folderGrants.scopeNodeId,
+        role: auth.schema.folderGrants.role,
+        can_read: auth.schema.folderGrants.canRead,
+        can_write: auth.schema.folderGrants.canWrite,
+        user_id: auth.schema.folderGrants.userId,
+        device_id: auth.schema.folderGrants.deviceId,
+        name: auth.schema.folderGrants.name,
+        grantee_email: auth.schema.user.email,
+        device_name: auth.schema.devices.name,
+        created_by_user_id: auth.schema.folderGrants.createdByUserId,
+      })
+      .from(auth.schema.folderGrants)
+      .leftJoin(auth.schema.user, eq(auth.schema.user.id, auth.schema.folderGrants.userId))
+      .leftJoin(auth.schema.devices, eq(auth.schema.devices.deviceId, auth.schema.folderGrants.deviceId))
+      .where(eq(auth.schema.folderGrants.folderId, folderId));
+
+    const creatorEmails = await resolveEmailsByUserId(
+      auth,
+      rows.map((row: { created_by_user_id: string | null }) => row.created_by_user_id),
+    );
+    return ctx.json(
+      rows.map((row: { created_by_user_id: string | null }) => ({
+        ...row,
+        created_by_email: row.created_by_user_id ? (creatorEmails.get(row.created_by_user_id) ?? null) : null,
+      })),
+    );
   });
 
   router.get("/folders/:id", async (ctx) => {
@@ -153,5 +212,10 @@ export function registerFolderRoutes(
 }
 
 function hasFolderRouteStore(db: CoreAuth["db"]): db is CoreAuth["db"] & FolderRouteStore {
-  return "createFolderForRoute" in db || "listGrantsForRoute" in db || "getFolderForRoute" in db;
+  return (
+    "createFolderForRoute" in db ||
+    "listGrantsForRoute" in db ||
+    "listFolderGrantsForRoute" in db ||
+    "getFolderForRoute" in db
+  );
 }

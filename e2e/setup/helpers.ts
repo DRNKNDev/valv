@@ -46,8 +46,8 @@ export async function seedContext(_db: CoreAuth["db"], sqlite: Database.Database
     .prepare(`INSERT INTO nodes (node_id, folder_id, parent_id, name, type, current_version_id, deleted_at, server_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(rootNodeId, folderId, null, "", "folder", null, null, 0);
   sqlite
-    .prepare(`INSERT INTO folder_grants (grant_id, folder_id, scope_node_id, user_id, device_id, role, can_read, can_write, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(grantId, folderId, rootNodeId, userId, null, "owner", 1, 1, now);
+    .prepare(`INSERT INTO folder_grants (grant_id, folder_id, scope_node_id, user_id, device_id, role, can_read, can_write, created_at, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(grantId, folderId, rootNodeId, userId, null, "owner", 1, 1, now, userId);
 
   const cookie = await generateSignedCookie("better-auth.session_token", sessionToken, authSecret, {
     httpOnly: true,

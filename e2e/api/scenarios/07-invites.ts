@@ -105,5 +105,98 @@ export function inviteScenarios(harness: SeededHarness): void {
 
       expect(response.status).toBe(403);
     });
+
+    it("rejects invite creation from a read-only USER principal with insufficient_permission", async () => {
+      const readOnlyEmail = `readonly-inviter-${crypto.randomUUID()}@example.com`;
+      const invite = await requestJson<{ invite_token: string }>(ctx.app, `/api/folders/${ctx.context.folderId}/invites`, {
+        method: "POST",
+        cookie: ctx.context.cookie,
+        body: { invited_email: readOnlyEmail, can_write: false },
+      });
+      const signup = await ctx.app.request("/api/auth/sign-up/email", {
+        method: "POST",
+        body: JSON.stringify({ name: "Read Only Inviter", email: readOnlyEmail, password: "password1234" }),
+        headers: { "content-type": "application/json" },
+      });
+      const collaboratorCookie = signup.headers.get("set-cookie")?.split(";")[0];
+      await requestJson(ctx.app, `/api/invites/${invite.invite_token}/accept`, { method: "POST", cookie: collaboratorCookie });
+
+      const response = await ctx.app.request(`/api/folders/${ctx.context.folderId}/invites`, {
+        method: "POST",
+        body: JSON.stringify({ invited_email: "should-fail@example.com" }),
+        headers: { "content-type": "application/json", cookie: collaboratorCookie ?? "" },
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(403);
+      expect(body).toEqual({ error: "insufficient_permission" });
+    });
+
+    it("rejects invite creation from a write-capable access key with access_key_cannot_invite_people", async () => {
+      const writeCapableKey = await requestJson<{ grant_id: string; device_id: string; token: string }>(ctx.app, `/api/folders/${ctx.context.folderId}/grants`, {
+        method: "POST",
+        cookie: ctx.context.cookie,
+        body: { scope_node_id: ctx.context.rootNodeId, name: `Write Capable Invite Agent ${crypto.randomUUID()}`, can_read: true, can_write: true },
+      });
+
+      const response = await ctx.app.request(`/api/folders/${ctx.context.folderId}/invites`, {
+        method: "POST",
+        body: JSON.stringify({ invited_email: "should-fail@example.com" }),
+        headers: { "content-type": "application/json", authorization: `Bearer ${writeCapableKey.token}` },
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(403);
+      expect(body).toEqual({ error: "access_key_cannot_invite_people" });
+    });
+
+    it("lists a pending invite via GET /api/folders/:id/invites by a surrogate id, never the redeemable token, and lets the sender cancel it", async () => {
+      const invitedEmail = `cancel-me-${crypto.randomUUID()}@example.com`;
+      const invite = await requestJson<{ invite_token: string }>(ctx.app, `/api/folders/${ctx.context.folderId}/invites`, {
+        method: "POST",
+        cookie: ctx.context.cookie,
+        body: { invited_email: invitedEmail },
+      });
+
+      const listResponse = await ctx.app.request(`/api/folders/${ctx.context.folderId}/invites`, {
+        headers: { cookie: ctx.context.cookie },
+      });
+      const listedText = await listResponse.text();
+      const listed = JSON.parse(listedText) as Array<{ invite_id: string; invited_email: string }>;
+      const row = listed.find((item) => item.invited_email === invitedEmail);
+
+      expect(row).toBeDefined();
+      expect(row?.invite_id).not.toBe(invite.invite_token);
+      expect(listedText).not.toContain(invite.invite_token);
+      expect(listedText).not.toContain("invite_token");
+
+      const cancel = await ctx.app.request(`/api/folders/${ctx.context.folderId}/invites/${row?.invite_id}`, {
+        method: "DELETE",
+        headers: { cookie: ctx.context.cookie },
+      });
+      expect(cancel.status).toBe(204);
+
+      const acceptAfterCancel = await ctx.app.request(`/api/invites/${invite.invite_token}/accept`, {
+        method: "POST",
+        headers: { cookie: ctx.context.cookie },
+      });
+      expect(acceptAfterCancel.status).toBe(404);
+    });
+
+    it("returns 403 access_key_cannot_list_grants for an access key on GET /api/folders/:id/invites", async () => {
+      const accessKey = await requestJson<{ grant_id: string; device_id: string; token: string }>(ctx.app, `/api/folders/${ctx.context.folderId}/grants`, {
+        method: "POST",
+        cookie: ctx.context.cookie,
+        body: { scope_node_id: ctx.context.rootNodeId, name: `Invite List Attempt Agent ${crypto.randomUUID()}`, can_read: true, can_write: true },
+      });
+
+      const response = await ctx.app.request(`/api/folders/${ctx.context.folderId}/invites`, {
+        headers: { authorization: `Bearer ${accessKey.token}` },
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(403);
+      expect(body).toEqual({ error: "access_key_cannot_list_grants" });
+    });
   });
 }
