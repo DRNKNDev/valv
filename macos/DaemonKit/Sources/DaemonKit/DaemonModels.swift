@@ -44,6 +44,8 @@ public struct DaemonStatus: Codable, Hashable, Sendable {
     public let account: AccountStatus?
     public let latestVersion: String?
     public let updateAvailable: Bool?
+    public let credential: Credential
+    public let principal: PrincipalStatus?
 
     enum CodingKeys: String, CodingKey {
         case paused
@@ -54,6 +56,62 @@ public struct DaemonStatus: Codable, Hashable, Sendable {
         case account
         case latestVersion = "latest_version"
         case updateAvailable = "update_available"
+        case credential
+        case principal
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        paused = try container.decode(Bool.self, forKey: .paused)
+        backendConnected = try container.decode(Bool.self, forKey: .backendConnected)
+        version = try container.decode(String.self, forKey: .version)
+        updateRequired = try container.decode(Bool.self, forKey: .updateRequired)
+        mounts = try container.decode([MountStatus].self, forKey: .mounts)
+        account = try container.decodeIfPresent(AccountStatus.self, forKey: .account)
+        latestVersion = try container.decodeIfPresent(String.self, forKey: .latestVersion)
+        updateAvailable = try container.decodeIfPresent(Bool.self, forKey: .updateAvailable)
+        // Older daemons predate this field entirely; default rather than fail the whole decode.
+        credential = try container.decodeIfPresent(Credential.self, forKey: .credential) ?? .none
+        principal = try container.decodeIfPresent(PrincipalStatus.self, forKey: .principal)
+    }
+}
+
+public enum Credential: String, Codable, Hashable, Sendable {
+    case account
+    case accessKey = "access_key"
+    case none
+    case pending
+    case rejected
+}
+
+public struct PrincipalScope: Codable, Hashable, Sendable {
+    public let folderId: String
+    public let folderName: String
+    public let scopeLabel: String
+    public let canWrite: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case folderId = "folder_id"
+        case folderName = "folder_name"
+        case scopeLabel = "scope_label"
+        case canWrite = "can_write"
+    }
+}
+
+public struct PrincipalStatus: Codable, Hashable, Sendable {
+    public enum PrincipalKind: String, Codable, Hashable, Sendable {
+        case account
+        case accessKey = "access_key"
+    }
+
+    public let type: PrincipalKind
+    public let email: String?
+    public let scopes: [PrincipalScope]
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case email
+        case scopes
     }
 }
 

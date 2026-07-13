@@ -205,7 +205,8 @@ struct ValvTests {
               "last_synced_at": null,
               "update_required": true
             }
-          ]
+          ],
+          "credential": "none"
         }
         """.utf8))
 
@@ -222,7 +223,8 @@ struct ValvTests {
           "backend_connected": true,
           "version": "0.1.0",
           "update_required": true,
-          "mounts": []
+          "mounts": [],
+          "credential": "none"
         }
         """.utf8))
 
@@ -896,6 +898,219 @@ struct ValvTests {
         enabled = true
         activationSubject.send(())
         #expect(monitor.isEnabled)
+    }
+
+    private func makeGrant(
+        grantId: String = "g1",
+        folderId: String = "f1",
+        scopeNodeId: String = "root",
+        role: String = "collaborator",
+        canRead: Bool = true,
+        canWrite: Bool = true,
+        userId: String? = nil,
+        deviceId: String? = nil,
+        name: String? = nil,
+        granteeEmail: String? = nil,
+        deviceName: String? = nil,
+        createdByEmail: String? = nil
+    ) -> GrantEntry {
+        GrantEntry(
+            grantId: grantId,
+            folderId: folderId,
+            scopeNodeId: scopeNodeId,
+            role: role,
+            canRead: canRead,
+            canWrite: canWrite,
+            userId: userId,
+            deviceId: deviceId,
+            name: name,
+            granteeEmail: granteeEmail,
+            deviceName: deviceName,
+            createdByEmail: createdByEmail
+        )
+    }
+
+    @Test func grantEntryDisplayNamePrefersEmailThenGrantNameThenDeviceNameThenUnknown() {
+        let userGrant = makeGrant(userId: "u1", granteeEmail: "bob@example.com", deviceName: "ignored")
+        #expect(userGrant.displayName == "bob@example.com")
+
+        let keyGrant = makeGrant(deviceId: "d1", name: "design-vps", deviceName: "old-name")
+        #expect(keyGrant.displayName == "design-vps")
+
+        let legacyGrant = makeGrant(deviceId: "d1", name: nil, deviceName: "legacy-device")
+        #expect(legacyGrant.displayName == "legacy-device")
+
+        let unknownGrant = makeGrant(deviceId: "d1", name: nil, deviceName: nil)
+        #expect(unknownGrant.displayName == "Unknown")
+    }
+
+    @Test func grantEntryIsOwnerGrantMatchesRoleString() {
+        #expect(makeGrant(role: "owner").isOwnerGrant)
+        #expect(!makeGrant(role: "collaborator").isOwnerGrant)
+    }
+
+    @Test func sharedWithRowsInterleavesGrantsAndPendingInvites() {
+        let grant = makeGrant(grantId: "g1")
+        let invite = PendingInvite(
+            inviteId: "i1", invitedEmail: "friend@example.com", scopeNodeId: "root", canWrite: true, createdByEmail: nil
+        )
+
+        let rows = ManageFoldersWindow.sharedWithRows(grants: [grant], invites: [invite])
+
+        #expect(rows.count == 2)
+        #expect(rows.contains(.grant(grant)))
+        #expect(rows.contains(.invite(invite)))
+    }
+
+    @Test func isGenuinelyUnsharedIgnoresTheOwnersOwnGrant() {
+        let owner = makeGrant(grantId: "owner-grant", role: "owner", userId: "owner-1", granteeEmail: "owner@example.com")
+        #expect(ManageFoldersWindow.isGenuinelyUnshared(grants: [owner], invites: []))
+
+        let collaborator = makeGrant(grantId: "g2", role: "collaborator", userId: "u2", granteeEmail: "bob@example.com")
+        #expect(!ManageFoldersWindow.isGenuinelyUnshared(grants: [owner, collaborator], invites: []))
+
+        let invite = PendingInvite(
+            inviteId: "i1", invitedEmail: "friend@example.com", scopeNodeId: "root", canWrite: true, createdByEmail: nil
+        )
+        #expect(!ManageFoldersWindow.isGenuinelyUnshared(grants: [owner], invites: [invite]))
+    }
+
+    @Test func accessKeyHandoffCommandCarriesConcretePathAndNoPlaceholder() {
+        let path = AccessKeyHandoff.defaultMountPath(folderName: "Design")
+        #expect(path == "~/valv/Design")
+        #expect(!path.contains("<"))
+
+        let command = AccessKeyHandoff.mountCommand(path: path, token: "K7fQ2p")
+        #expect(command == "valv mount ~/valv/Design --key K7fQ2p")
+        #expect(!command.contains("<path>"))
+        #expect(command.contains("--key"))
+    }
+
+    @Test func accessKeyHandoffDefaultPathFallsBackForBlankFolderName() {
+        #expect(AccessKeyHandoff.defaultMountPath(folderName: "   ") == "~/valv/Folder")
+    }
+
+    private final class RecordingBackendTransport: @unchecked Sendable {
+        private(set) var requests: [URLRequest] = []
+        private var status = 200
+        private var body = "{}"
+
+        func respond(status: Int, body: String) {
+            self.status = status
+            self.body = body
+        }
+
+        func handle(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+            requests.append(request)
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: status,
+                httpVersion: "HTTP/1.1",
+                headerFields: nil
+            )!
+            return (Data(body.utf8), response)
+        }
+    }
+
+    private func makeBackendClient(transport: RecordingBackendTransport) -> BackendClient {
+        BackendClient(
+            configProvider: {
+                ConfigReader.Values(backendURL: "https://api.example.test", deviceId: "device-1", deviceToken: "token-1")
+            },
+            transport: transport.handle
+        )
+    }
+
+    @Test func folderGrantsDecodesNameAndAttributionFields() async throws {
+        let transport = RecordingBackendTransport()
+        transport.respond(status: 200, body: """
+        [{"grant_id":"g1","folder_id":"f1","scope_node_id":"root","role":"collaborator","can_read":true,
+          "can_write":true,"user_id":null,"device_id":"d1","name":"design-vps","grantee_email":null,
+          "device_name":"design-vps","created_by_user_id":"u1","created_by_email":"owner@example.com"}]
+        """)
+        let client = makeBackendClient(transport: transport)
+
+        let grants = try await client.folderGrants(folderId: "f1")
+
+        #expect(grants.count == 1)
+        #expect(grants[0].name == "design-vps")
+        #expect(grants[0].createdByEmail == "owner@example.com")
+        #expect(transport.requests.count == 1)
+        #expect(transport.requests[0].httpMethod == "GET")
+        #expect(transport.requests[0].url?.path == "/api/folders/f1/grants")
+    }
+
+    @Test func folderInvitesDecodesPendingRows() async throws {
+        let transport = RecordingBackendTransport()
+        transport.respond(status: 200, body: """
+        [{"invite_id":"tok-1","invited_email":"bob@example.com","scope_node_id":"root","can_write":true,
+          "created_at":"2026-01-01T00:00:00Z","expires_at":"2026-01-08T00:00:00Z",
+          "created_by_user_id":"u1","created_by_email":"owner@example.com"}]
+        """)
+        let client = makeBackendClient(transport: transport)
+
+        let invites = try await client.folderInvites(folderId: "f1")
+
+        #expect(invites.count == 1)
+        #expect(invites[0].invitedEmail == "bob@example.com")
+        #expect(invites[0].createdByEmail == "owner@example.com")
+        #expect(transport.requests[0].url?.path == "/api/folders/f1/invites")
+    }
+
+    @Test func cancelInviteSendsDeleteToInviteRoute() async throws {
+        let transport = RecordingBackendTransport()
+        transport.respond(status: 204, body: "")
+        let client = makeBackendClient(transport: transport)
+
+        try await client.cancelInvite(folderId: "f1", inviteId: "tok-1")
+
+        #expect(transport.requests.count == 1)
+        #expect(transport.requests[0].httpMethod == "DELETE")
+        #expect(transport.requests[0].url?.path == "/api/folders/f1/invites/tok-1")
+    }
+
+    @Test func createDeviceGrantDecodesIssuedAccessKey() async throws {
+        let transport = RecordingBackendTransport()
+        transport.respond(status: 200, body: """
+        {"grant_id":"g1","device_id":"d1","token":"K7fQ2p"}
+        """)
+        let client = makeBackendClient(transport: transport)
+
+        let issued = try await client.createDeviceGrant(folderId: "f1", scopeNodeId: nil, name: "design-vps", canWrite: true)
+
+        #expect(issued.grantId == "g1")
+        #expect(issued.token == "K7fQ2p")
+        #expect(transport.requests[0].httpMethod == "POST")
+        #expect(transport.requests[0].url?.path == "/api/folders/f1/grants")
+    }
+
+    @Test func regenerateGrantMakesExactlyOneRequest() async throws {
+        let transport = RecordingBackendTransport()
+        transport.respond(status: 200, body: """
+        {"grant_id":"g2","device_id":"d2","token":"K7fQ2pNewToken"}
+        """)
+        let client = makeBackendClient(transport: transport)
+
+        let issued = try await client.regenerateGrant(folderId: "f1", grantId: "g1")
+
+        #expect(transport.requests.count == 1)
+        #expect(transport.requests[0].httpMethod == "POST")
+        #expect(transport.requests[0].url?.path == "/api/folders/f1/grants/g1/regenerate")
+        #expect(issued.grantId == "g2")
+        #expect(issued.token == "K7fQ2pNewToken")
+    }
+
+    @Test func folderGrantsSurfacesFourOhFourWithoutCrashing() async throws {
+        let transport = RecordingBackendTransport()
+        transport.respond(status: 404, body: "Not Found")
+        let client = makeBackendClient(transport: transport)
+
+        do {
+            _ = try await client.folderGrants(folderId: "f1")
+            Issue.record("Expected a 404 to throw")
+        } catch let BackendClientError.httpStatus(status, _) {
+            #expect(status == 404)
+        }
     }
 
 }

@@ -53,8 +53,13 @@ public struct UserFacingError: Sendable {
 
     private static let codeMessages: [String: String] = [
         "agent_devices_cannot_create_folders": "This device can join folders but can't create new shared folders.",
-        "agent_devices_cannot_create_invites": "This device can't invite people to that folder.",
+        "access_key_cannot_invite_people": "This device can't invite people to that folder.",
+        "access_key_cannot_issue_keys": "This device can't create new access keys.",
+        "access_key_cannot_list_grants": "This device can't view sharing details for that folder.",
+        "access_key_cannot_revoke": "This device can't revoke access.",
+        "access_key_name_taken": "A key with that name already exists in this folder.",
         "device_required": "Sign in on this device before making that change.",
+        "grant_has_no_token": "That grant doesn't have a key to regenerate.",
         "folder_not_found": "That folder could not be found.",
         "grant_denied": "You don't have permission to access that folder.",
         "grant_not_found": "That access grant could not be found.",

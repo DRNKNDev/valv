@@ -50,7 +50,7 @@ final class DaemonClientTests: XCTestCase {
             to: "GET /status",
             status: 200,
             body: """
-            {"paused":false,"backend_connected":true,"version":"1.2.3","update_required":false,"mounts":[]}
+            {"paused":false,"backend_connected":true,"version":"1.2.3","update_required":false,"mounts":[],"credential":"none"}
             """
         )
 
@@ -69,7 +69,7 @@ final class DaemonClientTests: XCTestCase {
             status: 200,
             body: """
             {"paused":false,"backend_connected":true,"version":"1.2.3","update_required":false,
-             "mounts":[],"update_available":true,"latest_version":"1.2.3"}
+             "mounts":[],"update_available":true,"latest_version":"1.2.3","credential":"none"}
             """
         )
 
@@ -86,7 +86,7 @@ final class DaemonClientTests: XCTestCase {
             status: 200,
             body: """
             {"paused":false,"backend_connected":true,"version":"1.2.3","update_required":false,
-             "mounts":[],"update_available":false,"latest_version":"1.2.3"}
+             "mounts":[],"update_available":false,"latest_version":"1.2.3","credential":"none"}
             """
         )
 
@@ -101,7 +101,7 @@ final class DaemonClientTests: XCTestCase {
             to: "GET /status",
             status: 200,
             body: """
-            {"paused":false,"backend_connected":true,"version":"1.2.3","update_required":false,"mounts":[]}
+            {"paused":false,"backend_connected":true,"version":"1.2.3","update_required":false,"mounts":[],"credential":"none"}
             """
         )
 
@@ -109,6 +109,22 @@ final class DaemonClientTests: XCTestCase {
 
         XCTAssertNil(status.updateAvailable)
         XCTAssertNil(status.latestVersion)
+    }
+
+    func testStatusDecodesWhenCredentialIsAbsent() async throws {
+        let transport = MockDaemonTransport()
+        transport.respond(
+            to: "GET /status",
+            status: 200,
+            body: """
+            {"paused":false,"backend_connected":true,"version":"1.2.3","update_required":false,"mounts":[]}
+            """
+        )
+
+        let status = try await transport.client().status()
+
+        XCTAssertEqual(status.credential, .none)
+        XCTAssertNil(status.principal)
     }
 
     func testMountsDecodesArrayWithSnakeCaseFields() async throws {

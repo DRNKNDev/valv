@@ -1,16 +1,55 @@
 import DaemonKit
 import SwiftUI
 
+enum SharedWithRow: Identifiable, Hashable {
+    case grant(GrantEntry)
+    case invite(PendingInvite)
+
+    var id: String {
+        switch self {
+        case .grant(let grant): return "grant-\(grant.grantId)"
+        case .invite(let invite): return "invite-\(invite.inviteId)"
+        }
+    }
+
+    var scopeNodeId: String {
+        switch self {
+        case .grant(let grant): return grant.scopeNodeId
+        case .invite(let invite): return invite.scopeNodeId
+        }
+    }
+}
+
+struct IssuedAccessKey: Identifiable {
+    let id = UUID()
+    let folderName: String
+    let token: String
+}
+
+enum AccessKeyHandoff {
+    static func defaultMountPath(folderName: String) -> String {
+        let trimmed = folderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "~/valv/\(trimmed.isEmpty ? "Folder" : trimmed)"
+    }
+
+    static func mountCommand(path: String, token: String) -> String {
+        "valv mount \(path) --key \(token)"
+    }
+}
+
 struct ManageFoldersWindow: View {
     @EnvironmentObject private var store: DaemonStore
     @EnvironmentObject private var domainManager: FileProviderDomainManager
     @State private var selectedFolderId: String?
     @State private var grants: [GrantEntry] = []
+    @State private var pendingInvites: [PendingInvite] = []
     @State private var resolvedScopePaths: [String: String] = [:]
     @State private var showInviteSheet = false
-    @State private var showAddDeviceSheet = false
+    @State private var showAddAccessKeySheet = false
     @State private var revokeTarget: GrantEntry?
+    @State private var regenerateTarget: GrantEntry?
     @State private var removeTarget: MountStatus?
+    @State private var issuedAccessKey: IssuedAccessKey?
     @State private var loadError: String?
     @State private var isLoadingGrants = false
     @State private var isResolvingScopes = false
@@ -25,9 +64,8 @@ struct ManageFoldersWindow: View {
         mounts.first { $0.folderId == selectedFolderId }
     }
 
-    private var grantsForSelectedFolder: [GrantEntry] {
-        guard let selectedFolderId else { return [] }
-        return grants.filter { $0.folderId == selectedFolderId }
+    private var currentSharedWithRows: [SharedWithRow] {
+        Self.sharedWithRows(grants: grants, invites: pendingInvites)
     }
 
     private var removeAlertTitle: String {
@@ -35,6 +73,14 @@ struct ManageFoldersWindow: View {
             return "Stop syncing this folder on this Mac?"
         }
         return "Stop syncing '\(displayName(for: removeTarget))' on this Mac?"
+    }
+
+    static func sharedWithRows(grants: [GrantEntry], invites: [PendingInvite]) -> [SharedWithRow] {
+        grants.map { .grant($0) } + invites.map { .invite($0) }
+    }
+
+    static func isGenuinelyUnshared(grants: [GrantEntry], invites: [PendingInvite]) -> Bool {
+        grants.allSatisfy(\.isOwnerGrant) && invites.isEmpty
     }
 
     var body: some View {
@@ -49,7 +95,6 @@ struct ManageFoldersWindow: View {
         }
         .frame(minWidth: 700, minHeight: 450)
         .task {
-            await loadGrants()
             if selectedFolderId == nil {
                 selectedFolderId = mounts.first?.folderId
             }
@@ -57,16 +102,26 @@ struct ManageFoldersWindow: View {
         .sheet(isPresented: $showInviteSheet) {
             if let mount = selectedMount {
                 InviteSheet(mount: mount, backendClient: backendClient, onCompleted: {
-                    Task { await loadGrants() }
+                    Task { await loadSharedWith(folderId: mount.folderId) }
                 })
             }
         }
-        .sheet(isPresented: $showAddDeviceSheet) {
+        .sheet(isPresented: $showAddAccessKeySheet) {
             if let mount = selectedMount {
-                AddDeviceSheet(mount: mount, backendClient: backendClient, onCompleted: {
-                    Task { await loadGrants() }
+                AddAccessKeySheet(mount: mount, backendClient: backendClient, onCompleted: {
+                    Task { await loadSharedWith(folderId: mount.folderId) }
                 })
             }
+        }
+        .sheet(item: $issuedAccessKey) { issued in
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Access Key Regenerated").font(.headline).padding(.bottom, 8)
+                AccessKeyHandoffView(folderName: issued.folderName, token: issued.token) {
+                    issuedAccessKey = nil
+                }
+            }
+            .padding(20)
+            .interactiveDismissDisabled(true)
         }
         .alert("Revoke Access?", isPresented: .constant(revokeTarget != nil), presenting: revokeTarget) { grant in
             Button("Revoke", role: .destructive) {
@@ -74,7 +129,15 @@ struct ManageFoldersWindow: View {
             }
             Button("Cancel", role: .cancel) { revokeTarget = nil }
         } message: { grant in
-            Text("This removes access for \(grant.granteeEmail ?? grant.deviceName ?? "this grant") on \(selectedMount?.name ?? "this folder").")
+            Text("This removes access for \(grant.displayName) on \(selectedMount?.name ?? "this folder").")
+        }
+        .alert("Regenerate Access Key?", isPresented: .constant(regenerateTarget != nil), presenting: regenerateTarget) { grant in
+            Button("Regenerate", role: .destructive) {
+                Task { await regenerate(grant) }
+            }
+            Button("Cancel", role: .cancel) { regenerateTarget = nil }
+        } message: { grant in
+            Text("The machine currently using '\(grant.displayName)' will lose access immediately and needs the new key to keep syncing.")
         }
         .alert(removeAlertTitle, isPresented: .constant(removeTarget != nil), presenting: removeTarget) { mount in
             Button("Stop Syncing", role: .destructive) {
@@ -155,7 +218,7 @@ struct ManageFoldersWindow: View {
                 Spacer()
                 Button("Invite...") { showInviteSheet = true }
                     .buttonStyle(.borderedProminent)
-                Button("Add Device...") { showAddDeviceSheet = true }
+                Button("Add Access Key...") { showAddAccessKeySheet = true }
             }
 
             if let loadError {
@@ -168,7 +231,7 @@ struct ManageFoldersWindow: View {
         }
         .padding()
         .task(id: mount.folderId) {
-            await resolveScopes(for: grantsForSelectedFolder)
+            await loadSharedWith(folderId: mount.folderId)
         }
     }
 
@@ -181,72 +244,128 @@ struct ManageFoldersWindow: View {
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, minHeight: 120)
-        } else if grantsForSelectedFolder.isEmpty {
+        } else if Self.isGenuinelyUnshared(grants: grants, invites: pendingInvites) {
             Text("Not shared with anyone yet")
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, minHeight: 120)
         } else {
-            Table(grantsForSelectedFolder) {
-                TableColumn("Grantee") { grant in
-                    Text(grant.granteeEmail ?? grant.deviceName ?? "Unknown")
+            Table(currentSharedWithRows) {
+                TableColumn("Grantee") { row in
+                    Text(grantee(for: row))
                         .lineLimit(1)
                 }
                 .width(min: 180, ideal: 260)
 
-                TableColumn("Scope") { grant in
-                    Text(scopeLabel(for: grant, mount: mount))
+                TableColumn("Scope") { row in
+                    Text(scopeLabel(forScopeNodeId: row.scopeNodeId))
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
                 .width(min: 120, ideal: 180)
 
-                TableColumn("Access") { grant in
-                    Text("\(grant.role.capitalized) · \(grant.canWrite ? "Read & Write" : "Read Only")")
+                TableColumn("Access") { row in
+                    Text(accessLabel(for: row))
                         .lineLimit(1)
                 }
-                .width(min: 130, ideal: 160)
+                .width(min: 150, ideal: 170)
 
-                TableColumn("") { grant in
+                TableColumn("Added by") { row in
+                    Text(addedByLabel(for: row))
+                        .lineLimit(1)
+                        .foregroundStyle(.secondary)
+                }
+                .width(min: 140, ideal: 200)
+
+                TableColumn("") { row in
+                    rowActions(for: row)
+                }
+                .width(min: 90, ideal: 170, max: 200)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func rowActions(for row: SharedWithRow) -> some View {
+        switch row {
+        case .grant(let grant):
+            if grant.isOwnerGrant {
+                EmptyView()
+            } else {
+                HStack {
+                    if grant.deviceId != nil {
+                        Button("Regenerate") { regenerateTarget = grant }
+                    }
                     Button("Revoke") { revokeTarget = grant }
                 }
-                .width(min: 70, ideal: 80, max: 90)
             }
+        case .invite(let invite):
+            Button("Cancel") {
+                Task { await cancel(invite) }
+            }
+        }
+    }
+
+    private func grantee(for row: SharedWithRow) -> String {
+        switch row {
+        case .grant(let grant): return grant.displayName
+        case .invite(let invite): return invite.invitedEmail
+        }
+    }
+
+    private func accessLabel(for row: SharedWithRow) -> String {
+        switch row {
+        case .grant(let grant):
+            return "\(grant.role.capitalized) · \(grant.canWrite ? "Read & Write" : "Read Only")"
+        case .invite(let invite):
+            return "Pending · \(invite.canWrite ? "Read & Write" : "Read Only")"
+        }
+    }
+
+    private func addedByLabel(for row: SharedWithRow) -> String {
+        switch row {
+        case .grant(let grant): return grant.createdByEmail ?? "Unknown"
+        case .invite(let invite): return invite.createdByEmail ?? "Unknown"
         }
     }
 
     // "" is the daemon's own documented resolution for a mount's root/scope node
     // itself (ipc-control-api spec: "The root/scope node itself SHALL resolve to ''"),
     // so an empty resolved path means this grant covers the entire folder.
-    private func scopeLabel(for grant: GrantEntry, mount: MountStatus) -> String {
-        guard let resolved = resolvedScopePaths[grant.scopeNodeId] else {
+    private func scopeLabel(forScopeNodeId scopeNodeId: String) -> String {
+        guard let resolved = resolvedScopePaths[scopeNodeId] else {
             return "Subfolder"
         }
         return resolved.isEmpty ? "Entire Folder" : resolved
     }
 
-    private func loadGrants() async {
+    private func loadSharedWith(folderId: String) async {
         isLoadingGrants = true
         defer { isLoadingGrants = false }
         do {
-            grants = try await backendClient.grants()
+            async let loadedGrants = backendClient.folderGrants(folderId: folderId)
+            async let loadedInvites = backendClient.folderInvites(folderId: folderId)
+            let (fetchedGrants, fetchedInvites) = try await (loadedGrants, loadedInvites)
+            grants = fetchedGrants
+            pendingInvites = fetchedInvites
             loadError = nil
         } catch {
-            NSLog("ManageFoldersWindow loadGrants failed: %@", error.localizedDescription)
+            NSLog("ManageFoldersWindow loadSharedWith failed: %@", error.localizedDescription)
             loadError = UserFacingError(from: error).message
         }
+        await resolveScopes(for: grants.map(\.scopeNodeId) + pendingInvites.map(\.scopeNodeId))
     }
 
-    private func resolveScopes(for entries: [GrantEntry]) async {
-        let unresolved = entries.filter { resolvedScopePaths[$0.scopeNodeId] == nil }
+    private func resolveScopes(for scopeNodeIds: [String]) async {
+        let unresolved = Set(scopeNodeIds).filter { resolvedScopePaths[$0] == nil }
         guard !unresolved.isEmpty else { return }
         isResolvingScopes = true
         defer { isResolvingScopes = false }
-        for grant in unresolved {
+        for scopeNodeId in unresolved {
             do {
-                let path = try await store.nodePath(nodeId: grant.scopeNodeId)
-                resolvedScopePaths[grant.scopeNodeId] = path
+                let path = try await store.nodePath(nodeId: scopeNodeId)
+                resolvedScopePaths[scopeNodeId] = path
             } catch {
-                resolvedScopePaths[grant.scopeNodeId] = "Subfolder"
+                resolvedScopePaths[scopeNodeId] = "Subfolder"
             }
         }
     }
@@ -260,7 +379,32 @@ struct ManageFoldersWindow: View {
             NSLog("ManageFoldersWindow revoke failed: %@", error.localizedDescription)
             loadError = UserFacingError(from: error).message
         }
-        await loadGrants()
+        await loadSharedWith(folderId: grant.folderId)
+    }
+
+    private func regenerate(_ grant: GrantEntry) async {
+        regenerateTarget = nil
+        do {
+            let issued = try await backendClient.regenerateGrant(folderId: grant.folderId, grantId: grant.grantId)
+            loadError = nil
+            issuedAccessKey = IssuedAccessKey(folderName: selectedMount?.name ?? "this folder", token: issued.token)
+        } catch {
+            NSLog("ManageFoldersWindow regenerate failed: %@", error.localizedDescription)
+            loadError = UserFacingError(from: error).message
+        }
+        await loadSharedWith(folderId: grant.folderId)
+    }
+
+    private func cancel(_ invite: PendingInvite) async {
+        guard let folderId = selectedFolderId else { return }
+        do {
+            try await backendClient.cancelInvite(folderId: folderId, inviteId: invite.inviteId)
+            loadError = nil
+        } catch {
+            NSLog("ManageFoldersWindow cancelInvite failed: %@", error.localizedDescription)
+            loadError = UserFacingError(from: error).message
+        }
+        await loadSharedWith(folderId: folderId)
     }
 
     private func removeMount(_ mount: MountStatus) {
@@ -445,9 +589,6 @@ private struct InviteSheet: View {
         isSubmitting = true
         Task {
             do {
-                // Always the folder's root node - no node picker in this window
-                // (macos-app spec: "Invite and Add Device actions are always scoped to
-                // the whole folder").
                 _ = try await backendClient.createInvite(folderId: mount.folderId, invitedEmail: email, canWrite: canWrite)
                 onCompleted()
                 dismiss()
@@ -460,7 +601,7 @@ private struct InviteSheet: View {
     }
 }
 
-private struct AddDeviceSheet: View {
+private struct AddAccessKeySheet: View {
     let mount: MountStatus
     let backendClient: BackendClient
     let onCompleted: () -> Void
@@ -474,32 +615,17 @@ private struct AddDeviceSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Add Device to \(mount.name)").font(.headline)
             if let issuedToken {
-                Text("Copy this token now - it won't be shown again.")
-                    .font(.caption).foregroundStyle(.secondary)
-                HStack {
-                    Text(issuedToken)
-                        .font(.system(.body, design: .monospaced))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
-                    Button("Copy") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(issuedToken, forType: .string)
-                    }
-                }
-                HStack {
-                    Spacer()
-                    Button("Done") {
-                        onCompleted()
-                        dismiss()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
+                AccessKeyHandoffView(folderName: mount.name, token: issuedToken) {
+                    onCompleted()
+                    dismiss()
                 }
             } else {
-                TextField("Device name", text: $name).textFieldStyle(.roundedBorder)
+                Text("Add Access Key to \(mount.name)").font(.headline)
+                Text("For a server or agent. To add your own Mac, install Valv there and sign in.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("Key name", text: $name).textFieldStyle(.roundedBorder)
                 Toggle("Allow editing", isOn: $canWrite)
                 if let errorMessage {
                     Text(errorMessage).font(.caption).foregroundStyle(.red)
@@ -516,25 +642,93 @@ private struct AddDeviceSheet: View {
             }
         }
         .padding(20)
-        .frame(width: 360)
+        .frame(width: issuedToken == nil ? 360 : 420)
+        .interactiveDismissDisabled(issuedToken != nil)
     }
 
     private func submit() {
         isSubmitting = true
         Task {
             do {
-                let token = try await backendClient.createDeviceGrant(
+                let issued = try await backendClient.createDeviceGrant(
                     folderId: mount.folderId,
                     scopeNodeId: mount.scopeNodeId,
                     name: name,
                     canWrite: canWrite
                 )
-                issuedToken = token
+                issuedToken = issued.token
             } catch {
-                NSLog("AddDeviceSheet submit failed: %@", error.localizedDescription)
+                NSLog("AddAccessKeySheet submit failed: %@", error.localizedDescription)
                 errorMessage = UserFacingError(from: error).message
                 isSubmitting = false
             }
         }
+    }
+}
+
+private struct AccessKeyHandoffView: View {
+    let folderName: String
+    let token: String
+    let onDone: () -> Void
+
+    @State private var mountPath: String
+
+    init(folderName: String, token: String, onDone: @escaping () -> Void) {
+        self.folderName = folderName
+        self.token = token
+        self.onDone = onDone
+        _mountPath = State(initialValue: AccessKeyHandoff.defaultMountPath(folderName: folderName))
+    }
+
+    private var mountCommand: String {
+        AccessKeyHandoff.mountCommand(path: mountPath, token: token)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("This key only grants access to \(folderName).")
+                .font(.callout)
+            Text("It won't be shown again - copy it now.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Destination on the other machine").font(.caption).foregroundStyle(.secondary)
+                TextField("Path", text: $mountPath).textFieldStyle(.roundedBorder)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Command").font(.caption).foregroundStyle(.secondary)
+                Text(mountCommand)
+                    .font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+                    .lineLimit(3)
+                    .truncationMode(.middle)
+            }
+
+            HStack {
+                Spacer()
+                Button("Copy Token") {
+                    copyToPasteboard(token)
+                }
+                Button("Copy Command") {
+                    copyToPasteboard(mountCommand)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(mountPath.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+
+            HStack {
+                Spacer()
+                Button("Done", action: onDone)
+            }
+        }
+        .frame(width: 420)
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
     }
 }
