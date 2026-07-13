@@ -14,6 +14,7 @@ import {
   resolveDeviceUserId,
   resolveEffectiveUserId,
   resolveEmailsByUserId,
+  toIso,
 } from "./common.js";
 
 type FolderRouteStore = {
@@ -117,10 +118,12 @@ export function registerFolderRoutes(
         name: auth.schema.folderGrants.name,
         grantee_email: auth.schema.user.email,
         device_name: auth.schema.devices.name,
+        folder_name: auth.schema.sharedFolders.name,
       })
       .from(auth.schema.folderGrants)
       .leftJoin(auth.schema.user, eq(auth.schema.user.id, auth.schema.folderGrants.userId))
       .leftJoin(auth.schema.devices, eq(auth.schema.devices.deviceId, auth.schema.folderGrants.deviceId))
+      .leftJoin(auth.schema.sharedFolders, eq(auth.schema.sharedFolders.folderId, auth.schema.folderGrants.folderId))
       .where(principalCondition);
     return ctx.json(rows);
   });
@@ -161,6 +164,7 @@ export function registerFolderRoutes(
         grantee_email: auth.schema.user.email,
         device_name: auth.schema.devices.name,
         created_by_user_id: auth.schema.folderGrants.createdByUserId,
+        created_at: auth.schema.folderGrants.createdAt,
       })
       .from(auth.schema.folderGrants)
       .leftJoin(auth.schema.user, eq(auth.schema.user.id, auth.schema.folderGrants.userId))
@@ -172,8 +176,9 @@ export function registerFolderRoutes(
       rows.map((row: { created_by_user_id: string | null }) => row.created_by_user_id),
     );
     return ctx.json(
-      rows.map((row: { created_by_user_id: string | null }) => ({
+      rows.map((row: { created_by_user_id: string | null; created_at: Date }) => ({
         ...row,
+        created_at: toIso(row.created_at),
         created_by_email: row.created_by_user_id ? (creatorEmails.get(row.created_by_user_id) ?? null) : null,
       })),
     );

@@ -16,6 +16,7 @@ export type FolderGrant = {
   canRead: boolean;
   canWrite: boolean;
   createdByUserId: string | null;
+  createdAt: Date;
 };
 
 export type FolderInvite = {
@@ -277,6 +278,7 @@ export class LifecycleDb implements CoreDb {
         name: item.name,
         grantee_email: item.userId ? this.users.find((user) => user.id === item.userId)?.email ?? null : null,
         device_name: item.deviceId ? this.devices.find((device) => device.deviceId === item.deviceId)?.name ?? null : null,
+        folder_name: this.sharedFolders.find((folder) => folder.folderId === item.folderId)?.name ?? null,
       }));
   }
 
@@ -299,6 +301,7 @@ export class LifecycleDb implements CoreDb {
         created_by_email: item.createdByUserId
           ? this.users.find((user) => user.id === item.createdByUserId)?.email ?? null
           : null,
+        created_at: item.createdAt.toISOString(),
       }));
   }
 
@@ -530,6 +533,7 @@ export function grant(
     canRead?: boolean;
     canWrite?: boolean;
     createdByUserId?: string;
+    createdAt?: Date;
   },
 ): FolderGrant {
   return {
@@ -543,5 +547,6 @@ export function grant(
     canRead: opts.canRead ?? true,
     canWrite: opts.canWrite ?? true,
     createdByUserId: opts.createdByUserId ?? null,
+    createdAt: opts.createdAt ?? new Date(),
   };
 }

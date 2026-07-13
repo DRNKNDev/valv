@@ -2322,11 +2322,13 @@ name = "valv-cli"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "hex",
  "hyper-util",
  "indicatif",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
