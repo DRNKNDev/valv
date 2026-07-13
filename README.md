@@ -107,4 +107,4 @@ pnpm test:core
 
 ## License
 
-Valv is licensed under [AGPL-3.0-only](./LICENSE). See [`LICENSE.md`](./LICENSE.md) for a practical summary; the full text in [`LICENSE`](./LICENSE) is authoritative.
+Valv is licensed under [AGPL-3.0-only](./LICENSE). The full text in [`LICENSE`](./LICENSE) is authoritative.
