@@ -45,7 +45,7 @@ if reason=$(headless_mount_unsafe_reason); then
 fi
 
 DAEMON_PID_A=""
-HOME_D="${TMPDIR}/home-headless"
+HOME_D="${VALV_SMOKE_HEADLESS_HOME:-${TMPDIR}/home-headless}"
 export HOME_D
 trap 'HOME="$HOME_D" "$VALV_BIN" daemon uninstall >/dev/null 2>&1 || true; stop_daemon DAEMON_PID_A' EXIT
 
@@ -62,7 +62,7 @@ assert_path_absent "${HOME_D}/.config/valv/config.toml"
 
 data_path="${HOME_D}/data"
 mkdir -p "$data_path"
-HOME="$HOME_D" "$VALV_BIN" mount "$data_path" --key "$grant_token" >/dev/null
+HOME="$HOME_D" VALV_BACKEND_URL="$BACKEND_URL" "$VALV_BIN" mount "$data_path" --key "$grant_token" >/dev/null
 
 assert_path_present "${HOME_D}/.config/valv/config.toml"
 if grep -q "device_token" "${HOME_D}/.config/valv/config.toml"; then

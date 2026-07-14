@@ -5,7 +5,10 @@ set -euo pipefail
 SMOKE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "${SMOKE_DIR}/harness.sh"
 
-mapfile -t scripts < <(find "$SMOKE_DIR" -maxdepth 1 -name '[0-9][0-9]-*.sh' | sort)
+scripts=()
+while IFS= read -r script; do
+  scripts+=("$script")
+done < <(find "$SMOKE_DIR" -maxdepth 1 -name '[0-9][0-9]-*.sh' | sort)
 
 declare -a results=()
 failures=0
