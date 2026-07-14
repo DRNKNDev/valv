@@ -8,6 +8,9 @@ set -euo pipefail
 SMOKE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "${SMOKE_DIR}/helpers.sh"
 
+HOME_D="${VALV_SMOKE_HEADLESS_HOME:-${TMPDIR}/home-headless}"
+export HOME_D
+
 headless_mount_unsafe_reason() {
   case "$(uname -s)" in
     Linux)
@@ -17,6 +20,14 @@ headless_mount_unsafe_reason() {
       fi
       if ! systemctl --user show-environment >/dev/null 2>&1; then
         printf 'no reachable systemd --user session (needs a user bus / XDG_RUNTIME_DIR)'
+        return 0
+      fi
+      # valvd writes the unit under $HOME, but systemd --user resolves its unit
+      # search path from the manager's own HOME, so the install only lands where
+      # the manager looks when both are the same home. run-headless-linux.sh is
+      # the job that satisfies this.
+      if [ "$HOME_D" != "$HOME" ]; then
+        printf 'install home %s is not the systemd --user manager home %s' "$HOME_D" "$HOME"
         return 0
       fi
       ;;
@@ -45,8 +56,6 @@ if reason=$(headless_mount_unsafe_reason); then
 fi
 
 DAEMON_PID_A=""
-HOME_D="${VALV_SMOKE_HEADLESS_HOME:-${TMPDIR}/home-headless}"
-export HOME_D
 trap 'HOME="$HOME_D" "$VALV_BIN" daemon uninstall >/dev/null 2>&1 || true; stop_daemon DAEMON_PID_A' EXIT
 
 start_daemon HOME_A DAEMON_PID_A
