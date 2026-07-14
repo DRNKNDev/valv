@@ -150,6 +150,134 @@ jobs:
         if: always()
         run: docker rm -f minio || true
 
+  smoke-headless-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - run: pnpm install --frozen-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+      - name: Build Rust workspace
+        working-directory: crates
+        run: cargo build --workspace --locked
+      - name: Install mc
+        run: |
+          asset="mc.linux-amd64.${MC_RELEASE}"
+          base="https://github.com/minio/mc/releases/download/${MC_RELEASE}"
+          curl -fsSL "${base}/${asset}" -o /usr/local/bin/mc
+          expected="$(curl -fsSL "${base}/${asset}.sha256sum" | awk '{print $1}')"
+          actual="$(sha256sum /usr/local/bin/mc | awk '{print $1}')"
+          [ "$expected" = "$actual" ] || { echo "mc checksum mismatch: expected ${expected}, got ${actual}" >&2; exit 1; }
+          chmod +x /usr/local/bin/mc
+          mc --version
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            "${MINIO_IMAGE}" server /data --console-address ":9001"
+      - name: Wait for MinIO
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+              echo "MinIO is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready within the bounded startup interval" >&2
+          docker logs minio || true
+          exit 1
+      - name: Run the headless install path under a disposable lingering user
+        shell: bash
+        run: |
+          set -o pipefail
+          bash e2e/smoke/run-headless-linux.sh 2>&1 | tee "${RUNNER_TEMP}/smoke-headless-linux.log"
+      - name: Upload smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs-headless-linux
+          path: ${{ runner.temp }}/smoke-headless-linux.log
+          if-no-files-found: ignore
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true
+
+  smoke-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - run: pnpm install --frozen-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+      - name: Build Rust workspace
+        working-directory: crates
+        run: cargo build --workspace --locked
+      - name: Install MinIO server and mc
+        run: brew install minio/stable/minio minio/stable/mc
+      - name: Start MinIO
+        run: |
+          mkdir -p "${RUNNER_TEMP}/minio-data"
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            minio server "${RUNNER_TEMP}/minio-data" --console-address ":9001" \
+            > "${RUNNER_TEMP}/minio.log" 2>&1 &
+          disown
+      - name: Wait for MinIO
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+              echo "MinIO is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready within the bounded startup interval" >&2
+          cat "${RUNNER_TEMP}/minio.log" || true
+          exit 1
+      - name: Run daemon smoke scenarios
+        shell: bash
+        run: |
+          set -o pipefail
+          export VALV_SMOKE_HEADLESS_HOME="$HOME"
+          bash e2e/smoke/run-all.sh 2>&1 | tee "${RUNNER_TEMP}/smoke-run-macos.log"
+      - name: Verify the headless daemon install path actually ran
+        run: |
+          log="${RUNNER_TEMP}/smoke-run-macos.log"
+          if grep -q '^\[SKIP\] 34-headless-access-key-mount.sh' "$log"; then
+            echo "34-headless-access-key-mount.sh skipped on macOS; the real daemon install path was not exercised" >&2
+            grep '^\[SKIP\] 34-headless-access-key-mount.sh' "$log" >&2
+            exit 1
+          fi
+          grep -q '^\[PASS\] 34-headless-access-key-mount.sh' "$log"
+      - name: Upload smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs-macos
+          path: ${{ runner.temp }}/smoke-run-macos.log
+          if-no-files-found: ignore
+      - name: Stop MinIO
+        if: always()
+        run: pkill -f 'minio server' || true
+
   daemon-kit:
     runs-on: macos-26
     steps:
