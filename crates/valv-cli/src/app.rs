@@ -150,7 +150,7 @@ pub(crate) struct ShareArgs {
     #[arg(long, allow_hyphen_values = true)]
     pub(crate) key: Option<String>,
     /// Grant read-only access instead of the read/write default.
-    #[arg(long = "read-only")]
+    #[arg(long = "read-only", requires = "target")]
     pub(crate) read_only: bool,
 }
 
@@ -230,6 +230,13 @@ fn map_clap_error(error: clap::Error) -> CliError {
         && rendered.contains("--new");
     if is_missing_mount_source {
         return CliError::mount_source_required();
+    }
+    let is_missing_share_target = error.kind() == ErrorKind::MissingRequiredArgument
+        && rendered.contains("--read-only")
+        && rendered.contains("--to")
+        && rendered.contains("--key");
+    if is_missing_share_target {
+        return CliError::share_read_only_requires_target();
     }
     CliError::usage("usage_error", rendered.trim_end().to_owned())
 }
@@ -1007,15 +1014,19 @@ async fn run_sync_barrier(
         let status = fetch_daemon_status().await?;
         let mounts = relevant_mounts(&status, folder_id);
 
-        if let Some(mount) = mounts.iter().find(|mount| mount.error.is_some()) {
-            return Err(CliError::sync_mount_error(
-                mount.name.clone(),
-                mount.error.clone().unwrap_or_default(),
-            )
-            .into());
+        if status.backend_connected {
+            if let Some(mount) = mounts.iter().find(|mount| mount.error.is_some()) {
+                return Err(CliError::sync_mount_error(
+                    mount.name.clone(),
+                    mount.error.clone().unwrap_or_default(),
+                )
+                .into());
+            }
         }
 
-        let settled = mounts.iter().all(|mount| mount.pending_ops == 0);
+        let settled = mounts
+            .iter()
+            .all(|mount| mount.pending_ops == 0 && mount.error.is_none());
         if settled {
             return Ok(summary);
         }
@@ -1597,6 +1608,26 @@ mod tests {
     }
 
     #[test]
+    fn share_read_only_without_a_target_is_a_usage_error() {
+        let error = parse(&["valv", "share", "/tmp/data", "--read-only"]).unwrap_err();
+        let cli_error = map_clap_error(error);
+
+        assert_eq!(cli_error.payload.code, "share_read_only_requires_target");
+        assert_eq!(cli_error.exit_code, 2);
+    }
+
+    #[test]
+    fn share_read_only_with_a_target_parses() {
+        assert!(parse(&["valv", "share", "/tmp/data", "--read-only", "--to", "a@b.com"]).is_ok());
+        assert!(parse(&["valv", "share", "/tmp/data", "--read-only", "--key", "name"]).is_ok());
+    }
+
+    #[test]
+    fn bare_share_with_no_flags_still_parses_as_the_list_form() {
+        assert!(parse(&["valv", "share", "/tmp/data"]).is_ok());
+    }
+
+    #[test]
     fn unmount_and_sync_take_a_path_not_a_folder_flag() {
         assert!(parse(&["valv", "unmount", "/tmp/data"]).is_ok());
         assert!(parse(&["valv", "sync"]).is_ok());
@@ -2130,6 +2161,142 @@ mod tests {
         assert_eq!(cli_error.payload.code, "sync_mount_error");
         assert_eq!(cli_error.exit_code, 1);
         assert!(cli_error.payload.message.contains("quota_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn sync_treats_a_mount_error_during_a_backend_outage_as_retryable_not_a_hard_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let status_body = format!(
+            r#"{{"paused":false,"backend_connected":false,"version":"0.1.0","update_required":false,"mounts":[{}],"credential":"account"}}"#,
+            mount_status_json(3, Some("backend_unreachable"))
+        );
+        MockDaemon::new()
+            .route(
+                "POST",
+                "/sync",
+                200,
+                r#"{"creates_submitted":0,"versions_submitted":0,"deletes_submitted":0,"pulled_ops":0,"errors":0}"#,
+            )
+            .route("GET", "/status", 200, status_body)
+            .spawn(&socket_path, 200);
+
+        let result = run_sync_barrier(
+            None,
+            "every mounted folder",
+            None,
+            Duration::from_millis(300),
+            Duration::from_millis(40),
+        )
+        .await;
+
+        restore_home(previous_home);
+
+        let error = result.expect_err(
+            "a mount error caused by an unreachable backend must not fail fast: it must wait and time out instead",
+        );
+        let cli_error = error
+            .downcast_ref::<CliError>()
+            .expect("an outage that never clears should time out with a CliError");
+        assert_eq!(cli_error.payload.code, "sync_timed_out");
+        assert_eq!(cli_error.exit_code, 75);
+    }
+
+    #[tokio::test]
+    async fn sync_does_not_exit_0_when_a_mount_carries_an_error_during_an_outage_with_no_pending_ops()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let status_body = format!(
+            r#"{{"paused":false,"backend_connected":false,"version":"0.1.0","update_required":false,"mounts":[{}],"credential":"account"}}"#,
+            mount_status_json(0, Some("backend_unreachable"))
+        );
+        MockDaemon::new()
+            .route(
+                "POST",
+                "/sync",
+                200,
+                r#"{"creates_submitted":0,"versions_submitted":0,"deletes_submitted":0,"pulled_ops":0,"errors":0}"#,
+            )
+            .route("GET", "/status", 200, status_body)
+            .spawn(&socket_path, 200);
+
+        let result = run_sync_barrier(
+            None,
+            "every mounted folder",
+            None,
+            Duration::from_millis(300),
+            Duration::from_millis(40),
+        )
+        .await;
+
+        restore_home(previous_home);
+
+        let error = result.expect_err(
+            "a mount carrying an error during an outage must never count as settled, even with zero pending ops",
+        );
+        let cli_error = error
+            .downcast_ref::<CliError>()
+            .expect("an outage that never clears should time out with a CliError");
+        assert_eq!(cli_error.payload.code, "sync_timed_out");
+        assert_eq!(cli_error.exit_code, 75);
+    }
+
+    #[tokio::test]
+    async fn sync_recovers_mid_wait_once_the_backend_reconnects_and_the_mount_error_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_home = set_test_home(dir.path());
+        let socket_path = crate::paths::socket_path().unwrap();
+        fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let outage_status_body = format!(
+            r#"{{"paused":false,"backend_connected":false,"version":"0.1.0","update_required":false,"mounts":[{}],"credential":"account"}}"#,
+            mount_status_json(3, Some("backend_unreachable"))
+        );
+        let recovered_status_body = format!(
+            r#"{{"paused":false,"backend_connected":true,"version":"0.1.0","update_required":false,"mounts":[{}],"credential":"account"}}"#,
+            mount_status_json(0, None)
+        );
+        MockDaemon::new()
+            .route(
+                "POST",
+                "/sync",
+                200,
+                r#"{"creates_submitted":0,"versions_submitted":0,"deletes_submitted":0,"pulled_ops":0,"errors":0}"#,
+            )
+            .route("GET", "/status", 200, outage_status_body)
+            .route("GET", "/status", 200, recovered_status_body)
+            .spawn(&socket_path, 4);
+
+        let result = run_sync_barrier(
+            None,
+            "every mounted folder",
+            None,
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+        )
+        .await;
+
+        restore_home(previous_home);
+
+        result.expect(
+            "a mount that recovers mid-wait once the backend reconnects should settle normally",
+        );
     }
 
     #[tokio::test]

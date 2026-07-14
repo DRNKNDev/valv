@@ -73,6 +73,16 @@ impl CliError {
         )
     }
 
+    pub(crate) fn share_read_only_requires_target() -> Self {
+        Self::usage(
+            "share_read_only_requires_target",
+            "--read-only requires a target: pass --to <email> or --key <name>",
+        )
+        .with_hint(
+            "share <path> with no flags lists existing grants; --read-only only makes sense when granting access with --to or --key.",
+        )
+    }
+
     pub(crate) fn handle_requires_pinned_id() -> Self {
         Self::usage(
             "handle_requires_pinned_id",
