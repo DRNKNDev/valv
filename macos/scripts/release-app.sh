@@ -40,11 +40,19 @@ Usage:
   APPLE_TEAM_ID="TEAMID" \
   NOTARY_PROFILE="valv-notary" \
   VALV_RELEASE_NOTES_FILE="/path/to/notes.md" \
-    macos/scripts/release-app.sh v0.1.0
+    macos/scripts/release-app.sh [--dry-run] v0.1.0
 
 Produces Valv-<version>.dmg (signed + notarized + stapled) and uploads it, its
 SHA-256, and any Sparkle deltas to the <tag> GitHub Release on
 ${VALV_GITHUB_REPO:-DRNKNDev/valv}.
+
+--dry-run runs the full archive/export/notarize/staple/DMG/appcast-generation
+flow (so signing, notarization, and Sparkle key problems still surface), but
+skips gh release upload and the post-upload enclosure assertion, defaults
+VALV_DMG_ARCHIVE_DIR to a fresh temp dir instead of ~/.valv-release-dmgs, and
+prints a diff of the generated appcast instead of overwriting the tracked
+oss/macos/appcast.xml. The produced .dmg path is printed at the end so the
+operator can mount and install it by hand.
 
 VALV_RELEASE_NOTES_FILE is the markdown shown in the in-app update dialog. It
 may be a trimmed version of the GitHub Release body (see
@@ -52,7 +60,20 @@ tooling/release/release-notes.md).
 USAGE
 }
 
-tag="${1:-}"
+dry_run=0
+positional=()
+for arg in "$@"; do
+  case "${arg}" in
+    --dry-run)
+      dry_run=1
+      ;;
+    *)
+      positional+=("${arg}")
+      ;;
+  esac
+done
+
+tag="${positional[0]:-}"
 team_id="${APPLE_TEAM_ID:-}"
 notary_profile="${NOTARY_PROFILE:-}"
 
@@ -104,7 +125,7 @@ if [[ -f "${appcast_path}" ]]; then
   [[ -n "${latest_from_appcast}" ]] && previous_build_number="${latest_from_appcast}"
 fi
 (( current_project_version > previous_build_number )) ||
-  fail "${scheme} CURRENT_PROJECT_VERSION (${current_project_version}) must be strictly greater than the previously published app release's build number (${previous_build_number}) — Sparkle orders updates by this field"
+  fail "${scheme} CURRENT_PROJECT_VERSION (${current_project_version}) must be strictly greater than the previously published app release's build number (${previous_build_number}): Sparkle orders updates by this field"
 
 work_dir="$(mktemp -d)"
 trap 'rm -rf "${work_dir}"' EXIT
@@ -197,7 +218,11 @@ echo "${digest}  Valv-${version}.dmg" > "${checksum_file}"
 generate_appcast_bin="$(command -v generate_appcast 2>/dev/null || find "${HOME}/Library/Developer/Xcode/DerivedData" -name generate_appcast -path '*sparkle*' 2>/dev/null | head -1)"
 [[ -x "${generate_appcast_bin}" ]] || fail "generate_appcast not found on PATH or in DerivedData Sparkle artifacts (build the app once so SPM resolves Sparkle's tools)"
 
-dmg_archive_dir="${VALV_DMG_ARCHIVE_DIR:-${HOME}/.valv-release-dmgs}"
+if [[ "${dry_run}" -eq 1 ]]; then
+  dmg_archive_dir="$(mktemp -d)"
+else
+  dmg_archive_dir="${VALV_DMG_ARCHIVE_DIR:-${HOME}/.valv-release-dmgs}"
+fi
 mkdir -p "${dmg_archive_dir}"
 echo "==> Archiving Valv-${version}.dmg into the local release archive (${dmg_archive_dir})"
 cp "${dmg_path}" "${dmg_archive_dir}/Valv-${version}.dmg"
@@ -232,30 +257,48 @@ sed -i '' -E \
   's#(releases/download/)v[0-9][^/]*/Valv-([0-9][^/]*)\.dmg#\1v\2/Valv-\2.dmg#g' \
   "${appcast_output}"
 
-cp "${appcast_output}" "${appcast_path}"
-echo "==> Wrote ${appcast_path}"
+if [[ "${dry_run}" -eq 1 ]]; then
+  echo "==> --dry-run: not overwriting ${appcast_path}; diff of what a real run would write:"
+  diff -u "${appcast_path}" "${appcast_output}" || true
+else
+  cp "${appcast_output}" "${appcast_path}"
+  echo "==> Wrote ${appcast_path}"
+fi
 
-echo "==> Uploading to ${repo} ${tag}"
-upload_files=("${dmg_path}" "${checksum_file}")
-while IFS= read -r delta; do
-  upload_files+=("${delta}")
-done < <(find "${dmg_archive_dir}" -maxdepth 1 -name "Valv${current_project_version}-*.delta")
-gh release upload "${tag}" \
-  --repo "${repo}" \
-  --clobber \
-  "${upload_files[@]}"
+if [[ "${dry_run}" -eq 1 ]]; then
+  echo "==> --dry-run: skipping gh release upload"
+else
+  echo "==> Uploading to ${repo} ${tag}"
+  upload_files=("${dmg_path}" "${checksum_file}")
+  while IFS= read -r delta; do
+    upload_files+=("${delta}")
+  done < <(find "${dmg_archive_dir}" -maxdepth 1 -name "Valv${current_project_version}-*.delta")
+  gh release upload "${tag}" \
+    --repo "${repo}" \
+    --clobber \
+    "${upload_files[@]}"
 
-echo "Published Valv-${version}.dmg (sha256 ${digest}) to ${repo} ${tag}"
+  echo "Published Valv-${version}.dmg (sha256 ${digest}) to ${repo} ${tag}"
 
-echo "==> Verifying every ${tag} enclosure resolves to an uploaded asset"
-assets="$(gh release view "${tag}" --repo "${repo}" --json assets --jq '.assets[].name')"
-while IFS= read -r asset; do
-  [[ -z "${asset}" ]] && continue
-  grep -qx "${asset}" <<<"${assets}" ||
-    fail "appcast references ${asset} under ${tag}, but no such asset exists on the release"
-done < <(grep -oE "releases/download/${tag}/[^\"]+" "${appcast_path}" | sed -E 's#.*/##')
+  echo "==> Verifying every ${tag} enclosure resolves to an uploaded asset"
+  assets="$(gh release view "${tag}" --repo "${repo}" --json assets --jq '.assets[].name')"
+  while IFS= read -r asset; do
+    [[ -z "${asset}" ]] && continue
+    grep -qx "${asset}" <<<"${assets}" ||
+      fail "appcast references ${asset} under ${tag}, but no such asset exists on the release"
+  done < <(grep -oE "releases/download/${tag}/[^\"]+" "${appcast_path}" | sed -E 's#.*/##')
+fi
 
-cat <<STEPS
+if [[ "${dry_run}" -eq 1 ]]; then
+  cat <<STEPS
+
+==> --dry-run complete: nothing was uploaded, and ${appcast_path} was not
+    modified (diff shown above). Mount and install the DMG to verify it:
+      ${dmg_archive_dir}/Valv-${version}.dmg
+    Re-run without --dry-run to publish for real.
+STEPS
+else
+  cat <<STEPS
 
 ==> Appcast regenerated locally but NOT yet published. Complete the publish
     sequence by hand (design D2/D4, tooling/release/release-notes.md):
@@ -268,3 +311,4 @@ cat <<STEPS
          (confirm the new version's entry is actually live before calling this
          release done - an unpublished appcast is safe, but not shipped)
 STEPS
+fi
