@@ -3,11 +3,51 @@
     <channel>
         <title>Valv</title>
         <item>
+            <title>0.2.2</title>
+            <pubDate>Tue, 14 Jul 2026 16:30:19 +0700</pubDate>
+            <sparkle:version>3</sparkle:version>
+            <sparkle:shortVersionString>0.2.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.2</sparkle:minimumSystemVersion>
+            <description sparkle:format="markdown"><![CDATA[First release of Valv for macOS: sync your folders, share them, and keep every version.
+
+## Sync
+
+- mounted folders appear in Finder and materialize on demand, so a folder costs nothing until you open a file in it
+- edits to a large file upload only the parts that changed
+- every file keeps its version history, and any version can be restored
+- conflicting edits become a conflict copy beside the original, never a silent overwrite
+- deletes, moves, and renames propagate correctly, including to a Mac that was offline when they happened
+
+## Sharing
+
+- share a folder from Finder, or from the Manage Folders window
+- invite someone by email and they accept in the browser with their own account
+- hand over an access key to set up a machine that has no Valv account, such as a home server or a VPS
+- a machine you hand a key to cannot share the folder onward
+- read-only sharing gives read access without write
+
+## The rest
+
+- menu-bar app showing daemon health and every folder's sync state
+- in-app updates
+- a `valv` command line for scripting, with `--json` on every command
+]]></description>
+            <enclosure url="https://github.com/DRNKNDev/valv/releases/download/v0.2.2/Valv-0.2.2.dmg" length="15433290" type="application/octet-stream" sparkle:edSignature="26Gx7jF6mrKE8ca91ocX4WeQAE9QGMpVzN0xBRFbGlD0M5Uvx/AgJJJ0AjkBbER82njZtHRmAjgZighULQ51CQ=="/>
+            <sparkle:deltas>
+                <enclosure url="https://github.com/DRNKNDev/valv/releases/download/v0.2.2/Valv3-2.delta" sparkle:deltaFrom="2" length="1824458" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977840" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="MqCUxrATQooExnQCrw6kjkK0wpbxMyIyFJ3FcxyeTOTNN6RtMBAjzSqOBeGc4A4JFHso2kgcNTHfJMt6LtGuAA=="/>
+                <enclosure url="https://github.com/DRNKNDev/valv/releases/download/v0.2.2/Valv3-1.delta" sparkle:deltaFrom="1" length="2132874" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977840" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="M3gD46w7CsKe9uQOaOdQr23FB24mCj2ExMj7e/8zJVGazvjjXrRRipGYIolVwRxLF8wFejRxZ4oYbAw9AYznAQ=="/>
+            </sparkle:deltas>
+        </item>
+        <item>
             <title>0.2.1</title>
             <pubDate>Mon, 13 Jul 2026 12:42:47 +0700</pubDate>
             <sparkle:version>2</sparkle:version>
             <sparkle:shortVersionString>0.2.1</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.2</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/DRNKNDev/valv/releases/download/v0.2.1/Valv-0.2.1.dmg" length="15255383" type="application/octet-stream" sparkle:edSignature="zmNbVUl6JCJNTVbr0oSudb1/RZ7/wR8vL/FvUuSA314kIuicWiyWh7re/OlaIy+8o94mGAbzb75GY5c8IuwXBQ=="/>
+            <sparkle:deltas>
+                <enclosure url="https://github.com/DRNKNDev/valv/releases/download/v0.2.1/Valv2-1.delta" sparkle:deltaFrom="1" length="1275126" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977840" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="bnw6+HbvKxd8+6hT8L3RgrksrAtjciboNDumc9y9QCHrLzJecWN2AHvXFU9CTt4lX/6WqfpNOhUvl+LfKTjcCw=="/>
+            </sparkle:deltas>
             <description sparkle:format="markdown"><![CDATA[Sharing from Finder, and a File Provider that no longer hangs or loses its domain.
 
 ## macOS app
@@ -25,11 +65,8 @@
 
 - New `GET /nodes/by-path` route, with a matching `nodeIdForPath` method in DaemonKit
 - Cross-folder moves are rejected with `409 cross_folder_move_rejected` instead of orphaning the node from both folders
-- Config errors now point at `valv auth login`, which is what actually writes `device_token` — the old hint dead-ended at `daemon install`, whose template leaves the token empty]]></description>
-            <enclosure url="https://github.com/DRNKNDev/valv/releases/download/v0.2.1/Valv-0.2.1.dmg" length="15255383" type="application/octet-stream" sparkle:edSignature="zmNbVUl6JCJNTVbr0oSudb1/RZ7/wR8vL/FvUuSA314kIuicWiyWh7re/OlaIy+8o94mGAbzb75GY5c8IuwXBQ=="/>
-            <sparkle:deltas>
-                <enclosure url="https://github.com/DRNKNDev/valv/releases/download/v0.2.1/Valv2-1.delta" sparkle:deltaFrom="1" length="1275126" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977840" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="bnw6+HbvKxd8+6hT8L3RgrksrAtjciboNDumc9y9QCHrLzJecWN2AHvXFU9CTt4lX/6WqfpNOhUvl+LfKTjcCw=="/>
-            </sparkle:deltas>
+- Config errors now point at `valv auth login`, which is what actually writes `device_token` — the old hint dead-ended at `daemon install`, whose template leaves the token empty
+]]></description>
         </item>
         <item>
             <title>0.2.0</title>
