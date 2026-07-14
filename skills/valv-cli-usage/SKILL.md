@@ -1,6 +1,6 @@
 ---
 name: valv-cli-usage
-description: Operate the valv file-sync CLI: sign in, mount and unmount folders, sync, check status, share folders with people or machines, revoke access, and restore file versions. Use when running valv commands, setting up a headless or agent machine with an access key, driving the valvd daemon, or interpreting valv exit codes and error codes.
+description: "Operate the valv file-sync CLI: sign in, mount and unmount folders, sync, check status, share folders with people or machines, revoke access, and restore file versions. Use when running valv commands, setting up a headless or agent machine with an access key, driving the valvd daemon, or interpreting valv exit codes and error codes."
 ---
 
 # valv CLI
