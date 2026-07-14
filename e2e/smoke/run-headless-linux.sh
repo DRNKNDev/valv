@@ -23,11 +23,13 @@ HEADLESS_UID=$(id -u "$HEADLESS_USER")
 HEADLESS_RUNTIME_DIR="/run/user/${HEADLESS_UID}"
 HEADLESS_BUS_SOCKET="${HEADLESS_RUNTIME_DIR}/bus"
 
+# systemd creates /run/user/<uid> as 0700 owned by that uid, so the socket is
+# only stat-able as root or as the user itself.
 deadline=$((SECONDS + 30))
-while [ "$SECONDS" -lt "$deadline" ] && [ ! -S "$HEADLESS_BUS_SOCKET" ]; do
+while [ "$SECONDS" -lt "$deadline" ] && ! sudo test -S "$HEADLESS_BUS_SOCKET"; do
   sleep 1
 done
-if [ ! -S "$HEADLESS_BUS_SOCKET" ]; then
+if ! sudo test -S "$HEADLESS_BUS_SOCKET"; then
   sudo systemctl status "user@${HEADLESS_UID}.service" || true
   fail "no reachable systemd --user session for ${HEADLESS_USER} after enabling linger"
 fi
@@ -38,10 +40,19 @@ HEADLESS_HOME=$(getent passwd "$HEADLESS_USER" | cut -d: -f6)
 sudo chmod o+x "$HOME"
 sudo chmod -R a+rwX "$TMPDIR"
 
+# The unit's ExecStart resolves to VALVD_BIN under the runner's checkout, so
+# valv-smoke's manager must be able to traverse and exec it. Fail loudly here
+# rather than as an opaque socket-wait timeout after the install.
+for bin in "$VALV_BIN" "$VALVD_BIN"; do
+  sudo -u "$HEADLESS_USER" test -x "$bin" ||
+    fail "${HEADLESS_USER} cannot execute ${bin}; check the checkout path is world-traversable"
+done
+
 log_file="${TMPDIR}/headless-linux-run.log"
 set +e
 sudo -H -u "$HEADLESS_USER" \
   env \
+    HOME="$HEADLESS_HOME" \
     XDG_RUNTIME_DIR="$HEADLESS_RUNTIME_DIR" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=${HEADLESS_BUS_SOCKET}" \
     BACKEND_URL="$BACKEND_URL" \
