@@ -3,6 +3,7 @@ mod auth;
 mod config;
 mod daemon;
 mod error;
+mod format;
 mod grants;
 mod paths;
 mod table;
