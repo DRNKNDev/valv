@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use valv_sync::api_base;
 
@@ -10,6 +9,7 @@ use crate::{
     config::{load_backend_url, load_config, CliConfig},
     daemon::probe_credential,
     error::{confirm, CliError, EX_FAILURE, EX_NOPERM},
+    format::age_from_now,
     paths::{resolve_mount, resolve_target_path, scope_label},
     table::print_table,
 };
@@ -117,6 +117,7 @@ pub(crate) async fn cmd_share_grant(args: ShareArgs, json: bool) -> Result<()> {
     let client = reqwest::Client::new();
     let can_write = !args.read_only;
     if let Some(email) = args.to {
+        let scope = scope_label(&target.folder_id, &target.scope_node_id)?;
         let response = client
             .post(format!(
                 "{}/folders/{}/invites",
@@ -138,20 +139,26 @@ pub(crate) async fn cmd_share_grant(args: ShareArgs, json: bool) -> Result<()> {
             .json::<InviteCreateResponse>()
             .await
             .context("failed to parse invite creation response")?;
+        let accept_url = format!(
+            "{}/invites/{}/accept",
+            api_base(&config.backend_url),
+            invite.invite_token
+        );
         if json {
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
                     "invited_email": email,
-                    "invite_url": format!("{}/invites/{}/accept", api_base(&config.backend_url), invite.invite_token),
+                    "invite_url": accept_url,
                 }))?
             );
         } else {
-            println!(
-                "Invite URL: {}/invites/{}/accept",
-                api_base(&config.backend_url),
-                invite.invite_token
-            );
+            let folder_label = resolve_mount(&args.path)
+                .ok()
+                .and_then(|mount| mount.name)
+                .unwrap_or_else(|| args.path.clone());
+            println!("{}", invite_receipt_message(&email, &folder_label, &scope, can_write));
+            println!("Accept link: {accept_url}");
         }
     } else if let Some(name) = args.key {
         let response = client
@@ -186,7 +193,7 @@ pub(crate) async fn cmd_share_grant(args: ShareArgs, json: bool) -> Result<()> {
                 }))?
             );
         } else {
-            println!("Created access key {name} ({})", grant.grant_id);
+            println!("Created access key {name} ({}).", grant.grant_id);
             println!("One-time token: {}", grant.token);
             println!("Store this token now; it cannot be retrieved again.");
         }
@@ -322,13 +329,13 @@ fn print_share_listing(
             })
             .collect::<Vec<_>>();
         print_table(
-            &["id", "grantee", "scope", "permission", "status"],
+            &["ID", "GRANTEE", "SCOPE", "PERMISSION", "STATUS"],
             &table_rows,
         );
     }
     if show_hint {
         println!(
-            "Add access with: valv share {path} --to <email>, or valv share {path} --key <name>"
+            "Add access with: `valv share {path} --to <email>`, or `valv share {path} --key <name>`."
         );
     }
     Ok(())
@@ -490,35 +497,11 @@ fn permission_label(can_write: bool) -> &'static str {
     }
 }
 
-fn age_from_now(created_at: &str) -> Option<String> {
-    let created = DateTime::parse_from_rfc3339(created_at)
-        .ok()?
-        .with_timezone(&Utc);
-    Some(humanize_duration(Utc::now().signed_duration_since(created)))
-}
-
-fn humanize_duration(delta: chrono::Duration) -> String {
-    let seconds = delta.num_seconds().max(0);
-    if seconds < 60 {
-        return plural(seconds, "second");
-    }
-    let minutes = seconds / 60;
-    if minutes < 60 {
-        return plural(minutes, "minute");
-    }
-    let hours = minutes / 60;
-    if hours < 24 {
-        return plural(hours, "hour");
-    }
-    plural(hours / 24, "day")
-}
-
-fn plural(count: i64, unit: &str) -> String {
-    if count == 1 {
-        format!("1 {unit} ago")
-    } else {
-        format!("{count} {unit}s ago")
-    }
+fn invite_receipt_message(email: &str, folder_label: &str, scope: &str, can_write: bool) -> String {
+    format!(
+        "Invited {email} to {folder_label} ({scope}, {}).",
+        permission_label(can_write)
+    )
 }
 
 async fn delete_grant(
@@ -820,6 +803,7 @@ pub(crate) struct InviteEntry {
 mod tests {
     use std::collections::HashMap;
 
+    use chrono::Utc;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -940,13 +924,6 @@ mod tests {
     }
 
     #[test]
-    fn humanize_duration_names_minutes() {
-        assert_eq!(humanize_duration(chrono::Duration::minutes(4)), "4 minutes ago");
-        assert_eq!(humanize_duration(chrono::Duration::minutes(1)), "1 minute ago");
-        assert_eq!(humanize_duration(chrono::Duration::seconds(30)), "30 seconds ago");
-    }
-
-    #[test]
     fn confirmation_message_names_the_grants_age() {
         let created_at = (Utc::now() - chrono::Duration::minutes(4)).to_rfc3339();
         let grant = grant_entry(
@@ -979,6 +956,26 @@ mod tests {
         assert_eq!(value["folder_id"], "folder-1");
         assert_eq!(value["handle"], "bob@example.com");
         assert!(!output.contains("Revoked"));
+    }
+
+    #[test]
+    fn invite_receipt_message_names_the_grantee_folder_scope_and_permission() {
+        let message = invite_receipt_message("bob@example.com", "Design", "Entire Folder", true);
+
+        assert_eq!(
+            message,
+            "Invited bob@example.com to Design (Entire Folder, read/write)."
+        );
+    }
+
+    #[test]
+    fn invite_receipt_message_names_read_only_permission() {
+        let message = invite_receipt_message("bob@example.com", "Design", "Entire Folder", false);
+
+        assert_eq!(
+            message,
+            "Invited bob@example.com to Design (Entire Folder, read-only)."
+        );
     }
 
     #[test]
