@@ -49,7 +49,7 @@ pub(crate) async fn cmd_auth_login(args: AuthLoginArgs, json: bool) -> Result<()
     if args.open_browser {
         open_browser(&login_url)?;
     }
-    println!("Open this URL to sign in:\n{login_url}");
+    println!("{}", pre_callback_message(args.open_browser, &login_url));
 
     let callback =
         wait_for_callback(accept_one_callback(listener, &state), AUTH_LOGIN_TIMEOUT).await?;
@@ -66,9 +66,21 @@ pub(crate) async fn cmd_auth_login(args: AuthLoginArgs, json: bool) -> Result<()
             serde_json::to_string(&serde_json::json!({ "device_id": callback.device_id }))?
         );
     } else {
-        println!("Signed in as device {}", callback.device_id);
+        println!("{}", login_success_message(&args.device_name));
     }
     Ok(())
+}
+
+fn pre_callback_message(open_browser: bool, login_url: &str) -> String {
+    if open_browser {
+        format!("Opening your browser to sign in… If it doesn't open, use this link:\n{login_url}")
+    } else {
+        format!("Open this URL to sign in:\n{login_url}")
+    }
+}
+
+fn login_success_message(device_name: &str) -> String {
+    format!("Signed in as this device ({device_name}).")
 }
 
 async fn wait_for_callback<F>(callback: F, timeout_duration: Duration) -> Result<PairingCallback>
@@ -268,6 +280,35 @@ mod tests {
             }
         );
         assert!(response.starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn pre_callback_message_is_not_imperative_when_the_browser_already_opened() {
+        let message = pre_callback_message(true, "https://valvsync.com/login?state=abc");
+
+        assert_eq!(
+            message,
+            "Opening your browser to sign in… If it doesn't open, use this link:\nhttps://valvsync.com/login?state=abc"
+        );
+        assert!(!message.contains("Open this URL to sign in:"));
+    }
+
+    #[test]
+    fn pre_callback_message_stays_imperative_when_no_browser_was_opened() {
+        let message = pre_callback_message(false, "https://valvsync.com/login?state=abc");
+
+        assert_eq!(
+            message,
+            "Open this URL to sign in:\nhttps://valvsync.com/login?state=abc"
+        );
+    }
+
+    #[test]
+    fn login_success_message_names_the_device_not_an_opaque_device_id() {
+        let message = login_success_message("Alice's MacBook");
+
+        assert_eq!(message, "Signed in as this device (Alice's MacBook).");
+        assert!(!message.contains("dev_a1b2c3"));
     }
 
     #[test]
