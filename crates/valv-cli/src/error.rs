@@ -64,19 +64,15 @@ impl CliError {
     }
 
     pub(crate) fn mount_source_required() -> Self {
-        Self::usage(
-            "mount_source_required",
-            "mount requires exactly one source: --folder <id|name>, --key <token>, or --new",
-        )
-        .with_hint(
-            "Pass --folder <id|name> to attach a folder you can already reach, --key <token> to redeem an access key, or --new to create one from this path.",
+        Self::usage("mount_source_required", "mount needs exactly one source.").with_hint(
+            "--folder <id|name>  attach a folder you can reach\n--key <token>       redeem an access key\n--new               create one from this path",
         )
     }
 
     pub(crate) fn share_read_only_requires_target() -> Self {
         Self::usage(
             "share_read_only_requires_target",
-            "--read-only requires a target: pass --to <email> or --key <name>",
+            "--read-only requires a target: pass --to <email> or --key <name>.",
         )
         .with_hint(
             "share <path> with no flags lists existing grants; --read-only only makes sense when granting access with --to or --key.",
@@ -96,7 +92,7 @@ impl CliError {
             "daemon_not_running",
             "The Valv daemon is not running.",
         )
-        .with_hint("Run any valv command to start it, or run: valv daemon restart")
+        .with_hint("Run any valv command to start it, or run `valv daemon restart`.")
     }
 
     pub(crate) fn daemon_failed_to_start(detail: impl Into<String>) -> Self {
@@ -145,7 +141,7 @@ impl CliError {
         Self::new(
             EX_FAILURE,
             "folder_not_found",
-            format!("Folder not found: {}", handle.into()),
+            format!("Folder not found: {}.", handle.into()),
         )
     }
 
@@ -153,7 +149,7 @@ impl CliError {
         Self::new(
             EX_FAILURE,
             "grant_not_found",
-            format!("No matching grant for {}", handle.into()),
+            format!("No matching grant for {}.", handle.into()),
         )
     }
 
@@ -203,7 +199,7 @@ impl CliError {
             "access_key_cannot_revoke",
             "An access key cannot revoke access, including its own.",
         )
-        .with_hint("Ask the folder owner to revoke it with `valv unshare <path> ...`.")
+        .with_hint("Ask the folder owner to revoke it with `valv unshare <path> …`.")
     }
 
     pub(crate) fn access_key_is_read_only(folder: impl Into<String>) -> Self {
@@ -230,9 +226,15 @@ impl CliError {
 
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.payload.message)?;
+        write!(f, "error: {}", self.payload.message)?;
         if let Some(hint) = &self.payload.hint {
-            write!(f, " {hint}")?;
+            let mut lines = hint.split('\n');
+            if let Some(first) = lines.next() {
+                write!(f, "\nhint:  {first}")?;
+            }
+            for line in lines {
+                write!(f, "\n       {line}")?;
+            }
         }
         Ok(())
     }
@@ -371,5 +373,36 @@ mod tests {
         assert_eq!(error.exit_code, EX_FAILURE);
         assert!(error.payload.message.contains("Design"));
         assert!(error.payload.message.contains("quota exceeded"));
+    }
+
+    #[test]
+    fn mount_source_required_renders_one_alternative_per_line_hanging_under_the_hint_label() {
+        let rendered = CliError::mount_source_required().to_string();
+
+        assert_eq!(
+            rendered,
+            "error: mount needs exactly one source.\n\
+             hint:  --folder <id|name>  attach a folder you can reach\n       \
+             --key <token>       redeem an access key\n       \
+             --new               create one from this path"
+        );
+        assert!(!rendered.contains("--new Pass"));
+    }
+
+    #[test]
+    fn a_hintless_error_prints_only_the_error_line() {
+        let rendered = CliError::not_configured().to_string();
+
+        assert!(rendered.starts_with("error: "));
+        assert!(!rendered.contains("hint:"));
+        assert_eq!(rendered.lines().count(), 1);
+    }
+
+    #[test]
+    fn a_single_sentence_hint_prints_as_one_hint_line() {
+        let rendered = CliError::access_key_cannot_create_folder().to_string();
+
+        assert_eq!(rendered.lines().count(), 2);
+        assert!(rendered.lines().nth(1).unwrap().starts_with("hint:  "));
     }
 }
