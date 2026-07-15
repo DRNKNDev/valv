@@ -25,6 +25,7 @@ use crate::{
         DaemonAbsenceReason,
     },
     error::{confirm, CliError},
+    format::{age_from_now, humanize_bytes},
     grants::{
         cmd_share_grant, cmd_share_list, cmd_unshare, fetch_reachable_grants, GrantListEntry,
     },
@@ -273,11 +274,11 @@ async fn run_command(command: Command, json: bool) -> Result<()> {
         Command::Status => cmd_status(json).await,
         Command::Pause => {
             ensure_daemon(None).await?;
-            cmd_pause_resume("pause", "Paused sync: background sync is paused", json).await
+            cmd_pause_resume("pause", "Sync paused.", json).await
         }
         Command::Resume => {
             ensure_daemon(None).await?;
-            cmd_pause_resume("resume", "Resumed sync: background sync is running", json).await
+            cmd_pause_resume("resume", "Sync resumed.", json).await
         }
         Command::Sync { path } => {
             ensure_daemon(None).await?;
@@ -362,15 +363,22 @@ async fn cmd_mount(args: MountArgs, json: bool) -> Result<()> {
                 "path": mounted.path,
             }))?
         );
-    } else if args.new {
-        println!(
-            "Created and mounted folder {}: {}",
-            mounted.folder_id, mounted.path
-        );
     } else {
-        println!("Attached folder {}: {}", mounted.folder_id, mounted.path);
+        let name = resolve_mount(&mounted.path)
+            .ok()
+            .and_then(|mount| mount.name)
+            .unwrap_or_else(|| mounted.folder_id.clone());
+        println!("{}", mount_success_message(args.new, &name, &mounted.path));
     }
     Ok(())
+}
+
+fn mount_success_message(created: bool, name: &str, path: &str) -> String {
+    if created {
+        format!("Created \"{name}\" and mounted it at {path}.")
+    } else {
+        format!("Attached \"{name}\" at {path}.")
+    }
 }
 
 fn request_spinner(message: &'static str, json: bool) -> Option<ProgressBar> {
@@ -426,7 +434,7 @@ async fn cmd_unmount(path: String, yes: bool, json: bool) -> Result<()> {
             )?
         );
     } else {
-        println!("Unmounted {path}");
+        println!("Unmounted {path}.");
     }
     Ok(())
 }
@@ -466,31 +474,28 @@ async fn cmd_versions(path: String, json: bool) -> Result<()> {
     let rows = response
         .versions
         .into_iter()
-        .map(|version| {
-            vec![
-                version.version_id,
-                version.created_at,
-                version.size_bytes.to_string(),
-                version.author_device_name,
-                if version.is_conflict_copy {
-                    "yes".into()
-                } else {
-                    "no".into()
-                },
-            ]
-        })
+        .map(version_row)
         .collect::<Vec<_>>();
     print_table(
-        &[
-            "version_id",
-            "created_at",
-            "size_bytes",
-            "author_device",
-            "conflict_copy",
-        ],
+        &["VERSION", "CREATED", "SIZE", "AUTHOR", "CONFLICT COPY"],
         &rows,
     );
     Ok(())
+}
+
+fn version_row(version: valv_sync::protocol::ipc::VersionEntry) -> Vec<String> {
+    let created = age_from_now(&version.created_at).unwrap_or(version.created_at);
+    vec![
+        version.version_id,
+        created,
+        humanize_bytes(version.size_bytes),
+        version.author_device_name,
+        if version.is_conflict_copy {
+            "yes".into()
+        } else {
+            "no".into()
+        },
+    ]
 }
 
 async fn refuse_if_access_key_restore_is_read_only(local_path: &str) -> Result<()> {
@@ -534,15 +539,25 @@ async fn cmd_restore(path: String, version_id: String, json: bool) -> Result<()>
     }
     match response.result.as_str() {
         "applied" => println!("Restored {local_path} to version {version_id}"),
-        "conflict_copy" => {
-            println!("Restored as conflict copy: another write occurred concurrently")
-        }
-        "superseded" => {
-            println!("Restore superseded: a concurrent write already advanced the file")
-        }
+        "conflict_copy" => println!("{}", conflict_copy_message(&local_path)),
+        "superseded" => println!("{}", superseded_message(&local_path)),
         result => println!("Restore result: {result}"),
     }
     Ok(())
+}
+
+fn conflict_copy_message(local_path: &str) -> String {
+    let parent = std::path::Path::new(local_path)
+        .parent()
+        .map(|parent| parent.display().to_string())
+        .unwrap_or_else(|| local_path.to_owned());
+    format!(
+        "Another write happened at the same time, so the restore was saved as a new file in {parent} instead of overwriting {local_path}."
+    )
+}
+
+fn superseded_message(local_path: &str) -> String {
+    format!("{local_path} was not restored: a newer write already happened, so nothing changed.")
 }
 
 fn canonical_path(path: &str) -> Result<String> {
@@ -599,10 +614,11 @@ async fn render_status_online(status: DaemonStatus, json: bool) -> Result<()> {
     }
 
     let rows = build_folder_rows(&status, &discovery);
-    print_table(
-        &["folder_id", "name", "access", "path", "sync_state"],
-        &rows,
-    );
+    print_table(&ONLINE_TABLE_HEADERS, &rows);
+
+    for line in mount_state_detail_lines(&status) {
+        println!("{line}");
+    }
 
     if matches!(discovery, Discovery::Unavailable) {
         println!("The reachable-folder list is unavailable: the backend could not be reached.");
@@ -656,7 +672,7 @@ async fn render_status_offline(json: bool) -> Result<()> {
             ]
         })
         .collect::<Vec<_>>();
-    print_table(&["folder_id", "name", "path"], &rows);
+    print_table(&OFFLINE_TABLE_HEADERS, &rows);
 
     if let Discovery::Available(grants) = &discovery {
         let mounted_ids = mounts
@@ -675,7 +691,7 @@ async fn render_status_offline(json: bool) -> Result<()> {
             })
             .collect::<Vec<_>>();
         if !unmounted_rows.is_empty() {
-            print_table(&["folder_id", "name", "path"], &unmounted_rows);
+            print_table(&OFFLINE_TABLE_HEADERS, &unmounted_rows);
         }
     }
     if matches!(discovery, Discovery::Unavailable) {
@@ -719,7 +735,7 @@ fn principal_lines(credential: Credential, principal: Option<&PrincipalStatus>) 
         Credential::Rejected => {
             vec!["Access key rejected. Ask the folder owner for a new key.".to_owned()]
         }
-        Credential::Pending => vec!["Verifying this machine's credential...".to_owned()],
+        Credential::Pending => vec!["Verifying this machine's credential…".to_owned()],
         Credential::None => vec!["Not configured, no key yet".to_owned()],
     }
 }
@@ -756,10 +772,10 @@ fn access_label(can_write: bool, role: Option<&str>) -> String {
 
 fn mount_sync_state(mount: &MountStatus) -> String {
     if mount.update_required {
-        return update_required_cell(true);
+        return "update required".into();
     }
-    if let Some(error) = &mount.error {
-        return error.clone();
+    if mount.error.is_some() {
+        return "error".into();
     }
     if mount.syncing {
         return "syncing".into();
@@ -780,8 +796,8 @@ fn build_folder_rows(status: &DaemonStatus, discovery: &Discovery) -> Vec<Vec<St
                 mount.folder_id.clone(),
                 mount.name.clone(),
                 access_label(mount.can_write, None),
-                mount.path.clone(),
                 mount_sync_state(mount),
+                mount.path.clone(),
             ]
         })
         .collect::<Vec<_>>();
@@ -806,6 +822,25 @@ fn build_folder_rows(status: &DaemonStatus, discovery: &Discovery) -> Vec<Vec<St
         }
     }
     rows
+}
+
+fn mount_state_detail_lines(status: &DaemonStatus) -> Vec<String> {
+    status
+        .mounts
+        .iter()
+        .filter_map(|mount| {
+            if mount.update_required {
+                Some(format!(
+                    "{}: update required, run `valv update` to fix this.",
+                    mount.name
+                ))
+            } else if let Some(error) = &mount.error {
+                Some(format!("{}: {error}", mount.name))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn offline_principal_line(mounts: &[valv_sync::persistence::mounts::LocalMount]) -> String {
@@ -835,7 +870,7 @@ fn print_daemon_absence(reason: &DaemonAbsenceReason) {
         }
         DaemonAbsenceReason::NotInstalled => {
             println!("Daemon: not installed (no background service is registered).");
-            println!("Run any valv command to install and start it, or run: valv daemon restart");
+            println!("Run any valv command to install and start it, or run `valv daemon restart`.");
         }
         DaemonAbsenceReason::InstalledButFailing { last_error } => {
             println!("Daemon: installed, but failing to start.");
@@ -847,15 +882,10 @@ fn print_daemon_absence(reason: &DaemonAbsenceReason) {
     }
 }
 
-const UPDATE_REQUIRED_MESSAGE: &str = "Update required. Run 'valv update' to fix this.";
+const UPDATE_REQUIRED_MESSAGE: &str = "Update required. Run `valv update` to fix this.";
 
-fn update_required_cell(update_required: bool) -> String {
-    if update_required {
-        UPDATE_REQUIRED_MESSAGE.to_owned()
-    } else {
-        "false".to_owned()
-    }
-}
+const ONLINE_TABLE_HEADERS: [&str; 5] = ["FOLDER ID", "NAME", "ACCESS", "STATE", "PATH"];
+const OFFLINE_TABLE_HEADERS: [&str; 3] = ["FOLDER ID", "NAME", "PATH"];
 
 fn update_available_line(
     update_available: Option<bool>,
@@ -1082,14 +1112,29 @@ async fn cmd_sync(path: Option<String>, json: bool) -> Result<()> {
         );
         return Ok(());
     }
-    println!(
-        "Synced {subject}: {} created, {} updated, {} deleted, {} remote ops applied",
-        summary.creates_submitted,
-        summary.versions_submitted,
-        summary.deletes_submitted,
-        summary.pulled_ops
-    );
+    println!("{}", sync_summary_line(&subject, &summary));
     Ok(())
+}
+
+fn sync_summary_line(subject: &str, summary: &SyncSummary) -> String {
+    let mut parts = Vec::new();
+    if summary.creates_submitted > 0 {
+        parts.push(format!("{} created", summary.creates_submitted));
+    }
+    if summary.versions_submitted > 0 {
+        parts.push(format!("{} updated", summary.versions_submitted));
+    }
+    if summary.deletes_submitted > 0 {
+        parts.push(format!("{} deleted", summary.deletes_submitted));
+    }
+    if summary.pulled_ops > 0 {
+        parts.push(format!("{} changes received", summary.pulled_ops));
+    }
+    if parts.is_empty() {
+        "Already up to date.".to_owned()
+    } else {
+        format!("Synced {subject}: {}.", parts.join(", "))
+    }
 }
 
 fn delegate_daemon(command: DaemonCommand, json: bool) -> Result<()> {
@@ -1145,6 +1190,7 @@ fn run_valvd_daemon_subcommand(subcommand: &str, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use valv_sync::protocol::ipc::VersionEntry;
 
     fn sample_status() -> DaemonStatus {
@@ -1303,7 +1349,7 @@ mod tests {
         let lines = principal_lines(Credential::Pending, None);
         assert_eq!(
             lines,
-            vec!["Verifying this machine's credential...".to_owned()]
+            vec!["Verifying this machine's credential…".to_owned()]
         );
     }
 
@@ -1519,17 +1565,117 @@ mod tests {
         );
     }
 
+    fn mount_status_with(
+        name: &str,
+        error: Option<&str>,
+        update_required: bool,
+        pending_ops: u64,
+    ) -> MountStatus {
+        MountStatus {
+            path: "/tmp/valv".into(),
+            folder_id: "folder-1".into(),
+            name: name.into(),
+            scope_node_id: None,
+            grant_id: None,
+            can_write: true,
+            syncing: false,
+            pending_ops,
+            last_synced_at: None,
+            update_required,
+            error: error.map(str::to_owned),
+        }
+    }
+
     #[test]
-    fn update_required_cell_names_the_fix_when_true() {
+    fn mount_sync_state_returns_short_tokens_never_a_raw_error_or_full_sentence() {
         assert_eq!(
-            update_required_cell(true),
-            "Update required. Run 'valv update' to fix this."
+            mount_sync_state(&mount_status_with("Design", None, false, 0)),
+            "synced"
+        );
+        assert_eq!(
+            mount_sync_state(&mount_status_with("Design", None, false, 3)),
+            "3 pending"
+        );
+        assert_eq!(
+            mount_sync_state(&mount_status_with("Design", Some("quota exceeded"), false, 0)),
+            "error"
+        );
+        assert_eq!(
+            mount_sync_state(&mount_status_with("Design", None, true, 0)),
+            "update required"
         );
     }
 
     #[test]
-    fn update_required_cell_is_a_bare_false_otherwise() {
-        assert_eq!(update_required_cell(false), "false");
+    fn mount_state_detail_lines_names_the_mount_for_error_and_update_required() {
+        let mut status = sample_status();
+        status.mounts = vec![
+            mount_status_with("Design", Some("quota exceeded"), false, 0),
+            mount_status_with("Assets", None, true, 0),
+            mount_status_with("Docs", None, false, 0),
+        ];
+
+        let lines = mount_state_detail_lines(&status);
+
+        assert_eq!(
+            lines,
+            vec![
+                "Design: quota exceeded".to_owned(),
+                "Assets: update required, run `valv update` to fix this.".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn mount_state_cell_and_detail_line_agree_when_a_mount_has_both_flags() {
+        let both = mount_status_with("Design", Some("quota exceeded"), true, 0);
+        let mut status = sample_status();
+        status.mounts = vec![both.clone()];
+
+        assert_eq!(mount_sync_state(&both), "update required");
+        assert_eq!(
+            mount_state_detail_lines(&status),
+            vec!["Design: update required, run `valv update` to fix this.".to_owned()]
+        );
+    }
+
+    #[test]
+    fn build_folder_rows_swaps_state_and_path_for_a_reachable_but_unmounted_folder() {
+        let status = sample_status();
+        let grants = vec![GrantListEntry {
+            grant_id: "g_2".into(),
+            folder_id: "folder-2".into(),
+            scope_node_id: "root".into(),
+            role: Some("collaborator".into()),
+            can_read: Some(true),
+            can_write: Some(false),
+            user_id: Some("user-1".into()),
+            device_id: None,
+            name: None,
+            grantee_email: None,
+            device_name: None,
+            created_at: None,
+            created_by_email: None,
+            folder_name: Some("Assets".into()),
+        }];
+
+        let rows = build_folder_rows(&status, &Discovery::Available(grants));
+        let unmounted_row = rows
+            .iter()
+            .find(|row| row[0] == "folder-2")
+            .expect("the unmounted folder should be listed");
+
+        assert_eq!(unmounted_row[3], "not mounted");
+        assert_eq!(unmounted_row[4], "-");
+    }
+
+    #[test]
+    fn online_and_offline_table_headers_are_human_labels_with_the_id_column_kept() {
+        assert_eq!(
+            ONLINE_TABLE_HEADERS,
+            ["FOLDER ID", "NAME", "ACCESS", "STATE", "PATH"]
+        );
+        assert_eq!(OFFLINE_TABLE_HEADERS, ["FOLDER ID", "NAME", "PATH"]);
     }
 
     #[test]
@@ -1746,7 +1892,7 @@ mod tests {
             .route("POST", "/pause", 204, "")
             .spawn(&socket_path, 1);
 
-        let result = cmd_pause_resume("pause", "Paused sync: background sync is paused", true).await;
+        let result = cmd_pause_resume("pause", "Sync paused.", true).await;
 
         restore_home(previous_home);
 
@@ -1834,6 +1980,102 @@ mod tests {
             .expect("an access-key refusal should be a CliError");
         assert_eq!(cli_error.payload.code, "access_key_cannot_mount_folder");
         assert_eq!(cli_error.exit_code, 77);
+    }
+
+    fn sync_summary(
+        creates: u64,
+        versions: u64,
+        deletes: u64,
+        pulled: i64,
+    ) -> SyncSummary {
+        SyncSummary {
+            creates_submitted: creates,
+            versions_submitted: versions,
+            deletes_submitted: deletes,
+            pulled_ops: pulled,
+            errors: 0,
+        }
+    }
+
+    #[test]
+    fn sync_summary_line_collapses_a_no_op_to_one_sentence() {
+        assert_eq!(
+            sync_summary_line("every mounted folder", &sync_summary(0, 0, 0, 0)),
+            "Already up to date."
+        );
+    }
+
+    #[test]
+    fn sync_summary_line_drops_zero_counts_and_avoids_op_log_jargon() {
+        assert_eq!(
+            sync_summary_line("~/Design", &sync_summary(3, 0, 0, 2)),
+            "Synced ~/Design: 3 created, 2 changes received."
+        );
+    }
+
+    #[test]
+    fn version_row_humanizes_created_at_and_size_bytes_for_a_human() {
+        let created_at = (Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+        let row = version_row(VersionEntry {
+            version_id: "version-1".into(),
+            created_at,
+            size_bytes: 1_048_576,
+            author_device_name: "Alice's MacBook".into(),
+            is_conflict_copy: false,
+        });
+
+        assert_eq!(row[0], "version-1");
+        assert_eq!(row[1], "2 days ago");
+        assert_eq!(row[2], "1.0 MB");
+        assert_eq!(row[3], "Alice's MacBook");
+        assert_eq!(row[4], "no");
+    }
+
+    #[test]
+    fn version_row_marks_conflict_copies() {
+        let row = version_row(VersionEntry {
+            version_id: "version-2".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            size_bytes: 42,
+            author_device_name: "Device".into(),
+            is_conflict_copy: true,
+        });
+
+        assert_eq!(row[4], "yes");
+    }
+
+    #[test]
+    fn conflict_copy_message_names_the_containing_folder_not_the_bare_term() {
+        let message = conflict_copy_message("/home/alice/Design/report.md");
+
+        assert_eq!(
+            message,
+            "Another write happened at the same time, so the restore was saved as a new file in /home/alice/Design instead of overwriting /home/alice/Design/report.md."
+        );
+        assert!(!message.contains("conflict copy"));
+    }
+
+    #[test]
+    fn superseded_message_avoids_the_word_superseded() {
+        let message = superseded_message("/home/alice/Design/report.md");
+
+        assert_eq!(
+            message,
+            "/home/alice/Design/report.md was not restored: a newer write already happened, so nothing changed."
+        );
+        assert!(!message.contains("superseded"));
+    }
+
+    #[test]
+    fn mount_success_message_leads_with_the_name_never_a_bare_id() {
+        assert_eq!(
+            mount_success_message(true, "Projects", "/home/alice/Projects"),
+            "Created \"Projects\" and mounted it at /home/alice/Projects."
+        );
+        assert_eq!(
+            mount_success_message(false, "Sync Docs", "/home/alice/Documents/Sync"),
+            "Attached \"Sync Docs\" at /home/alice/Documents/Sync."
+        );
     }
 
     #[tokio::test]
