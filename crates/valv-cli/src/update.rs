@@ -73,9 +73,11 @@ pub(crate) async fn cmd_update(json: bool) -> Result<()> {
         let latest_valvd_version = resolve_latest_version(&client, repo, Component::Valvd, "VALVD_VERSION")
             .await
             .context("failed to resolve the latest valvd release")?;
-        let current_valvd_version = current_daemon_version()
-            .await
-            .unwrap_or_else(|| "0.0.0".to_owned());
+        let current_valvd_version = match current_daemon_version().await {
+            Some(version) => version,
+            None => installed_binary_version(&install_dir.join("valvd"))
+                .unwrap_or_else(|| "0.0.0".to_owned()),
+        };
         let action = plan_update(&current_valvd_version, &latest_valvd_version, valvd_pinned);
         Some((action, current_valvd_version, latest_valvd_version))
     } else {
@@ -694,10 +696,36 @@ async fn current_daemon_version() -> Option<String> {
     Some(status.version)
 }
 
+fn installed_binary_version(binary: &Path) -> Option<String> {
+    let output = ProcessCommand::new(binary).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_version_output(&String::from_utf8(output.stdout).ok()?)
+}
+
+fn parse_version_output(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|token| token.trim_start_matches('v'))
+        .find(|token| {
+            let parts: Vec<&str> = token.split('.').collect();
+            parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use valv_sync::protocol::ipc::Credential;
+
+    #[test]
+    fn parse_version_output_extracts_semver_from_binary_output() {
+        assert_eq!(parse_version_output("valvd 0.2.2\n").as_deref(), Some("0.2.2"));
+        assert_eq!(parse_version_output("valvd v1.10.3").as_deref(), Some("1.10.3"));
+        assert_eq!(parse_version_output("").as_deref(), None);
+        assert_eq!(parse_version_output("no version here").as_deref(), None);
+    }
 
     #[test]
     fn plan_update_reports_already_up_to_date() {
