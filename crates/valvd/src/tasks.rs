@@ -336,9 +336,40 @@ fn random_jitter(max: Duration) -> Duration {
 
 async fn poll_update_status_once(state: &DaemonState) {
     let repo = valv_sync::update::DEFAULT_REPO;
-    let outcome = valv_sync::update::resolve_latest_version(&state.client, repo, "VALV_VERSION").await;
-    let mut update_status = state.update_status.lock().await;
-    apply_update_check_outcome(&mut update_status, outcome, env!("CARGO_PKG_VERSION"));
+    let running_version = env!("CARGO_PKG_VERSION");
+    let outcome = valv_sync::update::resolve_latest_version(
+        &state.client,
+        repo,
+        valv_sync::update::Component::Valvd,
+        "VALVD_VERSION",
+    )
+    .await;
+    let latest_version = outcome.as_ref().ok().cloned();
+    {
+        let mut update_status = state.update_status.lock().await;
+        apply_update_check_outcome(&mut update_status, outcome, running_version);
+    }
+
+    let Some(latest_version) = latest_version else {
+        return;
+    };
+    if !valv_sync::update::is_newer_version(&latest_version, running_version) {
+        return;
+    }
+    if !crate::self_update::is_app_managed_install() {
+        return;
+    }
+    let no_self_update = std::env::var("VALV_NO_SELF_UPDATE").ok();
+    if !should_attempt_self_update(no_self_update.as_deref()) {
+        return;
+    }
+    if let Err(error) = crate::self_update::attempt_self_update(&state.client, repo, &latest_version).await {
+        tracing::warn!(error = %error, latest_version = %latest_version, "valvd self-update failed");
+    }
+}
+
+fn should_attempt_self_update(no_self_update_env: Option<&str>) -> bool {
+    no_self_update_env != Some("1")
 }
 
 fn apply_update_check_outcome(
@@ -1728,12 +1759,14 @@ mod tests {
 
     #[tokio::test]
     async fn poll_update_status_once_uses_pinned_version_without_network() {
-        std::env::set_var("VALV_VERSION", "v42.0.0");
+        std::env::set_var("VALVD_VERSION", "v42.0.0");
+        std::env::set_var("VALV_NO_SELF_UPDATE", "1");
         let state = test_state();
 
         poll_update_status_once(&state).await;
 
-        std::env::remove_var("VALV_VERSION");
+        std::env::remove_var("VALVD_VERSION");
+        std::env::remove_var("VALV_NO_SELF_UPDATE");
         let (latest_version, update_available) = state.update_status.lock().await.as_status_fields();
         assert_eq!(latest_version.as_deref(), Some("42.0.0"));
         assert_eq!(update_available, Some(true));
@@ -1745,6 +1778,14 @@ mod tests {
         assert!(should_spawn_update_check(Some("0")));
         assert!(should_spawn_update_check(Some("true")));
         assert!(!should_spawn_update_check(Some("1")));
+    }
+
+    #[test]
+    fn should_attempt_self_update_only_suppresses_on_exactly_one() {
+        assert!(should_attempt_self_update(None));
+        assert!(should_attempt_self_update(Some("0")));
+        assert!(should_attempt_self_update(Some("true")));
+        assert!(!should_attempt_self_update(Some("1")));
     }
 
     #[test]

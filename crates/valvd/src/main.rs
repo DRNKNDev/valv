@@ -43,6 +43,7 @@ mod mounts;
 mod nodes;
 mod path_resolution;
 mod restore;
+mod self_update;
 #[cfg(target_os = "linux")]
 mod systemd;
 mod tasks;
@@ -226,6 +227,7 @@ fn init_tracing() {
 }
 
 async fn run() -> Result<()> {
+    self_update::reap_stale_backup();
     let config_file = config_path()?;
     let config = load_config(&config_file)?;
     let db_path = data_dir()?.join("sync.db");
