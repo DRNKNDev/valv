@@ -297,8 +297,27 @@ fn normalize_persisted_mount_paths(conn: &Connection) -> Result<()> {
         if canonical == mount.path {
             continue;
         }
-        if mount_store::get_mount(conn, &canonical)?.is_some() {
-            mount_store::delete_mount(conn, &mount.path)?;
+        if let Some(existing) = mount_store::get_mount(conn, &canonical)? {
+            if mount.mount_token.is_some() && existing.mount_token.is_none() {
+                tracing::warn!(
+                    path = %mount.path,
+                    canonical = %canonical,
+                    kept_folder_id = %mount.folder_id,
+                    dropped_folder_id = %existing.folder_id,
+                    "two mount rows canonicalize to the same path; keeping the one that holds the mount credential"
+                );
+                mount_store::delete_mount(conn, &canonical)?;
+                mount_store::update_mount_path(conn, &mount.path, &canonical)?;
+            } else {
+                tracing::warn!(
+                    path = %mount.path,
+                    canonical = %canonical,
+                    kept_folder_id = %existing.folder_id,
+                    dropped_folder_id = %mount.folder_id,
+                    "duplicate mount row canonicalizes to an existing path; dropping the non-canonical duplicate"
+                );
+                mount_store::delete_mount(conn, &mount.path)?;
+            }
             continue;
         }
         mount_store::update_mount_path(conn, &mount.path, &canonical)?;
@@ -652,6 +671,38 @@ mod tests {
         let mounts = mount_store::list_mounts(&conn).unwrap();
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].folder_id, "folder-canonical");
+    }
+
+    #[test]
+    fn normalize_persisted_mount_paths_keeps_the_credential_bearing_duplicate() {
+        let conn = test_conn();
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canonical = real.canonicalize().unwrap().to_string_lossy().into_owned();
+        let non_canonical = link.to_string_lossy().into_owned();
+        mount_store::upsert_mount(&conn, &canonical, "folder-tokenless", None, None, None, true)
+            .unwrap();
+        mount_store::upsert_mount(
+            &conn,
+            &non_canonical,
+            "folder-with-token",
+            None,
+            None,
+            Some("tok"),
+            true,
+        )
+        .unwrap();
+
+        normalize_persisted_mount_paths(&conn).unwrap();
+
+        let mounts = mount_store::list_mounts(&conn).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].folder_id, "folder-with-token");
+        assert_eq!(mounts[0].mount_token.as_deref(), Some("tok"));
+        assert_eq!(mounts[0].path, canonical);
     }
 
     #[test]
