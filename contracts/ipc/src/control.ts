@@ -10,6 +10,7 @@ export interface MountStatus {
   last_synced_at: string | null;
   update_required: boolean;
   error?: string;
+  watcher_alive?: boolean;
 }
 
 export interface AccountStatus {
