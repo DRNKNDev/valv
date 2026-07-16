@@ -138,4 +138,4 @@ Bare `share <path>` lists people, access keys, and pending invites, each with an
 - Socket: `~/.local/share/valv/valvd.sock`
 - Local mirror: `~/.local/share/valv/sync.db`
 
-`VALV_BACKEND_URL`, `VALV_WEB_BASE_URL`, `VALV_VERSION` (pins the update target), `VALV_NO_UPDATE_CHECK=1`, `VALV_INSTALL_DIR` (install script only), `RUST_LOG`.
+`VALV_BACKEND_URL`, `VALV_WEB_BASE_URL`, `VALV_CLI_VERSION` / `VALVD_VERSION` (pin each binary's update target independently), `VALV_NO_UPDATE_CHECK=1`, `VALV_INSTALL_DIR` (install script only), `RUST_LOG`.

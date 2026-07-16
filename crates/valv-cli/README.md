@@ -10,9 +10,9 @@ Hosted installer (downloads and verifies the latest GitHub release for your plat
 curl -fsSL https://valvsync.com/install | bash
 ```
 
-This runs [`../../scripts/install.sh`](../../scripts/install.sh), which detects your OS/architecture, downloads `valv-<version>-<target>.tar.gz` and `SHA256SUMS` from the matching GitHub release, verifies the checksum, and installs `valv` and `valvd` to `~/.local/bin` (override with `VALV_INSTALL_DIR`). Set `VALV_VERSION` to pin a specific release instead of the latest.
+This runs [`../../scripts/install.sh`](../../scripts/install.sh), which detects your OS/architecture, resolves the latest `cli-v*` and `valvd-v*` releases independently, downloads each component's own `valv-<version>-<target>.tar.gz` / `valvd-<version>-<target>.tar.gz` and `SHA256SUMS`, verifies each checksum, and installs `valv` and `valvd` to `~/.local/bin` (override with `VALV_INSTALL_DIR`). Set `VALV_CLI_VERSION` or `VALVD_VERSION` to pin that component to a specific release instead of the latest.
 
-Manual install: download `valv-<version>-<target>.tar.gz` from the [releases page](https://github.com/DRNKNDev/valv/releases), verify it against the release's `SHA256SUMS`/`SHA256SUMS.minisig`, and extract `valv`/`valvd` onto your `PATH`.
+Manual install: download `valv-<version>-<target>.tar.gz` (or `valvd-<version>-<target>.tar.gz` for the daemon) from the [releases page](https://github.com/DRNKNDev/valv/releases), verify it against that release's own `SHA256SUMS`/`SHA256SUMS.minisig`, and extract the binary onto your `PATH`.
 
 Prebuilt releases currently cover macOS arm64 (`aarch64-apple-darwin`) and Linux x86_64 (`x86_64-unknown-linux-gnu`). Other platforms require a source build.
 

@@ -5,7 +5,7 @@
 Valv is an open-source, self-hostable file sync product with a Rust sync engine and daemon, a native macOS Finder integration, scoped person/device sharing, and S3-compatible storage.
 
 [![OSS CI](https://github.com/DRNKNDev/valv/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DRNKNDev/valv/actions/workflows/ci.yml)
-[![Latest Release](https://img.shields.io/github/v/release/DRNKNDev/valv?sort=semver)](https://github.com/DRNKNDev/valv/releases/latest)
+[![Latest Release](https://img.shields.io/github/v/release/DRNKNDev/valv?sort=semver)](https://github.com/DRNKNDev/valv/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](./LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/29a3dVRdE)
 
@@ -23,7 +23,7 @@ Windows, Intel macOS, and Linux arm64 are not supported yet.
 
 ## Install
 
-- **macOS app:** download the latest DMG from [GitHub Releases](https://github.com/DRNKNDev/valv/releases/latest).
+- **macOS app:** download the latest DMG from the [GitHub Releases page](https://github.com/DRNKNDev/valv/releases) (the newest `macos-v*` release).
 - **CLI (macOS or Linux):**
 
   ```bash
