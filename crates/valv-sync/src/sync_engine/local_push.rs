@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Result};
@@ -168,7 +169,6 @@ async fn push_local_inner(
                         is_dir: metadata.is_dir(),
                         is_file: metadata.is_file(),
                         is_symlink: metadata.file_type().is_symlink(),
-                        len: metadata.len(),
                     });
                 }
                 Err(error) => {
@@ -256,7 +256,6 @@ async fn push_local_inner(
                         &mut summary,
                         ExistingFile {
                             abs_path: entry.abs_path,
-                            metadata_len: entry.len,
                             folder_id,
                             node,
                             db,
@@ -473,7 +472,7 @@ fn find_missing_move_candidate(
     node_type: &str,
 ) -> Result<Option<LocalNode>> {
     let mut stmt = conn.prepare(
-        "SELECT node_id, folder_id, parent_id, name, node_type, current_version_id, server_seq, deleted_at
+        "SELECT node_id, folder_id, parent_id, name, node_type, current_version_id, server_seq, deleted_at, pushed_size_bytes, pushed_mtime_nanos
          FROM nodes
          WHERE folder_id = ?1 AND deleted_at IS NULL",
     )?;
@@ -533,6 +532,8 @@ fn row_to_local_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalNode> {
         current_version_id: row.get(5)?,
         server_seq: row.get(6)?,
         deleted_at: row.get(7)?,
+        pushed_size_bytes: row.get(8)?,
+        pushed_mtime_nanos: row.get(9)?,
     })
 }
 
@@ -722,7 +723,6 @@ struct EntryInfo {
     is_dir: bool,
     is_file: bool,
     is_symlink: bool,
-    len: u64,
 }
 
 struct CreateEntry<'a> {
@@ -795,6 +795,8 @@ async fn create_entry(
                         current_version_id: None,
                         server_seq,
                         deleted_at: None,
+                        pushed_size_bytes: None,
+                        pushed_mtime_nanos: None,
                     },
                 )?;
             }
@@ -802,6 +804,17 @@ async fn create_entry(
             if is_dir {
                 queue.push_back((entry.abs_path, node_id));
             } else {
+                let stat = match stat_push_signature(&entry.abs_path) {
+                    Ok(stat) => stat,
+                    Err(error) => {
+                        eprintln!(
+                            "push_local: failed to stat {}: {error}",
+                            entry.abs_path.display()
+                        );
+                        summary.errors += 1;
+                        return Ok(());
+                    }
+                };
                 let date = today_date_str();
                 let conn = entry.db.lock().await;
                 match upload_then_submit_new_version(
@@ -818,7 +831,10 @@ async fn create_entry(
                 )
                 .await
                 {
-                    Ok(_) => summary.versions_submitted += 1,
+                    Ok(_) => {
+                        summary.versions_submitted += 1;
+                        warm_push_cache(&conn, &node_id, &entry.abs_path, stat.0, stat.1);
+                    }
                     Err(error) => {
                         propagate_update_required(&error, entry.update_required_flag)?;
                         eprintln!(
@@ -845,7 +861,6 @@ async fn create_entry(
 
 struct ExistingFile<'a> {
     abs_path: PathBuf,
-    metadata_len: u64,
     folder_id: &'a str,
     node: LocalNode,
     db: &'a Arc<Mutex<Connection>>,
@@ -858,6 +873,26 @@ struct ExistingFile<'a> {
 
 async fn process_existing_file(summary: &mut PushSummary, file: ExistingFile<'_>) -> Result<()> {
     ensure_not_update_required(file.update_required_flag)?;
+
+    let (on_disk_size, on_disk_mtime_nanos) = match stat_push_signature(&file.abs_path) {
+        Ok(stat) => stat,
+        Err(error) => {
+            eprintln!(
+                "push_local: failed to stat {}: {error}",
+                file.abs_path.display()
+            );
+            summary.errors += 1;
+            return Ok(());
+        }
+    };
+
+    if file.node.pushed_size_bytes == Some(on_disk_size)
+        && file.node.pushed_mtime_nanos == Some(on_disk_mtime_nanos)
+    {
+        summary.skipped += 1;
+        return Ok(());
+    }
+
     let stored_version = {
         let conn = file.db.lock().await;
         let version_id = file.node.current_version_id.as_deref().unwrap_or("");
@@ -875,10 +910,18 @@ async fn process_existing_file(summary: &mut PushSummary, file: ExistingFile<'_>
     };
 
     if let Some(version) = stored_version.as_ref() {
-        if version.size_bytes == file.metadata_len {
+        if version.size_bytes == on_disk_size {
             match file_content_hash(&file.abs_path) {
                 Ok(content_hash) if content_hash == version.content_hash => {
                     summary.skipped += 1;
+                    let conn = file.db.lock().await;
+                    warm_push_cache(
+                        &conn,
+                        &file.node.node_id,
+                        &file.abs_path,
+                        on_disk_size,
+                        on_disk_mtime_nanos,
+                    );
                     return Ok(());
                 }
                 Ok(_) => {}
@@ -910,7 +953,16 @@ async fn process_existing_file(summary: &mut PushSummary, file: ExistingFile<'_>
     )
     .await
     {
-        Ok(_) => summary.versions_submitted += 1,
+        Ok(_) => {
+            summary.versions_submitted += 1;
+            warm_push_cache(
+                &conn,
+                &file.node.node_id,
+                &file.abs_path,
+                on_disk_size,
+                on_disk_mtime_nanos,
+            );
+        }
         Err(error) => {
             propagate_update_required(&error, file.update_required_flag)?;
             eprintln!(
@@ -963,6 +1015,27 @@ fn is_conflict_copy_name(name: &str) -> bool {
 
 fn today_date_str() -> String {
     Local::now().date_naive().to_string()
+}
+
+fn stat_push_signature(path: &Path) -> Result<(u64, i64)> {
+    let metadata = fs::metadata(path)?;
+    Ok((metadata.len(), signed_nanos_since_epoch(metadata.modified()?)))
+}
+
+fn signed_nanos_since_epoch(time: SystemTime) -> i64 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos() as i64,
+        Err(error) => -(error.duration().as_nanos() as i64),
+    }
+}
+
+fn warm_push_cache(conn: &Connection, node_id: &str, path: &Path, size_bytes: u64, mtime_nanos: i64) {
+    if let Err(error) = nodes::update_pushed_cache(conn, node_id, size_bytes, mtime_nanos) {
+        eprintln!(
+            "push_local: failed to update push cache for {}: {error}",
+            path.display()
+        );
+    }
 }
 
 fn file_content_hash(path: &Path) -> Result<String> {
@@ -1022,7 +1095,8 @@ mod tests {
     #[tokio::test]
     async fn push_local_submits_create_for_new_file() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("report.md"), b"hello").unwrap();
+        let path = dir.path().join("report.md");
+        fs::write(&path, b"hello").unwrap();
         let db = seeded_db();
         let (backend_url, server) = local_push_server(vec![
             MockOp::Applied {
@@ -1056,8 +1130,11 @@ mod tests {
         assert_eq!(summary.creates_submitted, 1);
         assert_eq!(summary.versions_submitted, 1);
         assert_eq!(requests.len(), 2);
+        let expected_mtime = signed_nanos_since_epoch(fs::metadata(&path).unwrap().modified().unwrap());
         let conn = db.lock().await;
-        assert!(get_node(&conn, "srv-1").unwrap().is_some());
+        let created = get_node(&conn, "srv-1").unwrap().unwrap();
+        assert_eq!(created.pushed_size_bytes, Some(5));
+        assert_eq!(created.pushed_mtime_nanos, Some(expected_mtime));
     }
 
     #[tokio::test]
@@ -1135,6 +1212,10 @@ mod tests {
 
         assert_eq!(summary.versions_submitted, 0);
         assert_eq!(summary.skipped, 1);
+        let expected_mtime = signed_nanos_since_epoch(fs::metadata(&path).unwrap().modified().unwrap());
+        let node = node(&db, "file-node").await;
+        assert_eq!(node.pushed_size_bytes, Some(42));
+        assert_eq!(node.pushed_mtime_nanos, Some(expected_mtime));
     }
 
     #[tokio::test]
@@ -1177,7 +1258,8 @@ mod tests {
     #[tokio::test]
     async fn push_local_submits_new_version_for_size_change() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("changed.txt"), vec![b'a'; 20]).unwrap();
+        let path = dir.path().join("changed.txt");
+        fs::write(&path, vec![b'a'; 20]).unwrap();
         let db = seeded_db();
         seed_file_with_version(&db, "file-node", "changed.txt", 10).await;
         let (backend_url, server) = local_push_server(vec![MockOp::Applied {
@@ -1206,6 +1288,10 @@ mod tests {
         assert_eq!(summary.versions_submitted, 1);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["op_type"], "new_version");
+        let expected_mtime = signed_nanos_since_epoch(fs::metadata(&path).unwrap().modified().unwrap());
+        let node = node(&db, "file-node").await;
+        assert_eq!(node.pushed_size_bytes, Some(20));
+        assert_eq!(node.pushed_mtime_nanos, Some(expected_mtime));
     }
 
     #[tokio::test]
@@ -2012,6 +2098,223 @@ mod tests {
         assert_eq!(bar.name, "bar.txt");
     }
 
+    #[tokio::test]
+    async fn push_local_mtime_fast_path_skips_without_hashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fast.txt");
+        fs::write(&path, b"hello").unwrap();
+        let db = seeded_db();
+        seed_file_with_version_with_hash(&db, "file-node", "fast.txt", 5, "wrong-hash").await;
+        let mtime_nanos = signed_nanos_since_epoch(fs::metadata(&path).unwrap().modified().unwrap());
+        {
+            let conn = db.lock().await;
+            nodes::update_pushed_cache(&conn, "file-node", 5, mtime_nanos).unwrap();
+        }
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.versions_submitted, 0);
+        assert_eq!(summary.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn push_local_stale_cached_mtime_falls_back_to_hash_and_rewarms_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.txt");
+        fs::write(&path, vec![b'a'; 10]).unwrap();
+        let hash = file_content_hash(&path).unwrap();
+        let db = seeded_db();
+        seed_file_with_version_with_hash(&db, "file-node", "stale.txt", 10, &hash).await;
+        {
+            let conn = db.lock().await;
+            nodes::update_pushed_cache(&conn, "file-node", 10, 1).unwrap();
+        }
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.versions_submitted, 0);
+        let expected_mtime = signed_nanos_since_epoch(fs::metadata(&path).unwrap().modified().unwrap());
+        let node = node(&db, "file-node").await;
+        assert_eq!(node.pushed_size_bytes, Some(10));
+        assert_eq!(node.pushed_mtime_nanos, Some(expected_mtime));
+    }
+
+    #[tokio::test]
+    async fn push_local_touched_file_forces_reverification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("touched.txt");
+        fs::write(&path, vec![b'a'; 8]).unwrap();
+        let hash = file_content_hash(&path).unwrap();
+        let db = seeded_db();
+        seed_file_with_version_with_hash(&db, "file-node", "touched.txt", 8, &hash).await;
+        let original_mtime = signed_nanos_since_epoch(fs::metadata(&path).unwrap().modified().unwrap());
+        {
+            let conn = db.lock().await;
+            nodes::update_pushed_cache(&conn, "file-node", 8, original_mtime).unwrap();
+        }
+
+        let touched = std::time::SystemTime::now() + Duration::from_secs(120);
+        fs::File::open(&path).unwrap().set_modified(touched).unwrap();
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.versions_submitted, 0);
+        let node = node(&db, "file-node").await;
+        assert_ne!(node.pushed_mtime_nanos, Some(original_mtime));
+    }
+
+    #[tokio::test]
+    async fn push_local_move_preserves_push_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_parent = dir.path().join("old-parent");
+        let new_parent = dir.path().join("new-parent");
+        fs::create_dir(&old_parent).unwrap();
+        fs::create_dir(&new_parent).unwrap();
+        let moved_path = new_parent.join("moved.txt");
+        fs::write(&moved_path, b"hello").unwrap();
+
+        let db = seeded_db();
+        seed_folder(&db, "old-parent-node", "root-node", "old-parent", 2).await;
+        seed_folder(&db, "new-parent-node", "root-node", "new-parent", 3).await;
+        seed_file_with_version_under(
+            &db,
+            "moved-node",
+            "old-parent-node",
+            "moved.txt",
+            "moved-version",
+            5,
+            4,
+        )
+        .await;
+        let mtime_nanos =
+            signed_nanos_since_epoch(fs::metadata(&moved_path).unwrap().modified().unwrap());
+        {
+            let conn = db.lock().await;
+            nodes::update_pushed_cache(&conn, "moved-node", 5, mtime_nanos).unwrap();
+        }
+        let (backend_url, server) = local_push_server(vec![MockOp::Applied {
+            node_id: "moved-node".into(),
+            server_seq: 9,
+        }])
+        .await;
+
+        push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(1), server).await.unwrap().unwrap();
+
+        let moved = node(&db, "moved-node").await;
+        assert_eq!(moved.parent_id.as_deref(), Some("new-parent-node"));
+        assert_eq!(moved.pushed_size_bytes, Some(5));
+        assert_eq!(moved.pushed_mtime_nanos, Some(mtime_nanos));
+    }
+
+    #[tokio::test]
+    async fn push_local_caches_read_time_stat_when_write_races_the_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("racing.txt");
+        fs::write(&path, b"before").unwrap();
+        let db = seeded_db();
+        seed_file_with_version_with_hash(&db, "file-node", "racing.txt", 6, "wrong-hash").await;
+        let mtime_before = signed_nanos_since_epoch(fs::metadata(&path).unwrap().modified().unwrap());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backend_url = format!("http://{addr}");
+        let server_url = backend_url.clone();
+        let path_for_server = path.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (method, req_path, body) = read_request(&mut stream).await;
+                if method == "POST" && req_path == "/api/objects/batch" {
+                    write_batch_response(&mut stream, &server_url, &body).await;
+                } else if method == "PUT" && req_path.starts_with("/upload/") {
+                    write_response(&mut stream, "204 No Content", b"").await;
+                } else if method == "POST" && req_path == "/api/folders/folder-1/ops" {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    fs::write(&path_for_server, b"after!").unwrap();
+                    let body = serde_json::to_vec(&SubmitOpResponse::Applied {
+                        node_id: "file-node".into(),
+                        server_seq: 9,
+                    })
+                    .unwrap();
+                    write_response(&mut stream, "200 OK", &body).await;
+                    break;
+                } else {
+                    write_response(&mut stream, "404 Not Found", b"").await;
+                }
+            }
+        });
+
+        let summary = push_local(
+            dir.path(),
+            "folder-1",
+            None,
+            &db,
+            &reqwest::Client::new(),
+            &backend_url,
+            "token",
+            "Test Device",
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(1), server).await.unwrap().unwrap();
+
+        assert_eq!(summary.versions_submitted, 1);
+        let mtime_after = signed_nanos_since_epoch(fs::metadata(&path).unwrap().modified().unwrap());
+        assert_ne!(mtime_after, mtime_before);
+
+        let node = node(&db, "file-node").await;
+        assert_eq!(node.pushed_size_bytes, Some(6));
+        assert_eq!(node.pushed_mtime_nanos, Some(mtime_before));
+    }
+
     fn seeded_db() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(schema_sql()).unwrap();
@@ -2026,6 +2329,8 @@ mod tests {
                 current_version_id: None,
                 server_seq: 1,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
@@ -2081,6 +2386,8 @@ mod tests {
                 current_version_id: None,
                 server_seq,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
@@ -2123,6 +2430,8 @@ mod tests {
                 current_version_id: Some(version_id.into()),
                 server_seq,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
@@ -2160,6 +2469,8 @@ mod tests {
                 current_version_id: Some(version_id.into()),
                 server_seq,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
