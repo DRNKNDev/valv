@@ -50,7 +50,7 @@ mod tasks;
 
 use config::{
     config_path, data_dir, load_config, merge_config_mounts, socket_path, tcp_port_file_path,
-    DaemonConfig,
+    DaemonConfig, MountConfig,
 };
 #[cfg(target_os = "macos")]
 use launchd::{install_daemon, uninstall_daemon};
@@ -149,6 +149,7 @@ struct MountState {
     update_required_flag: Arc<AtomicBool>,
     rejected: Arc<AtomicBool>,
     error: Option<String>,
+    watcher_alive: Arc<AtomicBool>,
     // Serializes pull_mount_once/full_sync_mount for this mount so a background
     // pull can't mutate the local mirror mid-flight through an explicit sync's
     // push_local pass (see oss/crates/valv-sync/src/sync_engine/local_push.rs).
@@ -232,7 +233,8 @@ async fn run() -> Result<()> {
     let config = load_config(&config_file)?;
     let db_path = data_dir()?.join("sync.db");
     let conn = open_db(&db_path)?;
-    merge_config_mounts(&conn, &config.mounts)?;
+    normalize_persisted_mount_paths(&conn)?;
+    merge_config_mounts(&conn, &canonicalize_config_mount_paths(&config.mounts))?;
     let mount_states = mount_store::list_mounts(&conn)?
         .into_iter()
         .map(|mount| MountState {
@@ -250,6 +252,7 @@ async fn run() -> Result<()> {
             update_required_flag: Arc::new(AtomicBool::new(false)),
             rejected: Arc::new(AtomicBool::new(false)),
             error: None,
+            watcher_alive: Arc::new(AtomicBool::new(true)),
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
         })
@@ -284,6 +287,35 @@ async fn run() -> Result<()> {
     };
 
     serve_socket(state, &socket_path()?, &config_file, mount_count).await
+}
+
+fn normalize_persisted_mount_paths(conn: &Connection) -> Result<()> {
+    for mount in mount_store::list_mounts(conn)? {
+        let canonical = path_resolution::normalize_path(&mount.path)
+            .to_string_lossy()
+            .into_owned();
+        if canonical == mount.path {
+            continue;
+        }
+        if mount_store::get_mount(conn, &canonical)?.is_some() {
+            mount_store::delete_mount(conn, &mount.path)?;
+            continue;
+        }
+        mount_store::update_mount_path(conn, &mount.path, &canonical)?;
+    }
+    Ok(())
+}
+
+fn canonicalize_config_mount_paths(mounts: &[MountConfig]) -> Vec<MountConfig> {
+    mounts
+        .iter()
+        .map(|mount| MountConfig {
+            path: path_resolution::normalize_path(&mount.path)
+                .to_string_lossy()
+                .into_owned(),
+            ..mount.clone()
+        })
+        .collect()
 }
 
 async fn serve_socket(
@@ -465,6 +497,7 @@ impl MountState {
             update_required: self.update_required
                 || self.update_required_flag.load(Ordering::Acquire),
             error: self.error.clone(),
+            watcher_alive: self.watcher_alive.load(Ordering::Acquire),
         }
     }
 }
@@ -561,5 +594,110 @@ mod tests {
         assert_eq!(unix_status, tcp_status);
 
         let _ = fs::remove_dir_all(&socket_dir);
+    }
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../valv-sync/src/persistence/schema.sql"))
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn normalize_persisted_mount_paths_canonicalizes_a_symlinked_ancestor() {
+        let conn = test_conn();
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let non_canonical = link.to_string_lossy().into_owned();
+        mount_store::upsert_mount(&conn, &non_canonical, "folder-1", None, None, None, true)
+            .unwrap();
+
+        normalize_persisted_mount_paths(&conn).unwrap();
+
+        let canonical = real.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert!(mount_store::get_mount(&conn, &canonical).unwrap().is_some());
+        assert!(mount_store::get_mount(&conn, &non_canonical).unwrap().is_none());
+    }
+
+    #[test]
+    fn normalize_persisted_mount_paths_leaves_an_already_canonical_path_untouched() {
+        let conn = test_conn();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+        mount_store::upsert_mount(&conn, &canonical, "folder-1", None, None, None, true).unwrap();
+
+        normalize_persisted_mount_paths(&conn).unwrap();
+
+        let mounts = mount_store::list_mounts(&conn).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].path, canonical);
+    }
+
+    #[test]
+    fn normalize_persisted_mount_paths_drops_duplicate_when_canonical_row_already_exists() {
+        let conn = test_conn();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+        let non_canonical = format!("{canonical}/.");
+        mount_store::upsert_mount(&conn, &canonical, "folder-canonical", None, None, None, true)
+            .unwrap();
+        mount_store::upsert_mount(&conn, &non_canonical, "folder-stale", None, None, None, true)
+            .unwrap();
+
+        normalize_persisted_mount_paths(&conn).unwrap();
+
+        let mounts = mount_store::list_mounts(&conn).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].folder_id, "folder-canonical");
+    }
+
+    #[test]
+    fn canonicalize_config_mount_paths_absolutizes_a_relative_path_that_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        fs::create_dir_all("relative-mount").unwrap();
+
+        let canonicalized = canonicalize_config_mount_paths(&[MountConfig {
+            path: "relative-mount".to_owned(),
+            folder_id: "folder-1".to_owned(),
+            grant_id: None,
+            scope_node_id: None,
+            mount_token: None,
+        }]);
+
+        std::env::set_current_dir(original_cwd).unwrap();
+        assert!(Path::new(&canonicalized[0].path).is_absolute());
+    }
+
+    #[test]
+    fn a_non_canonical_persisted_row_is_not_duplicated_by_a_matching_config_entry_after_normalization(
+    ) {
+        let conn = test_conn();
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let non_canonical = link.to_string_lossy().into_owned();
+        mount_store::upsert_mount(&conn, &non_canonical, "folder-existing", None, None, None, true)
+            .unwrap();
+
+        normalize_persisted_mount_paths(&conn).unwrap();
+        let config_mounts = canonicalize_config_mount_paths(&[MountConfig {
+            path: non_canonical,
+            folder_id: "folder-stale".to_owned(),
+            grant_id: None,
+            scope_node_id: None,
+            mount_token: None,
+        }]);
+        merge_config_mounts(&conn, &config_mounts).unwrap();
+
+        let mounts = mount_store::list_mounts(&conn).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].folder_id, "folder-existing");
     }
 }

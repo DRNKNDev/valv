@@ -16,6 +16,7 @@ use valv_sync::{
 
 use crate::{
     error::{backend_response_or_error, require_token, DaemonError},
+    path_resolution::normalize_path,
     tasks::{cancel_tasks_for_mount, materialize_mount_files, spawn_tasks_for_mount},
     DaemonState, MountState,
 };
@@ -43,6 +44,7 @@ pub(crate) async fn post_mount(
         ));
     }
 
+    let canonical_path = normalize_path(&req.path).to_string_lossy().into_owned();
     let resolved = resolve_mount(&state, &req).await?;
     let token = require_token(
         resolved
@@ -54,7 +56,7 @@ pub(crate) async fn post_mount(
         let mut conn = state.db.lock().await;
         mount_store::upsert_mount(
             &conn,
-            &req.path,
+            &canonical_path,
             &resolved.folder_id,
             resolved.grant_id.as_deref(),
             resolved.scope_node_id.as_deref(),
@@ -70,7 +72,7 @@ pub(crate) async fn post_mount(
         )
         .await
         {
-            let _ = mount_store::delete_mount(&conn, &req.path);
+            let _ = mount_store::delete_mount(&conn, &canonical_path);
             return Err(DaemonError::Internal(err.to_string()));
         }
 
@@ -82,10 +84,10 @@ pub(crate) async fn post_mount(
     };
     {
         let conn = state.db.lock().await;
-        mount_store::set_mount_name(&conn, &req.path, &name)?;
+        mount_store::set_mount_name(&conn, &canonical_path, &name)?;
     }
     let mount = MountState {
-        path: req.path.clone(),
+        path: canonical_path.clone(),
         folder_id: resolved.folder_id.clone(),
         grant_id: resolved.grant_id.clone(),
         scope_node_id: resolved.scope_node_id.clone(),
@@ -99,12 +101,13 @@ pub(crate) async fn post_mount(
         update_required_flag: Arc::new(AtomicBool::new(false)),
         rejected: Arc::new(AtomicBool::new(false)),
         error: None,
+        watcher_alive: Arc::new(AtomicBool::new(true)),
         sync_lock: Arc::new(Mutex::new(())),
         cursor_notify: Arc::new(tokio::sync::Notify::new()),
     };
     if let Err(err) = materialize_mount_files(&state, &mount).await {
         let conn = state.db.lock().await;
-        let _ = mount_store::delete_mount(&conn, &req.path);
+        let _ = mount_store::delete_mount(&conn, &canonical_path);
         return Err(DaemonError::Internal(err.to_string()));
     }
     {
@@ -125,7 +128,7 @@ pub(crate) async fn post_mount(
         folder_id: resolved.folder_id,
         grant_id: resolved.grant_id,
         scope_node_id: resolved.scope_node_id,
-        path: req.path,
+        path: canonical_path,
     }))
 }
 
@@ -319,6 +322,8 @@ mod tests {
             current_version_id: None,
             server_seq: 0,
             deleted_at: None,
+            pushed_size_bytes: None,
+            pushed_mtime_nanos: None,
         }
     }
 
@@ -358,6 +363,8 @@ mod tests {
                 current_version_id: None,
                 server_seq: 0,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
@@ -407,6 +414,7 @@ mod tests {
             update_required_flag: Arc::new(AtomicBool::new(false)),
             rejected: Arc::new(AtomicBool::new(false)),
             error: None,
+            watcher_alive: Arc::new(AtomicBool::new(true)),
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -639,5 +647,89 @@ mod tests {
         assert!(state.config.device_token.is_none());
 
         cancel_tasks_for_mount(&state, &mount_path).await;
+    }
+
+    #[tokio::test]
+    async fn post_mount_through_symlinked_ancestor_persists_canonical_path() {
+        let grant_token = "grant-token-xyz".to_owned();
+        let folder_id = "folder-1".to_owned();
+        let scope_node_id = "scope-1".to_owned();
+        let backend_url = mount_grant_server(
+            folder_id.clone(),
+            scope_node_id.clone(),
+            "Design".to_owned(),
+            true,
+        )
+        .await;
+        let state = credential_less_state(backend_url);
+        let base = tempfile::tempdir().unwrap();
+        let real_root = base.path().join("real");
+        std::fs::create_dir_all(real_root.join("design")).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real_root, &link).unwrap();
+        let symlinked_path = link.join("design").to_string_lossy().into_owned();
+        let canonical_path = real_root
+            .join("design")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let response = post_mount(
+            State(state.clone()),
+            Json(MountRequest {
+                path: symlinked_path,
+                folder_id: None,
+                grant_token: Some(grant_token),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0.path, canonical_path);
+        assert!(state.tasks.lock().await.contains_key(&canonical_path));
+        let conn = state.db.lock().await;
+        assert!(mount_store::get_mount(&conn, &canonical_path)
+            .unwrap()
+            .is_some());
+        drop(conn);
+
+        cancel_tasks_for_mount(&state, &canonical_path).await;
+    }
+
+    #[tokio::test]
+    async fn post_mount_with_relative_path_is_stored_absolute() {
+        let grant_token = "grant-token-xyz".to_owned();
+        let folder_id = "folder-1".to_owned();
+        let scope_node_id = "scope-1".to_owned();
+        let backend_url = mount_grant_server(
+            folder_id.clone(),
+            scope_node_id.clone(),
+            "Design".to_owned(),
+            true,
+        )
+        .await;
+        let state = credential_less_state(backend_url);
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("design")).unwrap();
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(base.path()).unwrap();
+
+        let response = post_mount(
+            State(state.clone()),
+            Json(MountRequest {
+                path: "design".to_owned(),
+                folder_id: None,
+                grant_token: Some(grant_token),
+            }),
+        )
+        .await;
+
+        std::env::set_current_dir(original_cwd).unwrap();
+        let response = response.unwrap();
+
+        assert!(Path::new(&response.0.path).is_absolute());
+
+        cancel_tasks_for_mount(&state, &response.0.path).await;
     }
 }

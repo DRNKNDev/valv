@@ -76,6 +76,14 @@ pub fn delete_mount(conn: &Connection, path: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn update_mount_path(conn: &Connection, old_path: &str, new_path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE mounts SET path = ?1 WHERE path = ?2",
+        params![new_path, old_path],
+    )?;
+    Ok(())
+}
+
 pub fn get_cursor(conn: &Connection, folder_id: &str) -> Result<i64> {
     let cursor = conn
         .query_row(

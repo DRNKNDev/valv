@@ -235,6 +235,7 @@ mod tests {
             update_required_flag,
             rejected: Arc::new(AtomicBool::new(false)),
             error: None,
+            watcher_alive: Arc::new(AtomicBool::new(true)),
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
         }
@@ -256,6 +257,7 @@ mod tests {
             update_required_flag: Arc::new(AtomicBool::new(false)),
             rejected: Arc::new(AtomicBool::new(false)),
             error: None,
+            watcher_alive: Arc::new(AtomicBool::new(true)),
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
         }

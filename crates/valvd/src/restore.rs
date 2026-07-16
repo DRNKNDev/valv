@@ -190,6 +190,8 @@ mod tests {
             current_version_id: None,
             server_seq: 4,
             deleted_at: None,
+            pushed_size_bytes: None,
+            pushed_mtime_nanos: None,
         }
     }
 
@@ -209,6 +211,7 @@ mod tests {
             update_required_flag: Arc::new(AtomicBool::new(false)),
             rejected: Arc::new(AtomicBool::new(false)),
             error: None,
+            watcher_alive: Arc::new(AtomicBool::new(true)),
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
         };

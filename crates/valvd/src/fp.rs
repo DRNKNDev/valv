@@ -1095,6 +1095,7 @@ mod fp_watch_tests {
             update_required_flag: Arc::new(AtomicBool::new(false)),
             rejected: Arc::new(AtomicBool::new(false)),
             error: None,
+            watcher_alive: Arc::new(AtomicBool::new(true)),
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
         }
@@ -1253,6 +1254,8 @@ mod fp_watch_tests {
                     current_version_id: None,
                     server_seq: 7,
                     deleted_at: Some("2026-07-08T00:00:00Z".into()),
+                    pushed_size_bytes: None,
+                    pushed_mtime_nanos: None,
                 },
             )
             .unwrap();
@@ -1485,6 +1488,8 @@ mod fp_error_tests {
             current_version_id: None,
             server_seq: 7,
             deleted_at: None,
+            pushed_size_bytes: None,
+            pushed_mtime_nanos: None,
         }
     }
 
@@ -1511,6 +1516,7 @@ mod fp_error_tests {
             update_required_flag: Arc::new(AtomicBool::new(false)),
             rejected: Arc::new(AtomicBool::new(false)),
             error: None,
+            watcher_alive: Arc::new(AtomicBool::new(true)),
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(Notify::new()),
         }

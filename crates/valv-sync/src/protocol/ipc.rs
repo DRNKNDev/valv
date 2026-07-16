@@ -16,6 +16,12 @@ pub struct MountStatus {
     pub update_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default = "watcher_alive_default")]
+    pub watcher_alive: bool,
+}
+
+fn watcher_alive_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

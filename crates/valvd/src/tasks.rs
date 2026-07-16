@@ -34,7 +34,7 @@ use valv_sync::{
         update_required::is_update_required,
         ws_client::ws_push_loop,
     },
-    watch::{fs_watch_task, WatchMount},
+    watch::{fs_watch_task, DirtySignal, WatchMount},
 };
 
 use crate::{
@@ -389,6 +389,8 @@ fn apply_update_check_outcome(
     }
 }
 
+const FS_WATCH_TASK_INDEX: usize = 2;
+
 pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState) {
     let Some(token) = mount.effective_token(&state.config).map(str::to_owned) else {
         tracing::warn!(
@@ -399,11 +401,13 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
         return;
     };
     let (notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(32);
+    let dirty_signal = DirtySignal::new();
 
     let sync_state = state.clone();
     let sync_mount = mount.clone();
+    let sync_dirty_signal = dirty_signal.clone();
     let sync_handle = tokio::spawn(async move {
-        sync_loop(sync_state, sync_mount, notify_rx).await;
+        sync_loop(sync_state, sync_mount, notify_rx, sync_dirty_signal).await;
     });
 
     let ws_backend_url = state.config.backend_url.clone();
@@ -428,40 +432,7 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
         }
     });
 
-    let fs_handle = tokio::spawn({
-        let paused = state.paused.clone();
-        let fs_events_paused = state.fs_events_paused.clone();
-        let db = state.db.clone();
-        let client = state.client.clone();
-        let backend_url = state.config.backend_url.clone();
-        let device_name = state.config.device_name.clone();
-        let fs_folder_id = mount.folder_id.clone();
-        let watch_mount = WatchMount {
-            path: PathBuf::from(&mount.path),
-            folder_id: mount.folder_id.clone(),
-            device_name,
-            update_required: mount.update_required_flag.clone(),
-        };
-        async move {
-            if let Err(error) = fs_watch_task(
-                watch_mount,
-                paused,
-                fs_events_paused,
-                db,
-                client,
-                backend_url,
-                token,
-            )
-            .await
-            {
-                tracing::error!(
-                    folder_id = %fs_folder_id,
-                    error = %error,
-                    "filesystem watch task failed"
-                );
-            }
-        }
-    });
+    let fs_handle = spawn_fs_watch_handle(state, &mount, dirty_signal, token);
 
     state
         .tasks
@@ -470,10 +441,59 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
         .insert(mount.path.clone(), vec![sync_handle, ws_handle, fs_handle]);
 }
 
+fn spawn_fs_watch_handle(
+    state: &DaemonState,
+    mount: &MountState,
+    dirty_signal: DirtySignal,
+    token: String,
+) -> tokio::task::JoinHandle<()> {
+    let paused = state.paused.clone();
+    let fs_events_paused = state.fs_events_paused.clone();
+    let db = state.db.clone();
+    let client = state.client.clone();
+    let backend_url = state.config.backend_url.clone();
+    let device_name = state.config.device_name.clone();
+    let fs_folder_id = mount.folder_id.clone();
+    let watch_mount = WatchMount {
+        path: PathBuf::from(&mount.path),
+        folder_id: mount.folder_id.clone(),
+        device_name,
+        update_required: mount.update_required_flag.clone(),
+        needs_reconcile: dirty_signal,
+    };
+    tokio::spawn(async move {
+        if let Err(error) = fs_watch_task(
+            watch_mount,
+            paused,
+            fs_events_paused,
+            db,
+            client,
+            backend_url,
+            token,
+        )
+        .await
+        {
+            tracing::error!(
+                folder_id = %fs_folder_id,
+                error = %error,
+                "filesystem watch task failed"
+            );
+        }
+    })
+}
+
+const DIRTY_RECONCILE_DEBOUNCE: Duration = Duration::from_millis(1000);
+
+enum SyncLoopWake {
+    Periodic,
+    Dirty,
+}
+
 async fn sync_loop(
     state: DaemonState,
     mount: MountState,
     mut notify_rx: mpsc::Receiver<WsPushNotification>,
+    dirty_signal: DirtySignal,
 ) {
     // interval_at (not interval) delays the first tick by a full period.
     // post_mount already runs tree_resync + materialize_mount_files before
@@ -488,8 +508,8 @@ async fn sync_loop(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
-        tokio::select! {
-            _ = ticker.tick() => {},
+        let wake = tokio::select! {
+            _ = ticker.tick() => SyncLoopWake::Periodic,
             notification = notify_rx.recv() => {
                 let Some(notification) = notification else {
                     return;
@@ -497,15 +517,66 @@ async fn sync_loop(
                 if notification.folder_id != mount.folder_id {
                     continue;
                 }
+                SyncLoopWake::Periodic
             }
-        }
+            _ = dirty_signal.notified() => SyncLoopWake::Dirty,
+        };
+
+        respawn_watcher_if_dead(&state, &mount, &dirty_signal).await;
 
         if state.paused.load(Ordering::Acquire) {
             continue;
         }
 
-        pull_mount_once(&state, &mount).await;
+        match wake {
+            SyncLoopWake::Periodic => {
+                if dirty_signal.take() {
+                    reconcile_mount(&state, &mount).await;
+                } else {
+                    pull_mount_once(&state, &mount).await;
+                }
+            }
+            SyncLoopWake::Dirty => {
+                sleep(DIRTY_RECONCILE_DEBOUNCE).await;
+                if dirty_signal.take() {
+                    reconcile_mount(&state, &mount).await;
+                }
+            }
+        }
     }
+}
+
+async fn reconcile_mount(state: &DaemonState, mount: &MountState) {
+    if let Err(error) = run_full_sync_mount(state.clone(), mount.clone()).await {
+        tracing::warn!(error = %error, folder_id = %mount.folder_id, "reconcile sync task panicked");
+    }
+}
+
+async fn respawn_watcher_if_dead(state: &DaemonState, mount: &MountState, dirty_signal: &DirtySignal) {
+    let mut tasks = state.tasks.lock().await;
+    let Some(handles) = tasks.get_mut(&mount.path) else {
+        return;
+    };
+    let Some(fs_handle) = handles.get(FS_WATCH_TASK_INDEX) else {
+        return;
+    };
+    let finished = fs_handle.is_finished();
+    mount.watcher_alive.store(!finished, Ordering::Release);
+    if !finished {
+        return;
+    }
+
+    dirty_signal.mark();
+
+    let Some(token) = mount.effective_token(&state.config).map(str::to_owned) else {
+        tracing::warn!(
+            folder_id = %mount.folder_id,
+            path = %mount.path,
+            "fs_watch task died and mount has no usable credential; not respawning"
+        );
+        return;
+    };
+    handles[FS_WATCH_TASK_INDEX] = spawn_fs_watch_handle(state, mount, dirty_signal.clone(), token);
 }
 
 async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
@@ -795,7 +866,7 @@ async fn load_nodes_by_id(
 ) -> anyhow::Result<HashMap<String, LocalNode>> {
     let conn = state.db.lock().await;
     let mut stmt = conn.prepare(
-        "SELECT node_id, folder_id, parent_id, name, node_type, current_version_id, server_seq, deleted_at
+        "SELECT node_id, folder_id, parent_id, name, node_type, current_version_id, server_seq, deleted_at, pushed_size_bytes, pushed_mtime_nanos
          FROM nodes
          WHERE folder_id = ?1",
     )?;
@@ -810,6 +881,8 @@ async fn load_nodes_by_id(
                 current_version_id: row.get(5)?,
                 server_seq: row.get(6)?,
                 deleted_at: row.get(7)?,
+                pushed_size_bytes: row.get(8)?,
+                pushed_mtime_nanos: row.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2028,6 +2101,8 @@ mod tests {
                     current_version_id: Some("v1".into()),
                     server_seq: 1,
                     deleted_at: None,
+                    pushed_size_bytes: None,
+                    pushed_mtime_nanos: None,
                 },
             )
             .unwrap();
@@ -2312,6 +2387,7 @@ mod tests {
             update_required_flag: Arc::new(AtomicBool::new(false)),
             rejected: Arc::new(AtomicBool::new(false)),
             error: None,
+            watcher_alive: Arc::new(AtomicBool::new(true)),
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -2343,6 +2419,8 @@ mod tests {
                     current_version_id: None,
                     server_seq: 0,
                     deleted_at: None,
+                    pushed_size_bytes: None,
+                    pushed_mtime_nanos: None,
                 },
             )
             .unwrap();
@@ -2428,6 +2506,8 @@ mod tests {
                     current_version_id: None,
                     server_seq: 0,
                     deleted_at: None,
+                    pushed_size_bytes: None,
+                    pushed_mtime_nanos: None,
                 },
             )
             .unwrap();
@@ -2469,6 +2549,8 @@ mod tests {
                     current_version_id: None,
                     server_seq: 0,
                     deleted_at: None,
+                    pushed_size_bytes: None,
+                    pushed_mtime_nanos: None,
                 },
             )
             .unwrap();
@@ -2508,6 +2590,8 @@ mod tests {
                     current_version_id: None,
                     server_seq: 0,
                     deleted_at: None,
+                    pushed_size_bytes: None,
+                    pushed_mtime_nanos: None,
                 },
             )
             .unwrap();
@@ -2552,6 +2636,8 @@ mod tests {
                     current_version_id: None,
                     server_seq: 0,
                     deleted_at: None,
+                    pushed_size_bytes: None,
+                    pushed_mtime_nanos: None,
                 },
             )
             .unwrap();
@@ -2586,6 +2672,7 @@ mod tests {
             update_required_flag: Arc::new(AtomicBool::new(false)),
             rejected: Arc::new(AtomicBool::new(false)),
             error: None,
+            watcher_alive: Arc::new(AtomicBool::new(true)),
             sync_lock: Arc::new(Mutex::new(())),
             cursor_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -2601,6 +2688,8 @@ mod tests {
             current_version_id: Some("old-v".to_owned()),
             server_seq: 1,
             deleted_at: None,
+            pushed_size_bytes: None,
+            pushed_mtime_nanos: None,
         }
     }
 
@@ -2614,6 +2703,8 @@ mod tests {
             current_version_id: None,
             server_seq: 0,
             deleted_at: None,
+            pushed_size_bytes: None,
+            pushed_mtime_nanos: None,
         }
     }
 
@@ -2758,6 +2849,8 @@ mod tests {
                     current_version_id: None,
                     server_seq: 0,
                     deleted_at: None,
+                    pushed_size_bytes: None,
+                    pushed_mtime_nanos: None,
                 },
             )
             .unwrap();
@@ -2828,5 +2921,162 @@ mod tests {
         );
         stream.write_all(response.as_bytes()).await.unwrap();
         stream.write_all(body).await.unwrap();
+    }
+
+    async fn request_counting_server(
+        ops_response_body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests_for_server = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (request_line, _body) = read_http_request(&mut stream).await;
+                requests_for_server.lock().unwrap().push(request_line.clone());
+                if request_line.starts_with("GET /api/folders/folder-1/ops") {
+                    write_http_response(&mut stream, "200 OK", ops_response_body.as_bytes()).await;
+                } else if request_line == "POST /api/folders/folder-1/ops" {
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        br#"{"result":"applied","server_seq":1,"node_id":"n"}"#,
+                    )
+                    .await;
+                } else {
+                    write_http_response(&mut stream, "404 Not Found", b"{}").await;
+                }
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    fn pull_request_count(requests: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> usize {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.starts_with("GET /api/folders/folder-1/ops"))
+            .count()
+    }
+
+    async fn dirty_reconcile_test_state() -> (
+        DaemonState,
+        MountState,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tempfile::TempDir,
+    ) {
+        let mut state = test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        {
+            let conn = state.db.lock().await;
+            mounts::upsert_mount(&conn, &mount.path, &mount.folder_id, None, None, None, true)
+                .unwrap();
+            nodes::upsert_node(&conn, &root_node()).unwrap();
+        }
+        let (backend_url, requests) = request_counting_server(r#"{"ops":[],"up_to_seq":0}"#).await;
+        state.config.backend_url = backend_url;
+        *state.mounts.lock().await = vec![mount.clone()];
+        (state, mount, requests, dir)
+    }
+
+    #[tokio::test]
+    async fn sync_loop_reconciles_on_a_dirty_signal_without_waiting_for_the_periodic_tick() {
+        let (state, mount, requests, _dir) = dirty_reconcile_test_state().await;
+        let (_notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(4);
+        let dirty_signal = DirtySignal::new();
+        let handle = tokio::spawn(sync_loop(
+            state.clone(),
+            mount.clone(),
+            notify_rx,
+            dirty_signal.clone(),
+        ));
+
+        dirty_signal.mark();
+        sleep(Duration::from_millis(1600)).await;
+        handle.abort();
+
+        assert_eq!(
+            pull_request_count(&requests),
+            1,
+            "a dirty signal should trigger a reconcile well before the 30s ticker"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_loop_coalesces_a_burst_of_dirty_signals_into_one_reconcile() {
+        let (state, mount, requests, _dir) = dirty_reconcile_test_state().await;
+        let (_notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(4);
+        let dirty_signal = DirtySignal::new();
+        let handle = tokio::spawn(sync_loop(
+            state.clone(),
+            mount.clone(),
+            notify_rx,
+            dirty_signal.clone(),
+        ));
+
+        for _ in 0..5 {
+            dirty_signal.mark();
+        }
+        sleep(Duration::from_millis(1600)).await;
+        handle.abort();
+
+        assert_eq!(
+            pull_request_count(&requests),
+            1,
+            "a burst of dirty signals must coalesce into exactly one reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_loop_respawns_a_finished_watcher_and_marks_the_mount_dirty() {
+        let (state, mount, _requests, _dir) = dirty_reconcile_test_state().await;
+        let dead_handle = tokio::spawn(async {});
+        while !dead_handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        state.tasks.lock().await.insert(
+            mount.path.clone(),
+            vec![
+                tokio::spawn(std::future::pending::<()>()),
+                tokio::spawn(std::future::pending::<()>()),
+                dead_handle,
+            ],
+        );
+
+        let (_notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(4);
+        let dirty_signal = DirtySignal::new();
+        let handle = tokio::spawn(sync_loop(
+            state.clone(),
+            mount.clone(),
+            notify_rx,
+            dirty_signal.clone(),
+        ));
+
+        dirty_signal.mark();
+        let mut respawned_alive = false;
+        for _ in 0..60 {
+            sleep(Duration::from_millis(50)).await;
+            if mount.watcher_alive.load(Ordering::Acquire) {
+                respawned_alive = true;
+                break;
+            }
+        }
+        handle.abort();
+
+        assert!(
+            respawned_alive,
+            "a healthy respawned watcher must be observed alive again"
+        );
+        let tasks = state.tasks.lock().await;
+        let handles = tasks.get(&mount.path).unwrap();
+        assert!(
+            !handles[FS_WATCH_TASK_INDEX].is_finished(),
+            "the finished handle must have been replaced with a fresh one"
+        );
     }
 }
