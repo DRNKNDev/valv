@@ -28,19 +28,33 @@ fn open_sync_db() -> Result<Connection> {
     open_db(&db_path).with_context(|| format!("failed to open sync database {}", db_path.display()))
 }
 
-fn covering_mount(conn: &Connection, target: &Path) -> Result<LocalMount> {
-    mounts::list_mounts(conn)
-        .context("failed to list mounted folders")?
-        .into_iter()
+fn covering_mount_in(mounts: &[LocalMount], target: &Path) -> Option<LocalMount> {
+    mounts
+        .iter()
         .filter(|mount| target.starts_with(&mount.path))
         .max_by_key(|mount| mount.path.len())
-        .ok_or_else(|| CliError::path_not_mounted(target.display().to_string()).into())
+        .cloned()
+}
+
+fn resolve_covered_target(conn: &Connection, path: &str) -> Result<(LocalMount, PathBuf)> {
+    let mounts = mounts::list_mounts(conn).context("failed to list mounted folders")?;
+    let target = resolve_target(path);
+    if let Some(mount) = covering_mount_in(&mounts, &target) {
+        return Ok((mount, target));
+    }
+    if let Some(canonical) = canonicalize_via_existing_ancestor(&expand_tilde(path)) {
+        if canonical != target {
+            if let Some(mount) = covering_mount_in(&mounts, &canonical) {
+                return Ok((mount, canonical));
+            }
+        }
+    }
+    Err(CliError::path_not_mounted(target.display().to_string()).into())
 }
 
 pub(crate) fn resolve_mount(path: &str) -> Result<LocalMount> {
     let conn = open_sync_db()?;
-    let target = resolve_target(path);
-    covering_mount(&conn, &target)
+    resolve_covered_target(&conn, path).map(|(mount, _)| mount)
 }
 
 pub(crate) fn list_local_mounts() -> Result<Vec<LocalMount>> {
@@ -50,8 +64,7 @@ pub(crate) fn list_local_mounts() -> Result<Vec<LocalMount>> {
 
 pub(crate) fn resolve_target_path(path: &str) -> Result<ResolvedTarget> {
     let conn = open_sync_db()?;
-    let target = resolve_target(path);
-    let mount = covering_mount(&conn, &target)?;
+    let (mount, target) = resolve_covered_target(&conn, path)?;
     let node = resolve_abs_path(&conn, Path::new(&mount.path), &mount.folder_id, &target)
         .with_context(|| format!("failed to resolve target path {}", target.display()))?
         .ok_or_else(|| CliError::path_not_in_mirror(target.display().to_string()))?;
@@ -107,6 +120,23 @@ fn expand_tilde(path: &str) -> PathBuf {
 fn resolve_target(path: &str) -> PathBuf {
     let expanded = expand_tilde(path);
     std::fs::canonicalize(&expanded).unwrap_or(expanded)
+}
+
+fn canonicalize_via_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(current) {
+            let mut resolved = canonical;
+            for component in suffix.iter().rev() {
+                resolved.push(component);
+            }
+            return Some(resolved);
+        }
+        let parent = current.parent()?;
+        suffix.push(current.file_name()?.to_os_string());
+        current = parent;
+    }
 }
 
 pub(crate) fn config_path() -> Result<PathBuf> {
@@ -246,6 +276,15 @@ mod tests {
             true,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn canonicalize_via_existing_ancestor_resolves_a_vanished_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let vanished = dir.path().join("gone").join("child");
+        let resolved = canonicalize_via_existing_ancestor(&vanished).unwrap();
+        assert_eq!(resolved, base.join("gone").join("child"));
     }
 
     #[test]
