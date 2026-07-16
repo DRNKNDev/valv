@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use valv_sync::{
     protocol::ipc::DaemonStatus,
-    update::{self as shared_update, is_newer_version, resolve_latest_version},
+    update::{self as shared_update, is_newer_version, resolve_latest_version, Component},
 };
 
 use crate::{daemon::daemon_client, paths::local_state_dir};
@@ -56,10 +56,14 @@ async fn resolve_notice_version(bypass_cache: bool) -> Option<String> {
     }
 
     let client = reqwest::Client::new();
-    let latest_version =
-        resolve_latest_version(&client, shared_update::DEFAULT_REPO, "VALV_VERSION")
-            .await
-            .ok()?;
+    let latest_version = resolve_latest_version(
+        &client,
+        shared_update::DEFAULT_REPO,
+        Component::Cli,
+        "VALV_CLI_VERSION",
+    )
+    .await
+    .ok()?;
     write_cache(
         &cache_path,
         &UpdateCheckState {

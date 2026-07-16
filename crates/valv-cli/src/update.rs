@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 use valv_sync::{
     protocol::ipc::DaemonStatus,
-    update::{self as shared_update, is_newer_version, resolve_latest_version, verify_sha256sums},
+    update::{self as shared_update, is_newer_version, resolve_latest_version, verify_sha256sums, Component},
 };
 
 use crate::daemon::daemon_client;
@@ -31,6 +31,13 @@ fn emit(json: bool, human_lines: &[String], value: serde_json::Value) {
     }
 }
 
+struct StagedComponent {
+    extract_dir: PathBuf,
+    staged_path: PathBuf,
+    old_version: String,
+    new_version: String,
+}
+
 pub(crate) async fn cmd_update(json: bool) -> Result<()> {
     let guard = check_managed_install_guard()?;
     if guard == ManagedInstallGuard::FullAbort {
@@ -43,117 +50,198 @@ pub(crate) async fn cmd_update(json: bool) -> Result<()> {
     }
     let daemon_is_app_managed = guard == ManagedInstallGuard::DaemonManaged;
 
-    let current_version = env!("CARGO_PKG_VERSION");
-    let client = reqwest::Client::new();
-    let pinned = std::env::var("VALV_VERSION").is_ok_and(|value| !value.is_empty());
-    let latest_version =
-        resolve_latest_version(&client, shared_update::DEFAULT_REPO, "VALV_VERSION")
-            .await
-            .context("failed to resolve the latest valv release")?;
-
-    match plan_update(current_version, &latest_version, pinned) {
-        UpdatePlan::AlreadyUpToDate => {
-            emit(
-                json,
-                &[format!("valv is already up to date ({current_version})")],
-                serde_json::json!({"result": "up_to_date", "version": current_version}),
-            );
-            return Ok(());
-        }
-        UpdatePlan::Install => {}
-    }
-
     let current_exe = env::current_exe().context("failed to determine current executable path")?;
     let install_dir = current_exe
         .parent()
         .ok_or_else(|| anyhow!("current executable has no parent directory"))?
         .to_path_buf();
+    let valvd_sibling_present = install_dir.join("valvd").exists();
+    let should_consider_valvd = valvd_sibling_present && !daemon_is_app_managed;
+
+    let client = reqwest::Client::new();
+    let repo = shared_update::DEFAULT_REPO;
+
+    let current_cli_version = env!("CARGO_PKG_VERSION").to_owned();
+    let cli_pinned = env_pin_is_set("VALV_CLI_VERSION");
+    let latest_cli_version = resolve_latest_version(&client, repo, Component::Cli, "VALV_CLI_VERSION")
+        .await
+        .context("failed to resolve the latest valv release")?;
+    let cli_action = plan_update(&current_cli_version, &latest_cli_version, cli_pinned);
+
+    let valvd_info = if should_consider_valvd {
+        let valvd_pinned = env_pin_is_set("VALVD_VERSION");
+        let latest_valvd_version = resolve_latest_version(&client, repo, Component::Valvd, "VALVD_VERSION")
+            .await
+            .context("failed to resolve the latest valvd release")?;
+        let current_valvd_version = current_daemon_version()
+            .await
+            .unwrap_or_else(|| "0.0.0".to_owned());
+        let action = plan_update(&current_valvd_version, &latest_valvd_version, valvd_pinned);
+        Some((action, current_valvd_version, latest_valvd_version))
+    } else {
+        None
+    };
+    let valvd_action = valvd_info
+        .as_ref()
+        .map(|(action, _, _)| *action)
+        .unwrap_or(UpdatePlan::AlreadyUpToDate);
+
+    if cli_action == UpdatePlan::AlreadyUpToDate && valvd_action == UpdatePlan::AlreadyUpToDate {
+        emit(
+            json,
+            &[format!("valv is already up to date ({current_cli_version})")],
+            serde_json::json!({"result": "up_to_date", "version": current_cli_version}),
+        );
+        return Ok(());
+    }
 
     let target = detect_target(env::consts::OS, env::consts::ARCH)?;
-    let asset = format!("valv-{latest_version}-{target}.tar.gz");
-    let release_base = format!(
-        "https://github.com/{}/releases/download/v{latest_version}",
-        shared_update::DEFAULT_REPO
-    );
 
-    let tarball_bytes = download_bytes(&client, &format!("{release_base}/{asset}")).await?;
-    let sha256sums_bytes = download_bytes(&client, &format!("{release_base}/SHA256SUMS")).await?;
-    let minisig_bytes =
-        download_bytes(&client, &format!("{release_base}/SHA256SUMS.minisig")).await?;
+    let cli_staged = if cli_action == UpdatePlan::Install {
+        Some(
+            stage_component(
+                &client,
+                repo,
+                Component::Cli,
+                "valv",
+                &latest_cli_version,
+                target,
+                current_cli_version.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let valvd_staged = if let Some((UpdatePlan::Install, current_valvd_version, latest_valvd_version)) =
+        &valvd_info
+    {
+        Some(
+            stage_component(
+                &client,
+                repo,
+                Component::Valvd,
+                "valvd",
+                latest_valvd_version,
+                target,
+                current_valvd_version.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let swap = platform_binary_swap();
+    let backup = swap.swap(
+        &install_dir,
+        cli_staged.as_ref().map(|component| component.staged_path.as_path()),
+        valvd_staged.as_ref().map(|component| component.staged_path.as_path()),
+    )?;
+
+    if let Some(component) = &cli_staged {
+        let _ = fs::remove_dir_all(&component.extract_dir);
+    }
+    if let Some(component) = &valvd_staged {
+        let _ = fs::remove_dir_all(&component.extract_dir);
+    }
+
+    if let Some(valvd_component) = &valvd_staged {
+        if let Err(error) = restart_and_confirm(&valvd_component.new_version).await {
+            return Err(handle_failed_restart(&swap, &backup, restart_daemon, error));
+        }
+    }
+
+    let mut updated_lines = Vec::new();
+    let mut components_json = Vec::new();
+    if let Some(component) = &cli_staged {
+        updated_lines.push(format!("valv {} -> {}", component.old_version, component.new_version));
+        components_json.push(serde_json::json!({
+            "name": "valv",
+            "from": component.old_version,
+            "to": component.new_version,
+        }));
+    }
+    if let Some(component) = &valvd_staged {
+        updated_lines.push(format!("valvd {} -> {}", component.old_version, component.new_version));
+        components_json.push(serde_json::json!({
+            "name": "valvd",
+            "from": component.old_version,
+            "to": component.new_version,
+        }));
+    }
+
+    let no_valvd_sibling = !valvd_sibling_present && !daemon_is_app_managed;
+    let mut message = format!("Updated {}", updated_lines.join(", "));
+    if no_valvd_sibling && valvd_staged.is_none() && cli_staged.is_some() {
+        message.push_str(" (no valvd sibling found; daemon not restarted)");
+    }
+
+    let mut human_lines = vec![message];
+    if daemon_is_app_managed && cli_staged.is_some() {
+        human_lines.push(APP_MANAGED_NOTICE.to_owned());
+    }
+
+    emit(
+        json,
+        &human_lines,
+        serde_json::json!({
+            "result": "updated",
+            "components": components_json,
+            "valvd_restarted": valvd_staged.is_some(),
+            "daemon_app_managed": daemon_is_app_managed,
+        }),
+    );
+    Ok(())
+}
+
+fn env_pin_is_set(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| !value.is_empty())
+}
+
+async fn stage_component(
+    client: &reqwest::Client,
+    repo: &str,
+    component: Component,
+    binary_name: &'static str,
+    version: &str,
+    target: &str,
+    old_version: String,
+) -> Result<StagedComponent> {
+    let asset = component_asset_name(binary_name, version, target);
+    let release_base = component_release_base(repo, component, version);
+
+    let tarball_bytes = download_bytes(client, &format!("{release_base}/{asset}")).await?;
+    let sha256sums_bytes = download_bytes(client, &format!("{release_base}/SHA256SUMS")).await?;
+    let minisig_bytes = download_bytes(client, &format!("{release_base}/SHA256SUMS.minisig")).await?;
 
     verify_tarball_checksum(&asset, &tarball_bytes, &sha256sums_bytes)?;
     verify_sha256sums(&sha256sums_bytes, &minisig_bytes)
         .context("SHA256SUMS.minisig did not verify against SHA256SUMS")?;
 
     let extract_dir = extract_tarball(&tarball_bytes)?;
-    let staged_valv = extract_dir.join("valv");
-    let staged_valvd = extract_dir.join("valvd");
-    if !staged_valv.exists() || !staged_valvd.exists() {
-        return Err(anyhow!("{asset} did not contain valv and valvd"));
+    let staged_path = extract_dir.join(binary_name);
+    if !staged_path.exists() {
+        return Err(anyhow!("{asset} did not contain {binary_name}"));
     }
 
-    let valvd_sibling_present = install_dir.join("valvd").exists();
-    let should_swap_valvd = valvd_sibling_present && !daemon_is_app_managed;
+    Ok(StagedComponent {
+        extract_dir,
+        staged_path,
+        old_version,
+        new_version: version.to_owned(),
+    })
+}
 
-    let swap = platform_binary_swap();
-    let backup = swap.swap(
-        &install_dir,
-        &staged_valv,
-        should_swap_valvd.then_some(staged_valvd.as_path()),
-    )?;
-    let _ = fs::remove_dir_all(&extract_dir);
+fn component_asset_name(binary_name: &str, version: &str, target: &str) -> String {
+    format!("{binary_name}-{version}-{target}.tar.gz")
+}
 
-    if should_swap_valvd {
-        if let Err(error) = restart_and_confirm(&latest_version).await {
-            return Err(handle_failed_restart(&swap, &backup, restart_daemon, error));
-        }
-    }
-
-    if daemon_is_app_managed {
-        emit(
-            json,
-            &[
-                format!("Updated valv: {current_version} -> {latest_version}"),
-                APP_MANAGED_NOTICE.to_owned(),
-            ],
-            serde_json::json!({
-                "result": "updated",
-                "from": current_version,
-                "to": latest_version,
-                "valvd_restarted": false,
-                "daemon_app_managed": true,
-            }),
-        );
-    } else if valvd_sibling_present {
-        emit(
-            json,
-            &[format!(
-                "Updated valv and valvd: {current_version} -> {latest_version}"
-            )],
-            serde_json::json!({
-                "result": "updated",
-                "from": current_version,
-                "to": latest_version,
-                "valvd_restarted": true,
-                "daemon_app_managed": false,
-            }),
-        );
-    } else {
-        emit(
-            json,
-            &[format!(
-                "Updated valv: {current_version} -> {latest_version} (no valvd sibling found; daemon not restarted)"
-            )],
-            serde_json::json!({
-                "result": "updated",
-                "from": current_version,
-                "to": latest_version,
-                "valvd_restarted": false,
-                "daemon_app_managed": false,
-            }),
-        );
-    }
-    Ok(())
+fn component_release_base(repo: &str, component: Component, version: &str) -> String {
+    format!(
+        "https://github.com/{repo}/releases/download/{}{version}",
+        component.tag_prefix()
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,8 +445,8 @@ fn extract_tarball(tarball_bytes: &[u8]) -> Result<PathBuf> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SwapBackup {
-    valv_current: PathBuf,
-    valv_backup: PathBuf,
+    valv_current: Option<PathBuf>,
+    valv_backup: Option<PathBuf>,
     valvd_current: Option<PathBuf>,
     valvd_backup: Option<PathBuf>,
 }
@@ -367,7 +455,7 @@ pub(crate) trait BinarySwap {
     fn swap(
         &self,
         install_dir: &Path,
-        staged_valv: &Path,
+        staged_valv: Option<&Path>,
         staged_valvd: Option<&Path>,
     ) -> Result<SwapBackup>;
     fn rollback(&self, backup: &SwapBackup) -> Result<()>;
@@ -381,23 +469,30 @@ impl BinarySwap for UnixBinarySwap {
     fn swap(
         &self,
         install_dir: &Path,
-        staged_valv: &Path,
+        staged_valv: Option<&Path>,
         staged_valvd: Option<&Path>,
     ) -> Result<SwapBackup> {
-        let valv_current = install_dir.join("valv");
-        let valv_backup = install_dir.join("valv.old");
+        let (valv_current, valv_backup) = match staged_valv {
+            Some(staged_valv) => {
+                let valv_current = install_dir.join("valv");
+                let valv_backup = install_dir.join("valv.old");
 
-        rename_atomic(&valv_current, &valv_backup)?;
+                rename_atomic(&valv_current, &valv_backup)?;
 
-        if let Err(error) = rename_atomic(staged_valv, &valv_current) {
-            restore_binary(&valv_backup, &valv_current);
-            return Err(error.context("failed to install new valv binary"));
-        }
+                if let Err(error) = rename_atomic(staged_valv, &valv_current) {
+                    restore_binary(&valv_backup, &valv_current);
+                    return Err(error.context("failed to install new valv binary"));
+                }
 
-        if let Err(error) = set_executable(&valv_current) {
-            restore_binary(&valv_backup, &valv_current);
-            return Err(error.context("failed to set executable permission on new valv binary"));
-        }
+                if let Err(error) = set_executable(&valv_current) {
+                    restore_binary(&valv_backup, &valv_current);
+                    return Err(error.context("failed to set executable permission on new valv binary"));
+                }
+
+                (Some(valv_current), Some(valv_backup))
+            }
+            None => (None, None),
+        };
 
         let (valvd_current, valvd_backup) = match staged_valvd {
             Some(staged_valvd) => {
@@ -405,19 +500,19 @@ impl BinarySwap for UnixBinarySwap {
                 let valvd_backup = install_dir.join("valvd.old");
 
                 if let Err(error) = rename_atomic(&valvd_current, &valvd_backup) {
-                    restore_binary(&valv_backup, &valv_current);
+                    rollback_optional(&valv_backup, &valv_current);
                     return Err(error.context("failed to back up valvd binary"));
                 }
 
                 if let Err(error) = rename_atomic(staged_valvd, &valvd_current) {
                     restore_binary(&valvd_backup, &valvd_current);
-                    restore_binary(&valv_backup, &valv_current);
+                    rollback_optional(&valv_backup, &valv_current);
                     return Err(error.context("failed to install new valvd binary"));
                 }
 
                 if let Err(error) = set_executable(&valvd_current) {
                     restore_binary(&valvd_backup, &valvd_current);
-                    restore_binary(&valv_backup, &valv_current);
+                    rollback_optional(&valv_backup, &valv_current);
                     return Err(
                         error.context("failed to set executable permission on new valvd binary")
                     );
@@ -437,8 +532,9 @@ impl BinarySwap for UnixBinarySwap {
     }
 
     fn rollback(&self, backup: &SwapBackup) -> Result<()> {
-        rename_atomic(&backup.valv_backup, &backup.valv_current)
-            .context("failed to roll back valv binary")?;
+        if let (Some(valv_current), Some(valv_backup)) = (&backup.valv_current, &backup.valv_backup) {
+            rename_atomic(valv_backup, valv_current).context("failed to roll back valv binary")?;
+        }
         if let (Some(valvd_current), Some(valvd_backup)) =
             (&backup.valvd_current, &backup.valvd_backup)
         {
@@ -461,6 +557,13 @@ fn restore_binary(backup: &Path, current: &Path) {
 }
 
 #[cfg(unix)]
+fn rollback_optional(backup: &Option<PathBuf>, current: &Option<PathBuf>) {
+    if let (Some(backup), Some(current)) = (backup, current) {
+        restore_binary(backup, current);
+    }
+}
+
+#[cfg(unix)]
 fn set_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o755))
@@ -475,7 +578,7 @@ impl BinarySwap for WindowsBinarySwap {
     fn swap(
         &self,
         _install_dir: &Path,
-        _staged_valv: &Path,
+        _staged_valv: Option<&Path>,
         _staged_valvd: Option<&Path>,
     ) -> Result<SwapBackup> {
         unimplemented!(
@@ -584,6 +687,13 @@ fn daemon_status_matches_version(status: &DaemonStatus, target_version: &str) ->
     status.version == target_version
 }
 
+async fn current_daemon_version() -> Option<String> {
+    let client = daemon_client().ok()?;
+    let response = client.get("http://localhost/status").send().await.ok()?;
+    let status = response.json::<DaemonStatus>().await.ok()?;
+    Some(status.version)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,6 +720,44 @@ mod tests {
     fn plan_update_pin_installs_regardless_of_version_comparison() {
         assert_eq!(plan_update("0.2.0", "0.2.0", true), UpdatePlan::Install);
         assert_eq!(plan_update("0.2.0", "0.1.0", true), UpdatePlan::Install);
+    }
+
+    #[test]
+    fn env_pin_is_set_requires_a_non_empty_value() {
+        std::env::set_var("VALV_UPDATE_TEST_PIN_SET", "0.1.0");
+        std::env::set_var("VALV_UPDATE_TEST_PIN_EMPTY", "");
+        std::env::remove_var("VALV_UPDATE_TEST_PIN_UNSET");
+
+        assert!(env_pin_is_set("VALV_UPDATE_TEST_PIN_SET"));
+        assert!(!env_pin_is_set("VALV_UPDATE_TEST_PIN_EMPTY"));
+        assert!(!env_pin_is_set("VALV_UPDATE_TEST_PIN_UNSET"));
+
+        std::env::remove_var("VALV_UPDATE_TEST_PIN_SET");
+        std::env::remove_var("VALV_UPDATE_TEST_PIN_EMPTY");
+    }
+
+    #[test]
+    fn component_asset_name_uses_binary_prefix() {
+        assert_eq!(
+            component_asset_name("valv", "0.3.1", "aarch64-apple-darwin"),
+            "valv-0.3.1-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(
+            component_asset_name("valvd", "0.3.1", "x86_64-unknown-linux-gnu"),
+            "valvd-0.3.1-x86_64-unknown-linux-gnu.tar.gz"
+        );
+    }
+
+    #[test]
+    fn component_release_base_uses_tag_prefix() {
+        assert_eq!(
+            component_release_base("DRNKNDev/valv", Component::Cli, "0.3.1"),
+            "https://github.com/DRNKNDev/valv/releases/download/cli-v0.3.1"
+        );
+        assert_eq!(
+            component_release_base("DRNKNDev/valv", Component::Valvd, "0.3.1"),
+            "https://github.com/DRNKNDev/valv/releases/download/valvd-v0.3.1"
+        );
     }
 
     #[test]
@@ -751,7 +899,7 @@ mod tests {
 
         let swap = UnixBinarySwap;
         let backup = swap
-            .swap(install_dir, &staged_valv, Some(staged_valvd.as_path()))
+            .swap(install_dir, Some(&staged_valv), Some(staged_valvd.as_path()))
             .unwrap();
 
         assert_eq!(fs::read(install_dir.join("valv")).unwrap(), b"new valv");
@@ -774,12 +922,37 @@ mod tests {
         fs::write(&staged_valv, b"new valv").unwrap();
 
         let swap = UnixBinarySwap;
-        let backup = swap.swap(install_dir, &staged_valv, None).unwrap();
+        let backup = swap.swap(install_dir, Some(&staged_valv), None).unwrap();
 
         assert_eq!(fs::read(install_dir.join("valv")).unwrap(), b"new valv");
         assert!(!install_dir.join("valvd").exists());
         assert!(backup.valvd_current.is_none());
         assert!(backup.valvd_backup.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_binary_swap_skips_valv_when_only_valvd_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_dir = dir.path();
+        fs::write(install_dir.join("valv"), b"old valv").unwrap();
+        fs::write(install_dir.join("valvd"), b"old valvd").unwrap();
+        let staged_valvd = install_dir.join("staged-valvd");
+        fs::write(&staged_valvd, b"new valvd").unwrap();
+
+        let swap = UnixBinarySwap;
+        let backup = swap.swap(install_dir, None, Some(&staged_valvd)).unwrap();
+
+        assert_eq!(fs::read(install_dir.join("valv")).unwrap(), b"old valv");
+        assert_eq!(fs::read(install_dir.join("valvd")).unwrap(), b"new valvd");
+        assert!(backup.valv_current.is_none());
+        assert!(backup.valv_backup.is_none());
+        assert!(!install_dir.join("valv.old").exists());
+
+        swap.rollback(&backup).unwrap();
+
+        assert_eq!(fs::read(install_dir.join("valv")).unwrap(), b"old valv");
+        assert_eq!(fs::read(install_dir.join("valvd")).unwrap(), b"old valvd");
     }
 
     #[cfg(unix)]
@@ -794,7 +967,7 @@ mod tests {
         fs::write(&staged_valvd, b"new valvd").unwrap();
 
         let swap = UnixBinarySwap;
-        let result = swap.swap(install_dir, &staged_valv, Some(staged_valvd.as_path()));
+        let result = swap.swap(install_dir, Some(&staged_valv), Some(staged_valvd.as_path()));
 
         assert!(result.is_err());
         assert_eq!(
@@ -826,7 +999,7 @@ mod tests {
         let swap = UnixBinarySwap;
         let result = swap.swap(
             install_dir,
-            &staged_valv,
+            Some(&staged_valv),
             Some(missing_staged_valvd.as_path()),
         );
 
@@ -861,7 +1034,7 @@ mod tests {
 
         let swap = UnixBinarySwap;
         let backup = swap
-            .swap(install_dir, &staged_valv, Some(staged_valvd.as_path()))
+            .swap(install_dir, Some(&staged_valv), Some(staged_valvd.as_path()))
             .unwrap();
 
         let restarted = AtomicBool::new(false);
@@ -897,8 +1070,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let install_dir = dir.path();
         let backup = SwapBackup {
-            valv_current: install_dir.join("valv"),
-            valv_backup: install_dir.join("valv.old-missing"),
+            valv_current: Some(install_dir.join("valv")),
+            valv_backup: Some(install_dir.join("valv.old-missing")),
             valvd_current: None,
             valvd_backup: None,
         };
