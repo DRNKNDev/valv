@@ -393,6 +393,7 @@ const FS_WATCH_TASK_INDEX: usize = 2;
 
 pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState) {
     let Some(token) = mount.effective_token(&state.config).map(str::to_owned) else {
+        mount.watcher_alive.store(false, Ordering::Release);
         tracing::warn!(
             folder_id = %mount.folder_id,
             path = %mount.path,
