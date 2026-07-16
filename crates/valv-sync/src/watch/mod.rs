@@ -81,6 +81,11 @@ pub struct WatchMount {
     pub device_name: String,
     pub update_required: Arc<AtomicBool>,
     pub needs_reconcile: DirtySignal,
+    // Same mutex the daemon's pull_mount_once/full_sync_mount hold, so the
+    // watcher's push (which mutates the mirror and materializes conflict copies
+    // by re-reading the file on disk) can't run while a pull is overwriting
+    // that same file with the winning remote version.
+    pub sync_lock: Arc<Mutex<()>>,
 }
 
 pub async fn fs_watch_task(
@@ -137,7 +142,11 @@ pub async fn fs_watch_task(
             continue;
         }
 
-        match handle_fs_events(&mount, &db, &client, &backend_url, &token, events).await {
+        let outcome = {
+            let _sync_guard = mount.sync_lock.lock().await;
+            handle_fs_events(&mount, &db, &client, &backend_url, &token, events).await
+        };
+        match outcome {
             Ok(true) => {}
             Ok(false) => {
                 drain_pending_events(&mut rx);
@@ -1174,6 +1183,7 @@ mod tests {
             device_name: "Test Device".into(),
             update_required: Arc::new(AtomicBool::new(false)),
             needs_reconcile: DirtySignal::new(),
+            sync_lock: Arc::new(Mutex::new(())),
         }
     }
 

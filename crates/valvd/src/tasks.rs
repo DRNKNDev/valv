@@ -461,6 +461,7 @@ fn spawn_fs_watch_handle(
         device_name,
         update_required: mount.update_required_flag.clone(),
         needs_reconcile: dirty_signal,
+        sync_lock: mount.sync_lock.clone(),
     };
     tokio::spawn(async move {
         if let Err(error) = fs_watch_task(
