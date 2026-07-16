@@ -68,7 +68,7 @@ Usage:
   APPLE_TEAM_ID="TEAMID" \
   NOTARY_PROFILE="valv-notary" \
   VALV_RELEASE_NOTES_FILE="/path/to/notes.md" \
-    macos/scripts/release-app.sh [--dry-run] [--cli-version 0.3.1] \
+    macos/scripts/release-app.sh [--dry-run] [--local-cli] [--cli-version 0.3.1] \
       [--valvd-version 0.3.0] macos-v0.1.0
 
 Produces Valv-<version>.dmg (signed + notarized + stapled) and uploads it, its
@@ -82,6 +82,13 @@ bundle. Pass --cli-version / --valvd-version to pin the embedded binaries to
 an explicit version instead of resolving latest, for reproducible builds.
 The resolved versions are printed and recorded in the release notes and the
 appcast item description.
+
+--local-cli embeds the hardened-runtime valv/valvd that sign-cli-binaries.sh
+--local wrote to crates/target/signed-cli instead of downloading a released
+tarball, for a fully local app build with no cli-v*/valvd-v* release published
+yet. The embedded versions are read from the working-tree Cargo.toml. It cannot
+be combined with --cli-version/--valvd-version. Pair it with --dry-run for a
+local build that signs, notarizes, and staples without uploading.
 
 --dry-run runs the full archive/export/notarize/staple/DMG/appcast-generation
 flow (so signing, notarization, and Sparkle key problems still surface), but
@@ -99,6 +106,7 @@ USAGE
 }
 
 dry_run=0
+local_cli=0
 cli_version_override=""
 valvd_version_override=""
 positional=()
@@ -106,6 +114,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)
       dry_run=1
+      shift
+      ;;
+    --local-cli)
+      local_cli=1
       shift
       ;;
     --cli-version)
@@ -133,6 +145,9 @@ notary_profile="${NOTARY_PROFILE:-}"
 [[ "${tag}" == macos-v* ]] || fail "tag must start with macos-v (e.g. macos-v0.1.0)"
 [[ -n "${team_id}" ]] || { usage; fail "missing APPLE_TEAM_ID"; }
 [[ -n "${notary_profile}" ]] || { usage; fail "missing NOTARY_PROFILE"; }
+if [[ "${local_cli}" -eq 1 && ( -n "${cli_version_override}" || -n "${valvd_version_override}" ) ]]; then
+  fail "--local-cli cannot be combined with --cli-version/--valvd-version"
+fi
 
 need xcodebuild
 need xcrun
@@ -182,11 +197,18 @@ dmg_staging="${work_dir}/dmg"
 dmg_path="${work_dir}/Valv-${version}.dmg"
 export_plist="${work_dir}/ExportOptions.plist"
 
-echo "==> Resolving latest signed released valv/valvd"
-cli_resolved_version="${cli_version_override}"
-[[ -n "${cli_resolved_version}" ]] || cli_resolved_version="$(resolve_latest_version "cli-v")"
-valvd_resolved_version="${valvd_version_override}"
-[[ -n "${valvd_resolved_version}" ]] || valvd_resolved_version="$(resolve_latest_version "valvd-v")"
+signed_cli_dir="${crates_dir}/target/signed-cli"
+if [[ "${local_cli}" -eq 1 ]]; then
+  echo "==> Embedding locally signed valv/valvd from ${signed_cli_dir}"
+  cli_resolved_version="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "${crates_dir}/valv-cli/Cargo.toml")"
+  valvd_resolved_version="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "${crates_dir}/valvd/Cargo.toml")"
+else
+  echo "==> Resolving latest signed released valv/valvd"
+  cli_resolved_version="${cli_version_override}"
+  [[ -n "${cli_resolved_version}" ]] || cli_resolved_version="$(resolve_latest_version "cli-v")"
+  valvd_resolved_version="${valvd_version_override}"
+  [[ -n "${valvd_resolved_version}" ]] || valvd_resolved_version="$(resolve_latest_version "valvd-v")"
+fi
 echo "==> Embedding valv ${cli_resolved_version} and valvd ${valvd_resolved_version}"
 
 release_dir="${crates_dir}/target/release"
@@ -215,8 +237,24 @@ fetch_signed_binary() {
   cp "${embedded_dir}/${binary}" "${release_dir}/${binary}"
 }
 
-fetch_signed_binary valv "cli-v" "${cli_resolved_version}"
-fetch_signed_binary valvd "valvd-v" "${valvd_resolved_version}"
+embed_local_binary() {
+  local binary="$1"
+  [[ -x "${signed_cli_dir}/${binary}" ]] \
+    || fail "${signed_cli_dir}/${binary} not found - run sign-cli-binaries.sh --local for ${binary} first"
+  local sig
+  sig="$(codesign -dv --verbose=2 "${signed_cli_dir}/${binary}" 2>&1 || true)"
+  [[ "${sig}" == *"(runtime)"* ]] \
+    || fail "${signed_cli_dir}/${binary} lacks hardened runtime - re-run sign-cli-binaries.sh --local"
+  cp "${signed_cli_dir}/${binary}" "${release_dir}/${binary}"
+}
+
+if [[ "${local_cli}" -eq 1 ]]; then
+  embed_local_binary valv
+  embed_local_binary valvd
+else
+  fetch_signed_binary valv "cli-v" "${cli_resolved_version}"
+  fetch_signed_binary valvd "valvd-v" "${valvd_resolved_version}"
+fi
 
 echo "==> Archiving ${scheme}"
 xcodebuild archive \
