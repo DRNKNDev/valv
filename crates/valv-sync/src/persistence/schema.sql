@@ -17,7 +17,9 @@ CREATE TABLE IF NOT EXISTS nodes (
     node_type TEXT NOT NULL CHECK (node_type IN ('file', 'folder')),
     current_version_id TEXT,
     server_seq INTEGER NOT NULL,
-    deleted_at TEXT
+    deleted_at TEXT,
+    pushed_size_bytes INTEGER,
+    pushed_mtime_nanos INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_nodes_folder_parent

@@ -31,7 +31,23 @@ pub fn open_db(path: &Path) -> Result<Connection> {
         Connection::open(path).with_context(|| format!("open sqlite db {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(schema_sql())?;
+    migrate_nodes_push_cache_columns(&conn)?;
     Ok(conn)
+}
+
+fn migrate_nodes_push_cache_columns(conn: &Connection) -> Result<()> {
+    for stmt in [
+        "ALTER TABLE nodes ADD COLUMN pushed_size_bytes INTEGER",
+        "ALTER TABLE nodes ADD COLUMN pushed_mtime_nanos INTEGER",
+    ] {
+        match conn.execute(stmt, []) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") => {}
+            Err(e) => return Err(e).context(format!("run migration `{stmt}`")),
+        }
+    }
+    Ok(())
 }
 
 pub fn apply_op_log_entry(conn: &Connection, entry: &OpLogEntry) -> Result<Option<LocalNode>> {
@@ -120,6 +136,8 @@ fn apply_create(conn: &Connection, entry: &OpLogEntry) -> Result<()> {
             current_version_id: None,
             server_seq: entry.server_seq,
             deleted_at: None,
+            pushed_size_bytes: None,
+            pushed_mtime_nanos: None,
         },
     )
 }
@@ -178,6 +196,8 @@ fn insert_snapshot_node(conn: &Connection, folder_id: &str, node: &NodeSnapshot)
             current_version_id: node.current_version_id.clone(),
             server_seq: node.server_seq,
             deleted_at: node.deleted_at.clone(),
+            pushed_size_bytes: None,
+            pushed_mtime_nanos: None,
         },
     )
 }
@@ -262,6 +282,46 @@ mod tests {
     }
 
     #[test]
+    fn open_db_is_idempotent_and_migrates_existing_nodes_table() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+
+        {
+            let conn = Connection::open(file.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE nodes (
+                    node_id TEXT PRIMARY KEY,
+                    folder_id TEXT NOT NULL,
+                    parent_id TEXT,
+                    name TEXT NOT NULL,
+                    node_type TEXT NOT NULL,
+                    current_version_id TEXT,
+                    server_seq INTEGER NOT NULL,
+                    deleted_at TEXT
+                );",
+            )
+            .unwrap();
+        }
+
+        let conn = open_db(file.path()).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(nodes)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|result| result.unwrap())
+            .collect();
+        for column in ["pushed_size_bytes", "pushed_mtime_nanos"] {
+            assert!(
+                columns.iter().any(|name| name == column),
+                "expected nodes.{column} to exist, got columns {columns:?}"
+            );
+        }
+        drop(conn);
+
+        open_db(file.path()).unwrap();
+    }
+
+    #[test]
     fn apply_op_log_sequence_updates_mirror_state() {
         let conn = memory_db();
         mounts::upsert_mount(&conn, "/sync", "folder-1", None, None, None, true).unwrap();
@@ -337,6 +397,8 @@ mod tests {
                 current_version_id: Some("winner".into()),
                 server_seq: 10,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
@@ -393,6 +455,8 @@ mod tests {
                 current_version_id: None,
                 server_seq: 10,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
@@ -440,6 +504,8 @@ mod tests {
                     current_version_id: Some("current-v".into()),
                     server_seq: 10,
                     deleted_at: None,
+                    pushed_size_bytes: None,
+                    pushed_mtime_nanos: None,
                 },
             )
             .unwrap();
@@ -483,6 +549,8 @@ mod tests {
                 current_version_id: None,
                 server_seq: 10,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
@@ -542,6 +610,8 @@ mod tests {
                 current_version_id: None,
                 server_seq: 1,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
