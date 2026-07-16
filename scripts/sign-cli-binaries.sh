@@ -38,11 +38,14 @@ Usage:
   DEVELOPER_ID_APPLICATION="Developer ID Application: Name (TEAMID)" \
     MINISIGN_SECRET_KEY_FILE="/path/to/founder/minisign.key" \
     NOTARY_PROFILE="valv-notary" \
-    scripts/sign-cli-binaries.sh [--local] v0.1.0
+    scripts/sign-cli-binaries.sh [--local] cli-v0.1.0
 
-Optionally pass the signing identity as a second positional argument.
+Signs and re-packs a single component's tarball for the given tag: a
+cli-v<semver> tag re-signs valv's tarball, a valvd-v<semver> tag re-signs
+valvd's tarball. Optionally pass the signing identity as a second
+positional argument.
 
---local builds valv/valvd from the working tree with
+--local builds the tag's component from the working tree with
 cargo build --release --target aarch64-apple-darwin instead of downloading a
 published release asset. It needs no tag to already exist, no gh auth, and
 no GitHub network (notarization still needs network). It skips gh release
@@ -52,17 +55,17 @@ covers macOS only: macOS cannot cross-compile the Linux target, so the
 x86_64-unknown-linux-gnu row is absent by design, not a bug.
 
 NOTARY_PROFILE must name a keychain profile created with
-xcrun notarytool store-credentials. It notarizes valv/valvd after
+xcrun notarytool store-credentials. It notarizes the binary after
 codesigning, in every mode; a bare Mach-O cannot be stapled, so Gatekeeper
 resolves the ticket via an online lookup on first run.
 
-MINISIGN_SECRET_KEY_FILE (task 1.3) must point at the same minisign keypair
-release.yml's "Sign checksum manifest" step signs SHA256SUMS with (task 1.2)
-- this script's re-signing step is MANDATORY, not optional: it mutates
-SHA256SUMS after codesigning, so the signature release.yml already produced
-no longer verifies against the file's new content until this step
-regenerates it (see design.md D2). If the key is password-protected,
-`minisign -S` prompts for it interactively.
+MINISIGN_SECRET_KEY_FILE must point at the same minisign keypair
+release.yml's "Sign checksum manifest" step signs SHA256SUMS with - this
+script's re-signing step is MANDATORY, not optional: it mutates SHA256SUMS
+after codesigning, so the signature release.yml already produced no longer
+verifies against the file's new content until this step regenerates it (see
+design.md D4). If the key is password-protected, `minisign -S` prompts for
+it interactively.
 USAGE
 }
 
@@ -85,7 +88,21 @@ minisign_key_file="${MINISIGN_SECRET_KEY_FILE:-}"
 notary_profile="${NOTARY_PROFILE:-}"
 
 [[ -n "${tag}" ]] || { usage; fail "missing tag"; }
-[[ "${tag}" == v* ]] || fail "tag must start with v"
+case "${tag}" in
+  cli-v*)
+    binary="valv"
+    prefix="cli-v"
+    crate="valv-cli"
+    ;;
+  valvd-v*)
+    binary="valvd"
+    prefix="valvd-v"
+    crate="valvd"
+    ;;
+  *)
+    fail "tag must start with cli-v or valvd-v"
+    ;;
+esac
 [[ -n "${identity}" ]] || { usage; fail "missing Developer ID Application identity"; }
 [[ -n "${minisign_key_file}" ]] || { usage; fail "missing MINISIGN_SECRET_KEY_FILE"; }
 [[ -f "${minisign_key_file}" ]] || fail "MINISIGN_SECRET_KEY_FILE does not exist: ${minisign_key_file}"
@@ -101,21 +118,21 @@ need awk
 need mktemp
 [[ "${local_mode}" -eq 0 ]] || need cargo
 
-version="${tag#v}"
+version="${tag#"${prefix}"}"
 target="aarch64-apple-darwin"
-asset="valv-${version}-${target}.tar.gz"
+asset="${binary}-${version}-${target}.tar.gz"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 
 mkdir -p "${tmp_dir}/payload"
 
 if [[ "${local_mode}" -eq 1 ]]; then
-  echo "==> Building valv/valvd from the working tree (--local)"
-  ( cd "${oss_root}/crates" && cargo build --release -p valv-cli -p valvd --target "${target}" )
+  echo "==> Building ${binary} from the working tree (--local)"
+  ( cd "${oss_root}/crates" && cargo build --release -p "${crate}" --target "${target}" )
   build_dir="${oss_root}/crates/target/${target}/release"
-  [[ -f "${build_dir}/valv" && -f "${build_dir}/valvd" ]] ||
-    fail "cargo build did not produce valv and valvd in ${build_dir}"
-  cp "${build_dir}/valv" "${build_dir}/valvd" "${tmp_dir}/payload/"
+  [[ -f "${build_dir}/${binary}" ]] ||
+    fail "cargo build did not produce ${binary} in ${build_dir}"
+  cp "${build_dir}/${binary}" "${tmp_dir}/payload/"
 else
   gh release download "${tag}" \
     --repo "${repo}" \
@@ -131,29 +148,27 @@ else
     fail "checksum mismatch for ${asset}: expected ${expected}, got ${actual}"
 
   tar -xzf "${tmp_dir}/${asset}" -C "${tmp_dir}/payload"
-  [[ -f "${tmp_dir}/payload/valv" && -f "${tmp_dir}/payload/valvd" ]] ||
-    fail "${asset} did not contain valv and valvd"
+  [[ -f "${tmp_dir}/payload/${binary}" ]] ||
+    fail "${asset} did not contain ${binary}"
 fi
 
-codesign --force --sign "${identity}" --options runtime --timestamp "${tmp_dir}/payload/valv"
-codesign --force --sign "${identity}" --options runtime --timestamp "${tmp_dir}/payload/valvd"
-codesign -dv --verbose=4 "${tmp_dir}/payload/valv" >/dev/null
-codesign -dv --verbose=4 "${tmp_dir}/payload/valvd" >/dev/null
+codesign --force --sign "${identity}" --options runtime --timestamp "${tmp_dir}/payload/${binary}"
+codesign -dv --verbose=4 "${tmp_dir}/payload/${binary}" >/dev/null
 
-echo "==> Notarizing valv/valvd"
-notarize_zip="${tmp_dir}/valv-cli-notarize.zip"
+echo "==> Notarizing ${binary}"
+notarize_zip="${tmp_dir}/${binary}-notarize.zip"
 ditto -c -k --keepParent "${tmp_dir}/payload" "${notarize_zip}"
 xcrun notarytool submit "${notarize_zip}" \
   --keychain-profile "${notary_profile}" \
   --wait
 
-# Persist the signed binaries to a cargo-safe handoff dir so release-app.sh can embed
-# the exact same artifacts without a flaky GitHub CDN round-trip.
+# Persist the signed binary to a cargo-safe handoff dir so release-app.sh can embed
+# the exact same artifact without a flaky GitHub CDN round-trip.
 signed_dir="${oss_root}/crates/target/signed-cli"
 mkdir -p "${signed_dir}"
-cp "${tmp_dir}/payload/valv" "${tmp_dir}/payload/valvd" "${signed_dir}/"
+cp "${tmp_dir}/payload/${binary}" "${signed_dir}/"
 
-tar -C "${tmp_dir}/payload" -czf "${tmp_dir}/${asset}" valv valvd
+tar -C "${tmp_dir}/payload" -czf "${tmp_dir}/${asset}" "${binary}"
 digest="$(sha256_file "${tmp_dir}/${asset}")"
 
 if [[ "${local_mode}" -eq 1 ]]; then
