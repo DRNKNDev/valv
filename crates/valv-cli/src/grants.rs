@@ -1153,6 +1153,8 @@ mod tests {
                 current_version_id: None,
                 server_seq: 0,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
@@ -1380,6 +1382,8 @@ mod tests {
                     current_version_id: None,
                     server_seq: 1,
                     deleted_at: None,
+                    pushed_size_bytes: None,
+                    pushed_mtime_nanos: None,
                 },
             )
             .unwrap();
@@ -1645,6 +1649,8 @@ mod tests {
                 current_version_id: None,
                 server_seq: 0,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();

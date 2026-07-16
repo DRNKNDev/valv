@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     fs,
     io::IsTerminal,
+    path::Path,
     process::{Command as ProcessCommand, Stdio},
     time::{Duration, Instant},
 };
@@ -334,18 +335,23 @@ async fn fetch_daemon_status() -> Result<DaemonStatus> {
     parse_daemon_json::<DaemonStatus>(response).await
 }
 
+fn build_mount_request(args: &MountArgs) -> Result<MountRequest> {
+    Ok(MountRequest {
+        path: canonical_path(&args.path)?,
+        folder_id: args.folder.clone(),
+        grant_token: args.key.clone(),
+    })
+}
+
 async fn cmd_mount(args: MountArgs, json: bool) -> Result<()> {
     refuse_if_access_key_cannot_mount(&args).await?;
     let spinner = request_spinner("Mounting…", json);
     let mounted = async {
+        let request = build_mount_request(&args)?;
         let response = daemon_client()
             .context("failed to create daemon client for mount")?
             .post("http://localhost/mount")
-            .json(&MountRequest {
-                path: args.path.clone(),
-                folder_id: args.folder.clone(),
-                grant_token: args.key.clone(),
-            })
+            .json(&request)
             .send()
             .await
             .map_err(|error| daemon_request_error("mount", error))?;
@@ -547,7 +553,7 @@ async fn cmd_restore(path: String, version_id: String, json: bool) -> Result<()>
 }
 
 fn conflict_copy_message(local_path: &str) -> String {
-    let parent = std::path::Path::new(local_path)
+    let parent = Path::new(local_path)
         .parent()
         .map(|parent| parent.display().to_string())
         .unwrap_or_else(|| local_path.to_owned());
@@ -561,10 +567,12 @@ fn superseded_message(local_path: &str) -> String {
 }
 
 fn canonical_path(path: &str) -> Result<String> {
-    Ok(fs::canonicalize(path)
-        .with_context(|| format!("failed to resolve {path}"))?
-        .to_string_lossy()
-        .into_owned())
+    if let Ok(resolved) = fs::canonicalize(path) {
+        return Ok(resolved.to_string_lossy().into_owned());
+    }
+    std::path::absolute(path)
+        .map(|absolute| absolute.to_string_lossy().into_owned())
+        .with_context(|| format!("failed to resolve {path}"))
 }
 
 async fn cmd_status(json: bool) -> Result<()> {
@@ -776,6 +784,9 @@ fn mount_sync_state(mount: &MountStatus) -> String {
     }
     if mount.error.is_some() {
         return "error".into();
+    }
+    if !mount.watcher_alive {
+        return "watcher down".into();
     }
     if mount.syncing {
         return "syncing".into();
@@ -1211,6 +1222,7 @@ mod tests {
                 last_synced_at: None,
                 update_required: false,
                 error: None,
+                watcher_alive: true,
             }],
             account: None,
             latest_version: None,
@@ -1583,6 +1595,20 @@ mod tests {
             last_synced_at: None,
             update_required,
             error: error.map(str::to_owned),
+            watcher_alive: true,
+        }
+    }
+
+    fn mount_status_with_watcher(
+        error: Option<&str>,
+        update_required: bool,
+        syncing: bool,
+        watcher_alive: bool,
+    ) -> MountStatus {
+        MountStatus {
+            syncing,
+            watcher_alive,
+            ..mount_status_with("Design", error, update_required, 0)
         }
     }
 
@@ -1603,6 +1629,51 @@ mod tests {
         assert_eq!(
             mount_sync_state(&mount_status_with("Design", None, true, 0)),
             "update required"
+        );
+    }
+
+    #[test]
+    fn mount_sync_state_reports_watcher_down_when_nothing_else_applies() {
+        assert_eq!(
+            mount_sync_state(&mount_status_with_watcher(None, false, false, false)),
+            "watcher down"
+        );
+    }
+
+    #[test]
+    fn mount_sync_state_watcher_down_outranks_syncing() {
+        assert_eq!(
+            mount_sync_state(&mount_status_with_watcher(None, false, true, false)),
+            "watcher down"
+        );
+    }
+
+    #[test]
+    fn mount_sync_state_error_outranks_watcher_down() {
+        assert_eq!(
+            mount_sync_state(&mount_status_with_watcher(
+                Some("quota exceeded"),
+                false,
+                false,
+                false
+            )),
+            "error"
+        );
+    }
+
+    #[test]
+    fn mount_sync_state_update_required_outranks_watcher_down() {
+        assert_eq!(
+            mount_sync_state(&mount_status_with_watcher(None, true, false, false)),
+            "update required"
+        );
+    }
+
+    #[test]
+    fn mount_sync_state_stays_syncing_when_watcher_is_alive() {
+        assert_eq!(
+            mount_sync_state(&mount_status_with_watcher(None, false, true, true)),
+            "syncing"
         );
     }
 
@@ -2076,6 +2147,50 @@ mod tests {
             mount_success_message(false, "Sync Docs", "/home/alice/Documents/Sync"),
             "Attached \"Sync Docs\" at /home/alice/Documents/Sync."
         );
+    }
+
+    #[test]
+    fn build_mount_request_absolutizes_a_relative_new_path_before_it_reaches_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = fs::canonicalize(dir.path()).unwrap();
+        let _guard = crate::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir_path).unwrap();
+
+        let request = build_mount_request(&MountArgs {
+            path: "./Design".into(),
+            folder: None,
+            key: None,
+            new: true,
+        });
+
+        std::env::set_current_dir(previous_dir).unwrap();
+
+        let request = request.unwrap();
+        assert_eq!(
+            request.path,
+            dir_path.join("Design").to_string_lossy().into_owned()
+        );
+        assert!(
+            Path::new(&request.path).is_absolute(),
+            "a relative --new path must still resolve to an absolute path: {}",
+            request.path
+        );
+    }
+
+    #[test]
+    fn build_mount_request_passes_through_an_already_absolute_path_unchanged() {
+        let request = build_mount_request(&MountArgs {
+            path: "/Users/alice/Design".into(),
+            folder: None,
+            key: None,
+            new: true,
+        })
+        .unwrap();
+
+        assert_eq!(request.path, "/Users/alice/Design");
     }
 
     #[tokio::test]
