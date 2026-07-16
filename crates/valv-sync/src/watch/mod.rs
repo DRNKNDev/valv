@@ -11,11 +11,13 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Local;
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    event::ModifyKind, Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use reqwest::header::{HeaderName, HeaderValue};
 use rusqlite::Connection;
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Mutex, Notify},
     time::sleep,
 };
 use uuid::Uuid;
@@ -29,8 +31,8 @@ use crate::{
     },
     protocol::http::{BatchOperation, BatchRequest, BatchRequestObject, BatchResponse},
     protocol::sync::{
-        manifest_content_hash, ChunkRef, CreatePayload, DeletePayload, MovePayload,
-        NewVersionPayload, NodeType, RenamePayload, SubmitOpRequest, SubmitOpResponse,
+        manifest_content_hash, ChunkRef, CreatePayload, NewVersionPayload, NodeType,
+        SubmitOpRequest, SubmitOpResponse,
     },
     sync_engine::op_submit::{apply_submitted_new_version, materialize_conflict_copy, submit_op},
 };
@@ -39,8 +41,37 @@ use crate::{
 pub enum FsEvent {
     Create(PathBuf),
     Modify(PathBuf),
-    Delete(PathBuf),
-    Rename { from: PathBuf, to: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchSignal {
+    Event(FsEvent),
+    Dirty,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DirtySignal {
+    dirty: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl DirtySignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark(&self) {
+        self.dirty.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    pub async fn notified(&self) {
+        self.notify.notified().await;
+    }
+
+    pub fn take(&self) -> bool {
+        self.dirty.swap(false, Ordering::AcqRel)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +80,7 @@ pub struct WatchMount {
     pub folder_id: String,
     pub device_name: String,
     pub update_required: Arc<AtomicBool>,
+    pub needs_reconcile: DirtySignal,
 }
 
 pub async fn fs_watch_task(
@@ -61,7 +93,15 @@ pub async fn fs_watch_task(
     token: String,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(256);
-    let _watcher = watch_mount(&mount.path, tx, paused.clone(), fs_events_paused.clone())?;
+    let suppressed_during_pause = Arc::new(AtomicBool::new(false));
+    let _watcher = watch_mount(
+        &mount.path,
+        tx,
+        paused.clone(),
+        fs_events_paused.clone(),
+        mount.needs_reconcile.clone(),
+        suppressed_during_pause.clone(),
+    )?;
     let mut dropped_paused_events = false;
 
     loop {
@@ -82,6 +122,9 @@ pub async fn fs_watch_task(
             sleep(Duration::from_millis(150)).await;
             drain_pending_events(&mut rx);
             dropped_paused_events = false;
+            if suppressed_during_pause.swap(false, Ordering::AcqRel) {
+                mount.needs_reconcile.mark();
+            }
             continue;
         }
 
@@ -94,8 +137,19 @@ pub async fn fs_watch_task(
             continue;
         }
 
-        if !handle_fs_events(&mount, &db, &client, &backend_url, &token, events).await? {
-            drain_pending_events(&mut rx);
+        match handle_fs_events(&mount, &db, &client, &backend_url, &token, events).await {
+            Ok(true) => {}
+            Ok(false) => {
+                drain_pending_events(&mut rx);
+            }
+            Err(error) => {
+                eprintln!(
+                    "watcher: transient error processing fs events for folder {} - marking mount dirty: {error:#}",
+                    mount.folder_id
+                );
+                mount.needs_reconcile.mark();
+                drain_pending_events(&mut rx);
+            }
         }
     }
 
@@ -111,18 +165,33 @@ pub fn watch_mount(
     tx: mpsc::Sender<FsEvent>,
     paused: Arc<AtomicBool>,
     fs_events_paused: Arc<AtomicBool>,
+    needs_reconcile: DirtySignal,
+    suppressed_during_pause: Arc<AtomicBool>,
 ) -> Result<RecommendedWatcher> {
     let sender = tx.clone();
     let mut watcher = RecommendedWatcher::new(
         move |result: notify::Result<Event>| {
-            if paused.load(Ordering::Acquire) || fs_events_paused.load(Ordering::Acquire) {
-                return;
-            }
             let Ok(event) = result else {
                 return;
             };
-            if let Some(fs_event) = map_notify_event(event) {
-                let _ = sender.blocking_send(fs_event);
+            let user_paused = paused.load(Ordering::Acquire);
+            let materializing = fs_events_paused.load(Ordering::Acquire);
+            let signal = map_notify_event(event);
+            if user_paused || materializing {
+                if should_mark_suppressed_during_pause(user_paused, materializing, signal.as_ref())
+                {
+                    suppressed_during_pause.store(true, Ordering::Release);
+                }
+                return;
+            }
+            match signal {
+                Some(WatchSignal::Event(fs_event)) => {
+                    let _ = sender.blocking_send(fs_event);
+                }
+                Some(WatchSignal::Dirty) => {
+                    needs_reconcile.mark();
+                }
+                None => {}
             }
         },
         Config::default(),
@@ -145,11 +214,9 @@ pub async fn debounce_next_batch(rx: &mut mpsc::Receiver<FsEvent>) -> Option<Vec
 
 pub fn collapse_events(events: Vec<FsEvent>) -> Vec<FsEvent> {
     let mut collapsed = HashMap::<PathBuf, FsEvent>::new();
-    let mut renames = Vec::new();
 
     for event in events {
         match event {
-            FsEvent::Rename { from, to } => renames.push(FsEvent::Rename { from, to }),
             FsEvent::Create(path) => {
                 collapsed.insert(path.clone(), FsEvent::Create(path));
             }
@@ -159,18 +226,13 @@ pub fn collapse_events(events: Vec<FsEvent>) -> Vec<FsEvent> {
                     collapsed.insert(path.clone(), FsEvent::Modify(path));
                 }
             },
-            FsEvent::Delete(path) => {
-                collapsed.insert(path.clone(), FsEvent::Delete(path));
-            }
         }
     }
 
     let mut output = collapsed.into_values().collect::<Vec<_>>();
     output.sort_by_key(|event| match event {
-        FsEvent::Create(p) | FsEvent::Modify(p) | FsEvent::Delete(p) => p.components().count(),
-        FsEvent::Rename { from, .. } => from.components().count(),
+        FsEvent::Create(p) | FsEvent::Modify(p) => p.components().count(),
     });
-    output.extend(renames);
     output
 }
 
@@ -240,10 +302,6 @@ async fn handle_fs_event(
     match event {
         FsEvent::Create(path) => handle_create(mount, db, client, backend_url, token, &path).await,
         FsEvent::Modify(path) => handle_modify(mount, db, client, backend_url, token, &path).await,
-        FsEvent::Delete(path) => handle_delete(mount, db, client, backend_url, token, &path).await,
-        FsEvent::Rename { from, to } => {
-            handle_rename(mount, db, client, backend_url, token, &from, &to).await
-        }
     }
 }
 
@@ -339,6 +397,8 @@ async fn handle_create(
                         current_version_id: None,
                         server_seq,
                         deleted_at: None,
+                        pushed_size_bytes: None,
+                        pushed_mtime_nanos: None,
                     },
                 )?;
             }
@@ -414,6 +474,7 @@ async fn upload_file_new_version(
     based_on_seq: i64,
     path: &Path,
 ) -> Result<()> {
+    let mtime_nanos = read_time_mtime_nanos(path);
     let chunks = chunk_file(path)?;
     let size_bytes = chunks.iter().map(|chunk| chunk.length).sum();
     let manifest = chunks
@@ -472,12 +533,23 @@ async fn upload_file_new_version(
     {
         let conn = db.lock().await;
         apply_submitted_new_version(&conn, &mount.folder_id, node_id, &req, &response)?;
+        if let (SubmitOpResponse::Applied { .. }, Some(mtime_nanos)) = (&response, mtime_nanos) {
+            nodes::update_pushed_cache(&conn, node_id, size_bytes, mtime_nanos)?;
+        }
     }
     if matches!(response, SubmitOpResponse::ConflictCopy { .. }) {
         let date = Local::now().date_naive().to_string();
         materialize_conflict_copy(path, &mount.device_name, &date)?;
     }
     Ok(())
+}
+
+fn read_time_mtime_nanos(path: &Path) -> Option<i64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    Some(match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos() as i64,
+        Err(error) => -(error.duration().as_nanos() as i64),
+    })
 }
 
 async fn upload_pending_chunks(
@@ -536,130 +608,6 @@ fn is_conflict_copy_name(name: &str) -> bool {
     name.contains(" (conflicted copy, ")
 }
 
-async fn handle_delete(
-    mount: &WatchMount,
-    db: &Arc<Mutex<Connection>>,
-    client: &reqwest::Client,
-    backend_url: &str,
-    token: &str,
-    path: &Path,
-) -> Result<()> {
-    // notify's single-path `ModifyKind::Name` events are ambiguous: the OS uses
-    // them both for genuine out-of-tree moves (e.g. Finder "Move to Trash") and,
-    // on some platforms, for one half of an in-tree rename delivered as two
-    // separate single-path events instead of one two-path event. In the latter
-    // case the path is still present on disk, so trust the filesystem over the
-    // event classification before treating this as a real delete.
-    if path.exists() {
-        return Ok(());
-    }
-    let (req, node_id) = {
-        let conn = db.lock().await;
-        let Some(node) = resolve_abs_path(&conn, &mount.path, &mount.folder_id, path)? else {
-            eprintln!(
-                "watcher: skipping delete for {} - node not in local mirror (folder: {})",
-                path.display(),
-                mount.folder_id
-            );
-            return Ok(());
-        };
-        if node.parent_id.is_none() {
-            return Ok(());
-        }
-        (
-            SubmitOpRequest::Delete {
-                node_id: node.node_id.clone(),
-                based_on_seq: node.server_seq,
-                payload: DeletePayload {},
-            },
-            node.node_id,
-        )
-    };
-    match submit_op(client, backend_url, token, &mount.folder_id, &req).await? {
-        SubmitOpResponse::Applied { server_seq, .. } => {
-            let conn = db.lock().await;
-            nodes::mark_deleted(&conn, &node_id, server_seq)?;
-        }
-        SubmitOpResponse::Superseded { .. }
-        | SubmitOpResponse::ConflictCopy { .. }
-        | SubmitOpResponse::Conflict { .. } => {}
-    }
-    Ok(())
-}
-
-async fn handle_rename(
-    mount: &WatchMount,
-    db: &Arc<Mutex<Connection>>,
-    client: &reqwest::Client,
-    backend_url: &str,
-    token: &str,
-    from: &Path,
-    to: &Path,
-) -> Result<()> {
-    let (req, updated_node) = {
-        let conn = db.lock().await;
-        let Some(from_node) = resolve_abs_path(&conn, &mount.path, &mount.folder_id, from)? else {
-            eprintln!(
-                "watcher: skipping rename from {} - node not in local mirror (folder: {})",
-                from.display(),
-                mount.folder_id
-            );
-            return Ok(());
-        };
-        let Some(to_parent) = resolve_parent_for_path(&conn, &mount.path, &mount.folder_id, to)?
-        else {
-            eprintln!(
-                "watcher: skipping rename to {} - parent not in local mirror (folder: {})",
-                to.display(),
-                mount.folder_id
-            );
-            return Ok(());
-        };
-        let Some(from_parent_id) = from_node.parent_id.clone() else {
-            return Ok(());
-        };
-        let to_name = file_name(to)?;
-        let node_id = from_node.node_id.clone();
-        let to_parent_id = to_parent.node_id.clone();
-
-        let req = if from_parent_id == to_parent.node_id {
-            SubmitOpRequest::Rename {
-                node_id,
-                based_on_seq: from_node.server_seq,
-                payload: RenamePayload {
-                    new_name: to_name.clone(),
-                },
-            }
-        } else {
-            SubmitOpRequest::Move {
-                node_id,
-                based_on_seq: from_node.server_seq,
-                payload: MovePayload {
-                    new_parent_id: to_parent_id.clone(),
-                },
-            }
-        };
-        let mut updated_node = from_node;
-        updated_node.parent_id = Some(to_parent_id);
-        updated_node.name = to_name;
-        (req, updated_node)
-    };
-
-    if let SubmitOpResponse::Applied { server_seq, .. } =
-        submit_op(client, backend_url, token, &mount.folder_id, &req).await?
-    {
-        let conn = db.lock().await;
-        nodes::upsert_node(
-            &conn,
-            &LocalNode {
-                server_seq,
-                ..updated_node
-            },
-        )?;
-    }
-    Ok(())
-}
-
 fn file_name(path: &Path) -> Result<String> {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -674,23 +622,33 @@ fn node_type_str(node_type: &NodeType) -> &'static str {
     }
 }
 
-fn map_notify_event(event: Event) -> Option<FsEvent> {
+fn map_notify_event(event: Event) -> Option<WatchSignal> {
     match event.kind {
-        EventKind::Create(_) => event.paths.into_iter().next().map(FsEvent::Create),
-        EventKind::Modify(notify::event::ModifyKind::Name(_)) if event.paths.len() >= 2 => {
-            Some(FsEvent::Rename {
-                from: event.paths[0].clone(),
-                to: event.paths[1].clone(),
-            })
-        }
-        // 1-path rename: file moved out of the watch tree (e.g. Finder Move to Trash)
-        EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
-            event.paths.into_iter().next().map(FsEvent::Delete)
-        }
-        EventKind::Modify(_) => event.paths.into_iter().next().map(FsEvent::Modify),
-        EventKind::Remove(_) => event.paths.into_iter().next().map(FsEvent::Delete),
+        EventKind::Create(_) => event
+            .paths
+            .into_iter()
+            .next()
+            .map(|path| WatchSignal::Event(FsEvent::Create(path))),
+        EventKind::Modify(ModifyKind::Data(_)) => event
+            .paths
+            .into_iter()
+            .next()
+            .map(|path| WatchSignal::Event(FsEvent::Modify(path))),
+        EventKind::Modify(ModifyKind::Name(_)) => Some(WatchSignal::Dirty),
+        EventKind::Modify(ModifyKind::Metadata(_)) => None,
+        EventKind::Modify(_) => Some(WatchSignal::Dirty),
+        EventKind::Remove(_) => Some(WatchSignal::Dirty),
+        EventKind::Other if event.need_rescan() => Some(WatchSignal::Dirty),
         _ => None,
     }
+}
+
+fn should_mark_suppressed_during_pause(
+    user_paused: bool,
+    materializing: bool,
+    mapped: Option<&WatchSignal>,
+) -> bool {
+    user_paused && !materializing && mapped.is_some()
 }
 
 #[cfg(test)]
@@ -732,47 +690,119 @@ mod tests {
     }
 
     #[test]
-    fn collapse_delete_after_create_yields_delete() {
-        let path = PathBuf::from("/sync/report.md");
-        let events = vec![FsEvent::Create(path.clone()), FsEvent::Delete(path.clone())];
-
-        assert_eq!(collapse_events(events), vec![FsEvent::Delete(path)]);
-    }
-
-    #[test]
-    fn map_notify_event_one_path_name_change_maps_to_delete() {
+    fn map_notify_event_create_maps_to_fast_path() {
         let path = PathBuf::from("/sync/file.txt");
-        let event = Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
-            notify::event::RenameMode::Any,
-        )))
-        .add_path(path.clone());
-
-        assert_eq!(map_notify_event(event), Some(FsEvent::Delete(path)));
-    }
-
-    #[test]
-    fn map_notify_event_two_path_name_change_maps_to_rename() {
-        let src = PathBuf::from("/sync/file.txt");
-        let dst = PathBuf::from("/sync/renamed.txt");
-        let event = Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
-            notify::event::RenameMode::Any,
-        )))
-        .add_path(src.clone())
-        .add_path(dst.clone());
+        let event = Event::new(EventKind::Create(notify::event::CreateKind::File))
+            .add_path(path.clone());
 
         assert_eq!(
             map_notify_event(event),
-            Some(FsEvent::Rename { from: src, to: dst })
+            Some(WatchSignal::Event(FsEvent::Create(path)))
         );
     }
 
     #[test]
-    fn map_notify_event_remove_event_maps_to_delete() {
+    fn map_notify_event_data_modify_maps_to_fast_path() {
+        let path = PathBuf::from("/sync/file.txt");
+        let event = Event::new(EventKind::Modify(ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )))
+        .add_path(path.clone());
+
+        assert_eq!(
+            map_notify_event(event),
+            Some(WatchSignal::Event(FsEvent::Modify(path)))
+        );
+    }
+
+    #[test]
+    fn map_notify_event_one_path_name_change_signals_dirty() {
+        let path = PathBuf::from("/sync/file.txt");
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::Any,
+        )))
+        .add_path(path);
+
+        assert_eq!(map_notify_event(event), Some(WatchSignal::Dirty));
+    }
+
+    #[test]
+    fn map_notify_event_two_path_name_change_signals_dirty() {
+        let src = PathBuf::from("/sync/file.txt");
+        let dst = PathBuf::from("/sync/renamed.txt");
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::Any,
+        )))
+        .add_path(src)
+        .add_path(dst);
+
+        assert_eq!(map_notify_event(event), Some(WatchSignal::Dirty));
+    }
+
+    #[test]
+    fn map_notify_event_metadata_modify_is_ignored() {
+        let path = PathBuf::from("/sync/file.txt");
+        let event = Event::new(EventKind::Modify(ModifyKind::Metadata(
+            notify::event::MetadataKind::Any,
+        )))
+        .add_path(path);
+
+        assert_eq!(map_notify_event(event), None);
+    }
+
+    #[test]
+    fn map_notify_event_remove_event_signals_dirty() {
         let path = PathBuf::from("/sync/file.txt");
         let event =
-            Event::new(EventKind::Remove(notify::event::RemoveKind::File)).add_path(path.clone());
+            Event::new(EventKind::Remove(notify::event::RemoveKind::File)).add_path(path);
 
-        assert_eq!(map_notify_event(event), Some(FsEvent::Delete(path)));
+        assert_eq!(map_notify_event(event), Some(WatchSignal::Dirty));
+    }
+
+    #[test]
+    fn map_notify_event_rescan_flag_signals_dirty() {
+        let event = Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+
+        assert_eq!(map_notify_event(event), Some(WatchSignal::Dirty));
+    }
+
+    #[test]
+    fn map_notify_event_unrecognized_kind_is_ignored() {
+        let path = PathBuf::from("/sync/file.txt");
+        let event = Event::new(EventKind::Access(notify::event::AccessKind::Any)).add_path(path);
+
+        assert_eq!(map_notify_event(event), None);
+    }
+
+    #[test]
+    fn suppressed_during_pause_only_for_genuine_user_pause_events() {
+        let mapped = Some(WatchSignal::Dirty);
+        assert!(should_mark_suppressed_during_pause(
+            true,
+            false,
+            mapped.as_ref()
+        ));
+        assert!(!should_mark_suppressed_during_pause(
+            true,
+            true,
+            mapped.as_ref()
+        ));
+        assert!(!should_mark_suppressed_during_pause(
+            false,
+            true,
+            mapped.as_ref()
+        ));
+        assert!(!should_mark_suppressed_during_pause(true, false, None));
+    }
+
+    #[test]
+    fn dirty_signal_mark_and_take_round_trips_once() {
+        let signal = DirtySignal::new();
+        assert!(!signal.take());
+
+        signal.mark();
+        assert!(signal.take());
+        assert!(!signal.take());
     }
 
     #[tokio::test]
@@ -828,6 +858,8 @@ mod tests {
                 current_version_id: None,
                 server_seq: 1,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
@@ -842,6 +874,8 @@ mod tests {
                 current_version_id: None,
                 server_seq: 2,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
@@ -856,6 +890,8 @@ mod tests {
                 current_version_id: None,
                 server_seq: 3,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
@@ -1063,137 +1099,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_delete_applied_response_marks_local_node_deleted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("delete-me.txt");
-        fs::write(&path, b"").unwrap();
-        let db = seeded_db();
-        seed_file(&db, "file-node", "delete-me.txt", 4).await;
-        fs::remove_file(&path).unwrap();
-        let (backend_url, server) = submit_op_server(vec![SubmitOpResponse::Applied {
-            node_id: "file-node".into(),
-            server_seq: 7,
-        }])
-        .await;
-
-        handle_delete(
-            &watch_mount(dir.path()),
-            &db,
-            &reqwest::Client::new(),
-            &backend_url,
-            "token",
-            &path,
-        )
-        .await
-        .unwrap();
-        let requests = timeout(Duration::from_secs(1), server)
-            .await
-            .unwrap()
-            .unwrap();
-        let conn = db.lock().await;
-        let node = get_node(&conn, "file-node").unwrap().unwrap();
-
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["op_type"], "delete");
-        assert_eq!(node.server_seq, 7);
-        assert!(node.deleted_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn handle_delete_superseded_response_leaves_local_node_live() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("delete-me.txt");
-        fs::write(&path, b"").unwrap();
-        let db = seeded_db();
-        seed_file(&db, "file-node", "delete-me.txt", 4).await;
-        fs::remove_file(&path).unwrap();
-        let (backend_url, server) =
-            submit_op_server(vec![SubmitOpResponse::Superseded { current_seq: 99 }]).await;
-
-        handle_delete(
-            &watch_mount(dir.path()),
-            &db,
-            &reqwest::Client::new(),
-            &backend_url,
-            "token",
-            &path,
-        )
-        .await
-        .unwrap();
-        timeout(Duration::from_secs(1), server)
-            .await
-            .unwrap()
-            .unwrap();
-        let conn = db.lock().await;
-        let node = get_node(&conn, "file-node").unwrap().unwrap();
-
-        assert_eq!(node.server_seq, 4);
-        assert!(node.deleted_at.is_none());
-    }
-
-    #[tokio::test]
-    async fn delete_then_later_create_same_path_submits_fresh_create() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("recreated.txt");
-        fs::write(&path, b"").unwrap();
-        let db = seeded_db();
-        seed_file(&db, "old-node", "recreated.txt", 4).await;
-        fs::remove_file(&path).unwrap();
-        let (backend_url, server) = submit_op_server(vec![SubmitOpResponse::Applied {
-            node_id: "old-node".into(),
-            server_seq: 7,
-        }])
-        .await;
-        let mount = watch_mount(dir.path());
-        let client = reqwest::Client::new();
-
-        handle_delete(&mount, &db, &client, &backend_url, "token", &path)
-            .await
-            .unwrap();
-        timeout(Duration::from_secs(1), server)
-            .await
-            .unwrap()
-            .unwrap();
-        {
-            let conn = db.lock().await;
-            let old = get_node(&conn, "old-node").unwrap().unwrap();
-            assert!(old.deleted_at.is_some());
-            assert!(resolve_abs_path(&conn, dir.path(), "folder-1", &path)
-                .unwrap()
-                .is_none());
-        }
-
-        fs::write(&path, b"").unwrap();
-        let (backend_url, server) = submit_op_server(vec![
-            SubmitOpResponse::Applied {
-                node_id: "new-node".into(),
-                server_seq: 8,
-            },
-            SubmitOpResponse::Applied {
-                node_id: "new-version".into(),
-                server_seq: 9,
-            },
-        ])
-        .await;
-        handle_create(&mount, &db, &client, &backend_url, "token", &path)
-            .await
-            .unwrap();
-        let requests = timeout(Duration::from_secs(1), server)
-            .await
-            .unwrap()
-            .unwrap();
-        let conn = db.lock().await;
-        let old = get_node(&conn, "old-node").unwrap().unwrap();
-        let new = get_node(&conn, "new-node").unwrap().unwrap();
-
-        assert_eq!(requests[0]["op_type"], "create");
-        assert_eq!(requests[0]["payload"]["name"], "recreated.txt");
-        assert!(old.deleted_at.is_some());
-        assert_eq!(new.parent_id.as_deref(), Some("root-node"));
-        assert_eq!(new.name, "recreated.txt");
-    }
-
-    #[tokio::test]
     async fn update_required_submit_response_halts_watcher_submissions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.txt");
@@ -1254,28 +1159,12 @@ mod tests {
                 current_version_id: None,
                 server_seq: 1,
                 deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
             },
         )
         .unwrap();
         Arc::new(Mutex::new(conn))
-    }
-
-    async fn seed_file(db: &Arc<Mutex<Connection>>, node_id: &str, name: &str, server_seq: i64) {
-        let conn = db.lock().await;
-        upsert_node(
-            &conn,
-            &LocalNode {
-                node_id: node_id.into(),
-                folder_id: "folder-1".into(),
-                parent_id: Some("root-node".into()),
-                name: name.into(),
-                node_type: "file".into(),
-                current_version_id: None,
-                server_seq,
-                deleted_at: None,
-            },
-        )
-        .unwrap();
     }
 
     fn watch_mount(path: &Path) -> WatchMount {
@@ -1284,6 +1173,7 @@ mod tests {
             folder_id: "folder-1".into(),
             device_name: "Test Device".into(),
             update_required: Arc::new(AtomicBool::new(false)),
+            needs_reconcile: DirtySignal::new(),
         }
     }
 
