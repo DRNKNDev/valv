@@ -1,15 +1,18 @@
 # Release runbook:
-# 1. Bump crates/valv-cli/Cargo.toml and crates/valvd/Cargo.toml to the same semver.
+# 1. Bump crates/valv-cli/Cargo.toml (for cli-v*) or crates/valvd/Cargo.toml (for valvd-v*)
+#    to the new semver. macos-v* is not built by this workflow; see oss/macos/scripts/release-app.sh.
 # 2. From the private repo, run tooling/mirror/pull.sh, then tooling/mirror/push.sh.
-# 3. Tag v<semver> on the public remote after the mirror push; never tag the private repo
-#    for public releases, because this workflow only publishes from DRNKNDev/valv.
+# 3. Tag cli-v<semver> or valvd-v<semver> on the public remote after the mirror push; never tag the
+#    private repo for public releases, because this workflow only publishes from DRNKNDev/valv.
 
 name: Release
 
 on:
   push:
     tags:
-      - "v*"
+      - "cli-v*"
+      - "valvd-v*"
+      - "macos-v*"
 
 permissions:
   contents: write
@@ -22,6 +25,7 @@ jobs:
         working-directory: crates
     outputs:
       version: ${{ steps.guard.outputs.version }}
+      component: ${{ steps.guard.outputs.component }}
     steps:
       - uses: actions/checkout@v4
       - id: guard
@@ -29,23 +33,34 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Release tags must use v<semver>; got ${tag}" >&2
+          semver='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?'
+          if [[ "${tag}" =~ ^cli-v(${semver})$ ]]; then
+            component="valv"
+            crate_path="valv-cli/Cargo.toml"
+          elif [[ "${tag}" =~ ^valvd-v(${semver})$ ]]; then
+            component="valvd"
+            crate_path="valvd/Cargo.toml"
+          elif [[ "${tag}" =~ ^macos-v(${semver})$ ]]; then
+            component="macos"
+            crate_path=""
+          else
+            echo "Release tags must use cli-v<semver>, valvd-v<semver>, or macos-v<semver>; got ${tag}" >&2
             exit 1
           fi
-          version="${tag#v}"
-          cli_version="$(awk -F '"' '/^version = / { print $2; exit }' valv-cli/Cargo.toml)"
-          daemon_version="$(awk -F '"' '/^version = / { print $2; exit }' valvd/Cargo.toml)"
-          if [[ "${cli_version}" != "${version}" || "${daemon_version}" != "${version}" ]]; then
-            echo "Tag ${tag} does not match Cargo.toml versions:" >&2
-            echo "valv-cli=${cli_version}" >&2
-            echo "valvd=${daemon_version}" >&2
-            exit 1
+          version="${BASH_REMATCH[1]}"
+          if [[ -n "${crate_path}" ]]; then
+            crate_version="$(awk -F '"' '/^version = / { print $2; exit }' "${crate_path}")"
+            if [[ "${crate_version}" != "${version}" ]]; then
+              echo "Tag ${tag} does not match ${crate_path}'s version (${crate_version})" >&2
+              exit 1
+            fi
           fi
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "component=${component}" >> "${GITHUB_OUTPUT}"
 
   build:
     needs: version
+    if: needs.version.outputs.component != 'macos'
     strategy:
       fail-fast: true
       matrix:
@@ -63,26 +78,41 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo build --release -p valv-cli -p valvd --target ${{ matrix.target }}
-      - name: Package binaries
+      - name: Build
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "${{ needs.version.outputs.component }}" == "valv" ]]; then
+            cargo build --release -p valv-cli --target ${{ matrix.target }}
+          else
+            cargo build --release -p valvd --target ${{ matrix.target }}
+          fi
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          component="${{ needs.version.outputs.component }}"
           version="${{ needs.version.outputs.version }}"
           target="${{ matrix.target }}"
-          asset="valv-${version}-${target}.tar.gz"
+          if [[ "${component}" == "valv" ]]; then
+            binary="valv"
+          else
+            binary="valvd"
+          fi
+          asset="${component}-${version}-${target}.tar.gz"
           mkdir -p ../dist
-          tar -C "target/${target}/release" -czf "../dist/${asset}" valv valvd
+          tar -C "target/${target}/release" -czf "../dist/${asset}" "${binary}"
       - uses: actions/upload-artifact@v4
         with:
-          name: valv-${{ needs.version.outputs.version }}-${{ matrix.target }}
-          path: dist/valv-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz
+          name: ${{ needs.version.outputs.component }}-${{ needs.version.outputs.version }}-${{ matrix.target }}
+          path: dist/${{ needs.version.outputs.component }}-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
   publish:
     needs:
       - version
       - build
+    if: needs.version.outputs.component != 'macos'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -94,7 +124,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum valv-${{ needs.version.outputs.version }}-*.tar.gz > SHA256SUMS
+          sha256sum ${{ needs.version.outputs.component }}-${{ needs.version.outputs.version }}-*.tar.gz > SHA256SUMS
       - name: Install minisign
         run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Sign checksum manifest
@@ -111,13 +141,13 @@ jobs:
           trap 'rm -f "${key_file}"' EXIT
           printf '%s\n' "${MINISIGN_SECRET_KEY}" > "${key_file}"
           minisign -S -s "${key_file}" -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig \
-            -t "valv release ${{ github.ref_name }}"
+            -t "${{ needs.version.outputs.component }} release ${{ github.ref_name }}"
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           files: |
-            dist/valv-${{ needs.version.outputs.version }}-aarch64-apple-darwin.tar.gz
-            dist/valv-${{ needs.version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            dist/${{ needs.version.outputs.component }}-${{ needs.version.outputs.version }}-aarch64-apple-darwin.tar.gz
+            dist/${{ needs.version.outputs.component }}-${{ needs.version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
             dist/SHA256SUMS
             dist/SHA256SUMS.minisig
