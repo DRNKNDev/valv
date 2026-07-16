@@ -108,6 +108,7 @@ struct ValvApp: App {
         case .notSetUp: return "externaldrive.badge.questionmark"
         case .error: return "externaldrive.badge.exclamationmark"
         case .paused: return "externaldrive.badge.minus"
+        case .attention: return "externaldrive.trianglebadge.exclamationmark"
         case .syncing: return "externaldrive.badge.icloud"
         case .synced: return "externaldrive"
         }

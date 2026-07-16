@@ -194,6 +194,7 @@ struct MenuBarContentView: View {
         case .notSetUp: return "Not connected"
         case .error: return "Sync error"
         case .paused: return "Paused"
+        case .attention: return "Watcher offline"
         case .syncing: return "Syncing..."
         case .synced: return "Up to date"
         }
@@ -204,6 +205,7 @@ struct MenuBarContentView: View {
         case .notSetUp: return .gray
         case .error: return .red
         case .paused: return .yellow
+        case .attention: return .orange
         case .syncing: return .blue
         case .synced: return .green
         }

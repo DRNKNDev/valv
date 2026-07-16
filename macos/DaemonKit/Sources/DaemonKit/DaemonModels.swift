@@ -19,6 +19,7 @@ public struct MountStatus: Codable, Hashable, Sendable {
     public let lastSyncedAt: String?
     public let updateRequired: Bool
     public let error: String?
+    public let watcherAlive: Bool
 
     enum CodingKeys: String, CodingKey {
         case path
@@ -32,6 +33,24 @@ public struct MountStatus: Codable, Hashable, Sendable {
         case lastSyncedAt = "last_synced_at"
         case updateRequired = "update_required"
         case error
+        case watcherAlive = "watcher_alive"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        path = try container.decode(String.self, forKey: .path)
+        folderId = try container.decode(String.self, forKey: .folderId)
+        name = try container.decode(String.self, forKey: .name)
+        scopeNodeId = try container.decodeIfPresent(String.self, forKey: .scopeNodeId)
+        grantId = try container.decodeIfPresent(String.self, forKey: .grantId)
+        canWrite = try container.decode(Bool.self, forKey: .canWrite)
+        syncing = try container.decode(Bool.self, forKey: .syncing)
+        pendingOps = try container.decode(Int.self, forKey: .pendingOps)
+        lastSyncedAt = try container.decodeIfPresent(String.self, forKey: .lastSyncedAt)
+        updateRequired = try container.decode(Bool.self, forKey: .updateRequired)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        // Older daemons predate this field entirely; default to alive rather than fail the whole decode.
+        watcherAlive = try container.decodeIfPresent(Bool.self, forKey: .watcherAlive) ?? true
     }
 }
 

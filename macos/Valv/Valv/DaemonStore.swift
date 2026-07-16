@@ -2,13 +2,14 @@ import Combine
 import DaemonKit
 import Foundation
 
-/// One of the five states the menu-bar icon and dropdown summary reflect, in the
+/// One of the six states the menu-bar icon and dropdown summary reflect, in the
 /// precedence order the `macos-app` spec defines: not-set-up > error > paused >
-/// syncing > synced.
+/// attention > syncing > synced.
 enum IconState: Hashable {
     case notSetUp
     case error
     case paused
+    case attention
     case syncing
     case synced
 }
@@ -63,6 +64,10 @@ final class DaemonStore: ObservableObject {
         }
         if status.paused {
             return .paused
+        }
+        let hasUpdateRequiredMount = status.mounts.contains(where: { $0.updateRequired })
+        if !hasUpdateRequiredMount, status.mounts.contains(where: { !$0.watcherAlive }) {
+            return .attention
         }
         if status.mounts.contains(where: { $0.syncing }) {
             return .syncing
