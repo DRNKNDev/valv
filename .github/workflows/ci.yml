@@ -136,6 +136,8 @@ jobs:
           exit 1
       - name: Run daemon smoke scenarios
         shell: bash
+        env:
+          RUST_LOG: valv_sync=debug,valvd=debug,info
         run: |
           set -o pipefail
           bash e2e/smoke/run-all.sh 2>&1 | tee "${RUNNER_TEMP}/smoke-run.log"
@@ -145,6 +147,13 @@ jobs:
         with:
           name: smoke-logs
           path: ${{ runner.temp }}/smoke-run.log
+          if-no-files-found: ignore
+      - name: Upload daemon debug logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-daemon-logs
+          path: ${{ runner.temp }}/smoke-diag
           if-no-files-found: ignore
       - name: Stop MinIO
         if: always()
@@ -254,6 +263,8 @@ jobs:
           exit 1
       - name: Run daemon smoke scenarios
         shell: bash
+        env:
+          RUST_LOG: valv_sync=debug,valvd=debug,info
         run: |
           set -o pipefail
           export VALV_SMOKE_HEADLESS_HOME="$HOME"
@@ -273,6 +284,13 @@ jobs:
         with:
           name: smoke-logs-macos
           path: ${{ runner.temp }}/smoke-run-macos.log
+          if-no-files-found: ignore
+      - name: Upload daemon debug logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-daemon-logs-macos
+          path: ${{ runner.temp }}/smoke-diag
           if-no-files-found: ignore
       - name: Stop MinIO
         if: always()

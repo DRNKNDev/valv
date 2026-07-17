@@ -34,6 +34,18 @@ for script in "${scripts[@]}"; do
     printf '[FAIL] %s\n' "$script_name" >&2
     results+=("FAIL ${script_name}")
     failures=$((failures + 1))
+    diag="${SMOKE_DIAG_DIR}/${script_name}"
+    mkdir -p "$diag"
+    cp "$log_file" "$diag/console.out" 2>/dev/null || true
+    find "$TMPDIR" -maxdepth 3 -name '*.log' -exec cp {} "$diag/" \; 2>/dev/null || true
+    # local SQLite DBs (per-device sync.db + WAL/SHM, and the backend db), named
+    # by their path under TMPDIR so home-a vs home-b stay distinguishable.
+    find "$TMPDIR" \( -name 'sync.db' -o -name 'sync.db-wal' -o -name 'sync.db-shm' -o -name 'backend.db' \) 2>/dev/null | while IFS= read -r db; do
+      cp "$db" "$diag/$(printf '%s' "${db#"${TMPDIR}"/}" | tr '/' '_')" 2>/dev/null || true
+    done
+    { echo "# mount dirs at failure of ${script_name}"; find "$TMPDIR" -maxdepth 2 -type d -name 'mount-*' -exec ls -la {} \; ; \
+      echo "# small file contents under mount dirs"; find "$TMPDIR" -maxdepth 3 -path '*mount-*' -type f -size -20k -exec sh -c 'echo "=== $1 ==="; cat "$1"' _ {} \; ; } \
+      > "$diag/mounts.txt" 2>/dev/null || true
   fi
   rm -f "$log_file"
 done

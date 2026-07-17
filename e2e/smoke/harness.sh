@@ -140,7 +140,11 @@ BACKEND_URL="http://localhost:14747"
 BUCKET_NAME="valv-smoke-${RUN_ID}"
 HOME_A="${TMPDIR}/home-a"
 HOME_B="${TMPDIR}/home-b"
-export RUN_ID SMOKE_TMP_ROOT TMPDIR BACKEND_URL BUCKET_NAME HOME_A HOME_B
+# Durable diagnostics dir, outside TMPDIR so cleanup keeps it. run-all.sh copies
+# a failing scenario's daemon logs here before the next scenario overwrites them.
+SMOKE_DIAG_DIR="${SMOKE_DIAG_DIR:-${RUNNER_TEMP:-${SMOKE_TMP_ROOT}}/smoke-diag}"
+mkdir -p "$SMOKE_DIAG_DIR"
+export RUN_ID SMOKE_TMP_ROOT TMPDIR BACKEND_URL BUCKET_NAME HOME_A HOME_B SMOKE_DIAG_DIR
 
 trap cleanup EXIT
 
