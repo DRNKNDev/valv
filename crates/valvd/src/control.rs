@@ -2,7 +2,10 @@ use std::sync::atomic::Ordering;
 
 use axum::{extract::State, Json};
 use tokio::time::{sleep, Duration};
-use valv_sync::protocol::ipc::{Credential, DaemonStatus, MountStatus, PrincipalType};
+use valv_sync::protocol::{
+    ipc::{Credential, DaemonStatus, MountStatus, PrincipalType},
+    sync::WsPushNotification,
+};
 
 use crate::{error::DaemonError, DaemonState};
 
@@ -92,6 +95,25 @@ pub(crate) async fn post_resume(
 ) -> Result<axum::http::StatusCode, DaemonError> {
     sleep(Duration::from_millis(250)).await;
     state.paused.store(false, Ordering::Release);
+
+    // A WS notification that arrived while paused was read off notify_rx and
+    // discarded by sync_loop's `if state.paused { continue }` guard, with
+    // nothing else to re-trigger a pull on resume. Re-enqueue one synthetic
+    // notification per mount so a change that arrived during the pause is
+    // still picked up promptly instead of waiting for the next ticker floor.
+    // try_send (not send().await): a full channel must never stall this HTTP
+    // response - the ticker/other notifications still cover a dropped enqueue.
+    let mounts = state.mounts.lock().await.clone();
+    let senders = state.notify_senders.lock().await.clone();
+    for mount in mounts {
+        if let Some(sender) = senders.get(&mount.path) {
+            let _ = sender.try_send(WsPushNotification {
+                folder_id: mount.folder_id,
+                server_seq: 0,
+            });
+        }
+    }
+
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -103,8 +125,10 @@ mod tests {
     };
 
     use rusqlite::Connection;
+    use tokio::sync::mpsc;
     use tokio::sync::Mutex;
     use tokio::sync::Notify;
+    use tokio::time::timeout;
 
     use crate::config::DaemonConfig;
     use crate::MountState;
@@ -121,6 +145,7 @@ mod tests {
             fs_events_paused: Arc::new(AtomicBool::new(false)),
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            notify_senders: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
             principal: Arc::new(Mutex::new(None)),
             device_token_rejected: Arc::new(AtomicBool::new(false)),
@@ -216,6 +241,44 @@ mod tests {
             axum::http::StatusCode::NO_CONTENT
         );
         assert!(!state.paused.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn post_resume_enqueues_a_catch_up_notification_per_mount() {
+        let state = test_state(connected_config());
+        let mount = test_mount(false);
+        *state.mounts.lock().await = vec![mount.clone()];
+        let (tx, mut rx) = mpsc::channel::<WsPushNotification>(4);
+        state
+            .notify_senders
+            .lock()
+            .await
+            .insert(mount.path.clone(), tx);
+
+        post_resume(State(state.clone())).await.unwrap();
+
+        let notification = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            notification,
+            WsPushNotification {
+                folder_id: mount.folder_id.clone(),
+                server_seq: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn post_resume_does_not_fail_when_a_mount_has_no_notify_sender_yet() {
+        let state = test_state(connected_config());
+        *state.mounts.lock().await = vec![test_mount(false)];
+
+        assert_eq!(
+            post_resume(State(state)).await.unwrap(),
+            axum::http::StatusCode::NO_CONTENT
+        );
     }
 
     fn test_mount(update_required: bool) -> MountState {

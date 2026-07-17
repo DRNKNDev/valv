@@ -24,13 +24,16 @@ use rusqlite::Connection;
 use tokio::{
     net::{TcpListener, UnixListener},
     signal,
-    sync::{Mutex, Notify},
+    sync::{mpsc, Mutex, Notify},
     task::AbortHandle,
 };
 use tracing_subscriber::{filter::LevelFilter, prelude::*, EnvFilter};
 use valv_sync::{
     persistence::{mounts as mount_store, open_db},
-    protocol::ipc::{AccountStatus, MountStatus, PrincipalStatus},
+    protocol::{
+        ipc::{AccountStatus, MountStatus, PrincipalStatus},
+        sync::WsPushNotification,
+    },
 };
 
 mod config;
@@ -91,6 +94,10 @@ struct DaemonState {
     // itself: sync_loop owns and awaits the real JoinHandle so it can detect
     // the watcher's exit, while this map keeps a teardown-only cancel handle.
     tasks: Arc<Mutex<HashMap<String, Vec<AbortHandle>>>>,
+    // Keyed by mount path like `tasks` above. Lets IPC handlers outside the
+    // sync/WS task trio (POST /resume) enqueue a synthetic WsPushNotification
+    // into a mount's sync_loop notify channel without owning the receiver.
+    notify_senders: Arc<Mutex<HashMap<String, mpsc::Sender<WsPushNotification>>>>,
     account: Arc<Mutex<Option<AccountStatus>>>,
     principal: Arc<Mutex<Option<PrincipalStatus>>>,
     device_token_rejected: Arc<AtomicBool>,
@@ -266,6 +273,7 @@ async fn run() -> Result<()> {
         fs_events_paused: Arc::new(AtomicBool::new(false)),
         mounts: Arc::new(Mutex::new(mount_states)),
         tasks: Arc::new(Mutex::new(HashMap::new())),
+        notify_senders: Arc::new(Mutex::new(HashMap::new())),
         account: Arc::new(Mutex::new(None)),
         principal: Arc::new(Mutex::new(None)),
         device_token_rejected: Arc::new(AtomicBool::new(false)),
@@ -552,6 +560,7 @@ mod tests {
             fs_events_paused: Arc::new(AtomicBool::new(false)),
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            notify_senders: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
             principal: Arc::new(Mutex::new(None)),
             device_token_rejected: Arc::new(AtomicBool::new(false)),

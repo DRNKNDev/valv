@@ -404,6 +404,13 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
     let (notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(32);
     let dirty_signal = DirtySignal::new();
 
+    state
+        .notify_senders
+        .lock()
+        .await
+        .insert(mount.path.clone(), notify_tx.clone());
+    spawn_boot_catchup(&mount, notify_tx.clone());
+
     // Spawned before sync_loop so sync_loop can take ownership of the
     // JoinHandle itself and await its completion; state.tasks below only
     // gets an abort handle, for unmount/remount/SIGTERM teardown.
@@ -420,12 +427,14 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
     let ws_backend_url = state.config.backend_url.clone();
     let ws_folder_id = mount.folder_id.clone();
     let ws_backend_health = state.backend_health.clone();
+    let ws_pre_connect_jitter = random_jitter(MOUNT_STARTUP_JITTER_WINDOW);
     let ws_handle = tokio::spawn(async move {
         if let Err(error) = ws_push_loop(
             &ws_backend_url,
             &token,
             vec![ws_folder_id.clone()],
             notify_tx,
+            ws_pre_connect_jitter,
         )
         .await
         {
@@ -442,6 +451,30 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
         mount.path.clone(),
         vec![sync_handle.abort_handle(), ws_handle.abort_handle(), fs_abort_handle],
     );
+}
+
+// A few seconds, scaled for typical single-digit-to-low-tens mount counts on
+// one machine. Sampled independently for the boot catch-up delay and the WS
+// pre-connect delay, so the two triggers aren't guaranteed to land together.
+const MOUNT_STARTUP_JITTER_WINDOW: Duration = Duration::from_secs(3);
+
+// WS-independent startup catch-up: enqueues one synthetic notification per
+// mount into its own sync_loop notify channel, staggered per mount so many
+// persisted mounts don't all hit sync.db at once. Does not wait on or
+// require ws_push_loop's connection, so a boot where WS can't connect but
+// HTTPS still works still catches up.
+fn spawn_boot_catchup(mount: &MountState, notify_tx: mpsc::Sender<WsPushNotification>) {
+    let jitter = random_jitter(MOUNT_STARTUP_JITTER_WINDOW);
+    let folder_id = mount.folder_id.clone();
+    tokio::spawn(async move {
+        sleep(jitter).await;
+        let _ = notify_tx
+            .send(WsPushNotification {
+                folder_id,
+                server_seq: 0,
+            })
+            .await;
+    });
 }
 
 fn spawn_fs_watch_handle(
@@ -487,6 +520,14 @@ fn spawn_fs_watch_handle(
 }
 
 const DIRTY_RECONCILE_DEBOUNCE: Duration = Duration::from_millis(1000);
+
+// Distinct from DIRTY_RECONCILE_DEBOUNCE above even though both are ~1s: this
+// one bounds the WS-notify select! arm (armed once on first arrival, never
+// blocking the loop), the other is the Dirty wake's own inline sleep.
+const WS_NOTIFY_DEBOUNCE: Duration = Duration::from_millis(1000);
+
+const SYNC_POLL_FLOOR: Duration = Duration::from_secs(180);
+const SYNC_POLL_JITTER: Duration = Duration::from_secs(90);
 
 // A freshly (re)spawned fs_watch task that exits again before living this
 // long is considered a quick death and backs off before the next respawn
@@ -540,12 +581,14 @@ async fn sync_loop(
     // interval_at (not interval) delays the first tick by a full period.
     // post_mount already runs tree_resync + materialize_mount_files before
     // this task is spawned, so an immediate first tick buys no correctness
-    // benefit; it only means every mount on a daemon fires a redundant pull
-    // the instant it's spawned. With many persisted mounts on one daemon
-    // (e.g. a device that has mounted many folders over time), those pulls
-    // all serialize on the daemon's single sync.db connection, which can
-    // stall an unrelated foreground `valv sync` for many seconds.
-    let period = Duration::from_secs(30);
+    // benefit. The period itself is a jittered ~3-4.5 minute floor, computed
+    // once per mount here (not per tick), so every mount's whole tick
+    // sequence de-aligns from every other mount's rather than all firing
+    // together at a fixed 30s cadence. WS heartbeat/catch-up (ws-push-client)
+    // and this loop's own boot/resume catch-up now carry the real-time load;
+    // this ticker is purely the correctness backstop for a WS failure this
+    // change's other mechanisms fail to detect.
+    let period = SYNC_POLL_FLOOR + random_jitter(SYNC_POLL_JITTER);
     let mut ticker = interval_at(Instant::now() + period, period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -555,6 +598,10 @@ async fn sync_loop(
         backoff: Duration::ZERO,
         respawn_at: None,
     };
+
+    // Armed on the first matching notification in a quiescent period; later
+    // arrivals before it fires are coalesced, not extended (see WS_NOTIFY_DEBOUNCE).
+    let mut notify_deadline: Option<Instant> = None;
 
     loop {
         let wake = tokio::select! {
@@ -566,6 +613,18 @@ async fn sync_loop(
                 if notification.folder_id != mount.folder_id {
                     continue;
                 }
+                notify_deadline.get_or_insert_with(|| Instant::now() + WS_NOTIFY_DEBOUNCE);
+                continue;
+            }
+            // Absent a pending notification, notify_deadline is None and this
+            // arm is disabled, so Instant::now() here is never actually
+            // awaited (same pattern as the watcher respawn_at arm below).
+            // Non-blocking by construction: unlike the Dirty wake's inline
+            // sleep, this is its own select! arm, so the loop stays
+            // responsive to the watcher-exit/respawn-backoff arms for the
+            // whole debounce window instead of stalling on it.
+            _ = sleep_until(notify_deadline.unwrap_or_else(Instant::now)), if notify_deadline.is_some() => {
+                notify_deadline = None;
                 SyncLoopWake::Periodic
             }
             _ = dirty_signal.notified() => SyncLoopWake::Dirty,
@@ -587,6 +646,9 @@ async fn sync_loop(
         }
 
         match wake {
+            // Also reached when the WS-notify debounce deadline above fires;
+            // it shares this exact dirty-then-reconcile-else-pull decision by
+            // construction rather than a separately maintained copy of it.
             SyncLoopWake::Periodic => {
                 if dirty_signal.take() {
                     reconcile_mount(&state, &mount).await;
@@ -1609,6 +1671,7 @@ pub(crate) async fn cancel_mount_tasks(state: &DaemonState) {
             task.abort();
         }
     }
+    state.notify_senders.lock().await.clear();
 }
 
 pub(crate) async fn cancel_tasks_for_mount(state: &DaemonState, path: &str) {
@@ -1617,6 +1680,7 @@ pub(crate) async fn cancel_tasks_for_mount(state: &DaemonState, path: &str) {
             task.abort();
         }
     }
+    state.notify_senders.lock().await.remove(path);
 }
 
 async fn begin_mount_sync(state: &DaemonState, folder_id: &str) {
@@ -1706,6 +1770,7 @@ mod tests {
             fs_events_paused: Arc::new(AtomicBool::new(false)),
             mounts: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            notify_senders: Arc::new(Mutex::new(HashMap::new())),
             account: Arc::new(Mutex::new(None)),
             principal: Arc::new(Mutex::new(None)),
             device_token_rejected: Arc::new(AtomicBool::new(false)),
@@ -1990,6 +2055,38 @@ mod tests {
     #[test]
     fn random_jitter_of_zero_max_is_zero() {
         assert_eq!(random_jitter(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn sync_poll_floor_period_stays_within_the_jittered_three_to_four_and_a_half_minute_range() {
+        for _ in 0..1000 {
+            let period = SYNC_POLL_FLOOR + random_jitter(SYNC_POLL_JITTER);
+            assert!(period >= SYNC_POLL_FLOOR);
+            assert!(period < SYNC_POLL_FLOOR + SYNC_POLL_JITTER);
+        }
+        assert_eq!(SYNC_POLL_FLOOR, Duration::from_secs(180));
+        assert_eq!(SYNC_POLL_FLOOR + SYNC_POLL_JITTER, Duration::from_secs(270));
+    }
+
+    #[test]
+    fn boot_catchup_and_ws_pre_connect_jitter_are_independently_sampled() {
+        // spawn_tasks_for_mount calls random_jitter(MOUNT_STARTUP_JITTER_WINDOW)
+        // separately for the boot catch-up delay and the ws_push_loop
+        // pre-connect delay; this guards against a future refactor
+        // accidentally computing one jitter value and reusing it for both.
+        let mut saw_different_pair = false;
+        for _ in 0..200 {
+            let boot = random_jitter(MOUNT_STARTUP_JITTER_WINDOW);
+            let ws = random_jitter(MOUNT_STARTUP_JITTER_WINDOW);
+            if boot != ws {
+                saw_different_pair = true;
+                break;
+            }
+        }
+        assert!(
+            saw_different_pair,
+            "the boot enqueue and WS pre-connect jitter must be independent random samples"
+        );
     }
 
     #[test]
@@ -3149,6 +3246,170 @@ mod tests {
             pull_request_count(&requests),
             1,
             "a burst of dirty signals must coalesce into exactly one reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_loop_debounces_a_single_ws_notification_before_pulling() {
+        let (state, mount, requests, _dir) = dirty_reconcile_test_state().await;
+        let (notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(4);
+        let dirty_signal = DirtySignal::new();
+        let handle = tokio::spawn(sync_loop(
+            state.clone(),
+            mount.clone(),
+            notify_rx,
+            dirty_signal.clone(),
+            tokio::spawn(std::future::pending::<()>()),
+        ));
+
+        notify_tx
+            .send(WsPushNotification {
+                folder_id: mount.folder_id.clone(),
+                server_seq: 0,
+            })
+            .await
+            .unwrap();
+
+        sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            pull_request_count(&requests),
+            0,
+            "a WS notification must not pull immediately on arrival"
+        );
+
+        sleep(Duration::from_millis(900)).await;
+        handle.abort();
+
+        assert_eq!(
+            pull_request_count(&requests),
+            1,
+            "a single WS notification must pull once the ~1s debounce elapses"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_loop_coalesces_a_burst_of_ws_notifications_from_the_first_arrival() {
+        let (state, mount, requests, _dir) = dirty_reconcile_test_state().await;
+        let (notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(8);
+        let dirty_signal = DirtySignal::new();
+        let handle = tokio::spawn(sync_loop(
+            state.clone(),
+            mount.clone(),
+            notify_rx,
+            dirty_signal.clone(),
+            tokio::spawn(std::future::pending::<()>()),
+        ));
+
+        // Arrivals spread over 400ms (t=0, 200, 400). If the debounce
+        // reset/extended on each arrival (trailing-edge), its deadline would
+        // sit at 400ms+1000ms=1400ms; a fixed-from-first-arrival deadline
+        // sits at 0ms+1000ms=1000ms. Waiting to ~1.2s from the first arrival
+        // distinguishes the two: only the fixed-from-first deadline has
+        // fired by then.
+        for _ in 0..3 {
+            notify_tx
+                .send(WsPushNotification {
+                    folder_id: mount.folder_id.clone(),
+                    server_seq: 0,
+                })
+                .await
+                .unwrap();
+            sleep(Duration::from_millis(200)).await;
+        }
+        sleep(Duration::from_millis(800)).await;
+        handle.abort();
+
+        assert_eq!(
+            pull_request_count(&requests),
+            1,
+            "a burst of WS notifications must coalesce into exactly one pull, \
+             firing ~1s after the first arrival and not extended by later ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_notify_wake_reconciles_when_the_dirty_flag_is_already_set() {
+        // Drives this through a real sync_loop rather than inlining the
+        // decision, so a real regression in the match arm is actually
+        // caught. sync_loop's Dirty select! arm shares the same
+        // DirtySignal/Notify as the WS-notify debounce, which otherwise
+        // races: DirtySignal::mark() wakes any pending dirty_signal.notified()
+        // near-instantly, normally winning the select! and consuming the
+        // flag via its own debounce before the independently-armed
+        // WS-notify deadline (~1s out) gets a chance to observe it. Pausing
+        // first sidesteps that race deterministically: the Dirty wake still
+        // fires and consumes the Notify permit, but hits the `if
+        // state.paused { continue }` guard before its own take()+reconcile,
+        // so the flag stays set. Only once resumed does the already-armed
+        // WS-notify debounce fire and observe that still-set flag.
+        let (state, mount, requests, dir) = dirty_reconcile_test_state().await;
+        // A push with nothing local to push makes no POST call at all, which
+        // would make reconcile and pull-only indistinguishable by request
+        // log; give it a local file so push_local has something to submit.
+        fs::write(dir.path().join("a.txt"), b"alpha").unwrap();
+        state.paused.store(true, Ordering::Release);
+
+        let (notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(4);
+        let dirty_signal = DirtySignal::new();
+        let handle = tokio::spawn(sync_loop(
+            state.clone(),
+            mount.clone(),
+            notify_rx,
+            dirty_signal.clone(),
+            tokio::spawn(std::future::pending::<()>()),
+        ));
+
+        dirty_signal.mark();
+        sleep(Duration::from_millis(150)).await;
+
+        notify_tx
+            .send(WsPushNotification {
+                folder_id: mount.folder_id.clone(),
+                server_seq: 0,
+            })
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(150)).await;
+
+        state.paused.store(false, Ordering::Release);
+        sleep(Duration::from_millis(1500)).await;
+        handle.abort();
+
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.starts_with("POST")),
+            "a WS-notify debounce firing after resume must see the still-set \
+             dirty flag and reconcile, not just pull-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_tasks_for_mount_enqueues_a_boot_catchup_independent_of_ws() {
+        // dirty_reconcile_test_state's backend server speaks plain HTTP, not
+        // the WebSocket upgrade handshake, so ws_push_loop can never connect
+        // here - this is exactly the "WS can't connect but HTTPS still
+        // works" boot scenario the boot catch-up must cover on its own.
+        let (state, mount, requests, _dir) = dirty_reconcile_test_state().await;
+
+        spawn_tasks_for_mount(&state, mount.clone()).await;
+
+        let mut saw_pull = false;
+        for _ in 0..100 {
+            if pull_request_count(&requests) > 0 {
+                saw_pull = true;
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        cancel_tasks_for_mount(&state, &mount.path).await;
+
+        assert!(
+            saw_pull,
+            "spawn_tasks_for_mount must enqueue a boot catch-up pull even when \
+             the WebSocket connection never establishes"
         );
     }
 
