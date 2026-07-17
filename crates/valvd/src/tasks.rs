@@ -549,6 +549,7 @@ async fn sync_loop(
 }
 
 async fn reconcile_mount(state: &DaemonState, mount: &MountState) {
+    tracing::debug!(folder_id = %mount.folder_id, "diag reconcile_mount (dirty-triggered full_sync)");
     if let Err(error) = run_full_sync_mount(state.clone(), mount.clone()).await {
         tracing::warn!(error = %error, folder_id = %mount.folder_id, "reconcile sync task panicked");
     }
@@ -587,6 +588,7 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
         return;
     };
     let _sync_guard = mount.sync_lock.lock().await;
+    tracing::debug!(folder_id = %mount.folder_id, "diag pull_mount_once begin (pull-only)");
     begin_mount_sync(state, &mount.folder_id).await;
     let result = {
         let mut conn = state.db.lock().await;
@@ -644,6 +646,7 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
         return summary;
     };
     let _sync_guard = mount.sync_lock.lock().await;
+    tracing::debug!(folder_id = %mount.folder_id, "diag full_sync_mount begin (push+pull)");
     begin_mount_sync(state, &mount.folder_id).await;
     if mount.update_required {
         mount.update_required_flag.store(true, Ordering::Release);
@@ -973,7 +976,15 @@ async fn apply_pulled_fs_change(
             }
         }
         "new_version" if pulled.is_conflict_copy => {
+            tracing::debug!(
+                node_id = %pulled.node_id,
+                actor = %pulled.actor_device_id,
+                self_device = %state.config.device_id,
+                version = ?pulled.new_version_id,
+                "diag pull conflict-copy op received"
+            );
             if pulled.actor_device_id == state.config.device_id {
+                tracing::debug!(node_id = %pulled.node_id, "diag pull conflict-copy authored by self; skipping");
                 return Ok(());
             }
             let Some(version_id) = pulled.new_version_id.as_deref() else {
@@ -998,6 +1009,13 @@ async fn apply_pulled_fs_change(
             }
             let bytes =
                 download_and_store_version(state, mount, &pulled.node_id, version_id).await?;
+            tracing::debug!(
+                node_id = %pulled.node_id,
+                version = %version_id,
+                dst = %conflict_path.display(),
+                bytes = bytes.len(),
+                "diag pull materialized conflict copy from download"
+            );
             fs::write(conflict_path, bytes)?;
         }
         "new_version" => {

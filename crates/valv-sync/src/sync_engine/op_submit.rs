@@ -90,6 +90,12 @@ pub fn materialize_conflict_copy(
     };
     let conflict_path = disambiguate_conflict_path(original_path.with_file_name(conflict_name))?;
     fs::copy(original_path, &conflict_path)?;
+    eprintln!(
+        "diag conflict-copy(push-side/op_submit): device_name={device_name} src={} dst={} src_len={:?}",
+        original_path.display(),
+        conflict_path.display(),
+        fs::metadata(original_path).map(|m| m.len()).ok()
+    );
     Ok(conflict_path)
 }
 
