@@ -25,7 +25,7 @@ use tokio::{
     net::{TcpListener, UnixListener},
     signal,
     sync::{Mutex, Notify},
-    task::JoinHandle,
+    task::AbortHandle,
 };
 use tracing_subscriber::{filter::LevelFilter, prelude::*, EnvFilter};
 use valv_sync::{
@@ -87,7 +87,10 @@ struct DaemonState {
     mounts: Arc<Mutex<Vec<MountState>>>,
     // Keyed by mount path so mounting/remounting one folder only cancels and
     // respawns that mount's own tasks instead of every persisted mount's.
-    tasks: Arc<Mutex<HashMap<String, Vec<JoinHandle<()>>>>>,
+    // The fs_watch slot holds an AbortHandle rather than the JoinHandle
+    // itself: sync_loop owns and awaits the real JoinHandle so it can detect
+    // the watcher's exit, while this map keeps a teardown-only cancel handle.
+    tasks: Arc<Mutex<HashMap<String, Vec<AbortHandle>>>>,
     account: Arc<Mutex<Option<AccountStatus>>>,
     principal: Arc<Mutex<Option<PrincipalStatus>>>,
     device_token_rejected: Arc<AtomicBool>,

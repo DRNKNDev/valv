@@ -12,7 +12,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use tokio::{
     sync::mpsc,
-    time::{interval_at, sleep, Instant, MissedTickBehavior},
+    time::{interval_at, sleep, sleep_until, Instant, MissedTickBehavior},
 };
 use valv_sync::{
     persistence::{
@@ -404,21 +404,26 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
     let (notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(32);
     let dirty_signal = DirtySignal::new();
 
+    // Spawned before sync_loop so sync_loop can take ownership of the
+    // JoinHandle itself and await its completion; state.tasks below only
+    // gets an abort handle, for unmount/remount/SIGTERM teardown.
+    let fs_handle = spawn_fs_watch_handle(state, &mount, dirty_signal.clone(), token.clone());
+    let fs_abort_handle = fs_handle.abort_handle();
+
     let sync_state = state.clone();
     let sync_mount = mount.clone();
     let sync_dirty_signal = dirty_signal.clone();
     let sync_handle = tokio::spawn(async move {
-        sync_loop(sync_state, sync_mount, notify_rx, sync_dirty_signal).await;
+        sync_loop(sync_state, sync_mount, notify_rx, sync_dirty_signal, fs_handle).await;
     });
 
     let ws_backend_url = state.config.backend_url.clone();
-    let ws_token = token.clone();
     let ws_folder_id = mount.folder_id.clone();
     let ws_backend_health = state.backend_health.clone();
     let ws_handle = tokio::spawn(async move {
         if let Err(error) = ws_push_loop(
             &ws_backend_url,
-            &ws_token,
+            &token,
             vec![ws_folder_id.clone()],
             notify_tx,
         )
@@ -433,13 +438,10 @@ pub(crate) async fn spawn_tasks_for_mount(state: &DaemonState, mount: MountState
         }
     });
 
-    let fs_handle = spawn_fs_watch_handle(state, &mount, dirty_signal, token);
-
-    state
-        .tasks
-        .lock()
-        .await
-        .insert(mount.path.clone(), vec![sync_handle, ws_handle, fs_handle]);
+    state.tasks.lock().await.insert(
+        mount.path.clone(),
+        vec![sync_handle.abort_handle(), ws_handle.abort_handle(), fs_abort_handle],
+    );
 }
 
 fn spawn_fs_watch_handle(
@@ -486,9 +488,46 @@ fn spawn_fs_watch_handle(
 
 const DIRTY_RECONCILE_DEBOUNCE: Duration = Duration::from_millis(1000);
 
+// A freshly (re)spawned fs_watch task that exits again before living this
+// long is considered a quick death and backs off before the next respawn
+// attempt; one that lives past this resets the backoff to zero.
+const WATCHER_LIVENESS_THRESHOLD: Duration = Duration::from_secs(3);
+const WATCHER_RESPAWN_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const WATCHER_RESPAWN_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+fn next_watcher_backoff(previous: Duration, lived: Duration) -> Duration {
+    if lived >= WATCHER_LIVENESS_THRESHOLD {
+        Duration::ZERO
+    } else if previous.is_zero() {
+        WATCHER_RESPAWN_INITIAL_BACKOFF
+    } else {
+        (previous * 2).min(WATCHER_RESPAWN_MAX_BACKOFF)
+    }
+}
+
 enum SyncLoopWake {
     Periodic,
     Dirty,
+}
+
+// The fs_watch task's JoinHandle, owned by sync_loop so it can select! on
+// the task's completion instead of polling is_finished() on each wake.
+struct WatcherState {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    spawned_at: Instant,
+    backoff: Duration,
+    respawn_at: Option<Instant>,
+}
+
+// Polling a JoinHandle after it has already resolved panics, so this must
+// only ever be awaited from a select! arm guarded by `watcher.handle.is_some()`.
+async fn await_watcher_exit(
+    handle: &mut Option<tokio::task::JoinHandle<()>>,
+) -> Result<(), tokio::task::JoinError> {
+    match handle {
+        Some(inner) => inner.await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn sync_loop(
@@ -496,6 +535,7 @@ async fn sync_loop(
     mount: MountState,
     mut notify_rx: mpsc::Receiver<WsPushNotification>,
     dirty_signal: DirtySignal,
+    fs_watch_handle: tokio::task::JoinHandle<()>,
 ) {
     // interval_at (not interval) delays the first tick by a full period.
     // post_mount already runs tree_resync + materialize_mount_files before
@@ -508,6 +548,13 @@ async fn sync_loop(
     let period = Duration::from_secs(30);
     let mut ticker = interval_at(Instant::now() + period, period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    let mut watcher = WatcherState {
+        handle: Some(fs_watch_handle),
+        spawned_at: Instant::now(),
+        backoff: Duration::ZERO,
+        respawn_at: None,
+    };
 
     loop {
         let wake = tokio::select! {
@@ -522,9 +569,18 @@ async fn sync_loop(
                 SyncLoopWake::Periodic
             }
             _ = dirty_signal.notified() => SyncLoopWake::Dirty,
+            result = await_watcher_exit(&mut watcher.handle), if watcher.handle.is_some() => {
+                handle_watcher_exit(&state, &mount, &dirty_signal, &mut watcher, result).await;
+                continue;
+            }
+            // Absent a pending backoff, respawn_at is None and this arm is
+            // disabled, so Instant::now() here is never actually awaited.
+            _ = sleep_until(watcher.respawn_at.unwrap_or_else(Instant::now)), if watcher.respawn_at.is_some() => {
+                watcher.respawn_at = None;
+                respawn_watcher(&state, &mount, &dirty_signal, &mut watcher).await;
+                continue;
+            }
         };
-
-        respawn_watcher_if_dead(&state, &mount, &dirty_signal).await;
 
         if state.paused.load(Ordering::Acquire) {
             continue;
@@ -555,31 +611,73 @@ async fn reconcile_mount(state: &DaemonState, mount: &MountState) {
     }
 }
 
-async fn respawn_watcher_if_dead(state: &DaemonState, mount: &MountState, dirty_signal: &DirtySignal) {
-    let mut tasks = state.tasks.lock().await;
-    let Some(handles) = tasks.get_mut(&mount.path) else {
-        return;
-    };
-    let Some(fs_handle) = handles.get(FS_WATCH_TASK_INDEX) else {
-        return;
-    };
-    let finished = fs_handle.is_finished();
-    mount.watcher_alive.store(!finished, Ordering::Release);
-    if !finished {
-        return;
+async fn handle_watcher_exit(
+    state: &DaemonState,
+    mount: &MountState,
+    dirty_signal: &DirtySignal,
+    watcher: &mut WatcherState,
+    result: Result<(), tokio::task::JoinError>,
+) {
+    if let Err(error) = result {
+        if !error.is_cancelled() {
+            tracing::warn!(
+                folder_id = %mount.folder_id,
+                error = %error,
+                "fs_watch task panicked"
+            );
+        }
     }
-
+    mount.watcher_alive.store(false, Ordering::Release);
     dirty_signal.mark();
 
+    let lived = watcher.spawned_at.elapsed();
+    watcher.backoff = next_watcher_backoff(watcher.backoff, lived);
+    watcher.handle = None;
+
+    if watcher.backoff.is_zero() {
+        respawn_watcher(state, mount, dirty_signal, watcher).await;
+    } else {
+        watcher.respawn_at = Some(Instant::now() + watcher.backoff);
+    }
+}
+
+// Mirrors the teardown-race invariant the old is_finished() poll embodied:
+// only respawns while holding state.tasks with the mount's entry still
+// present, and stores the fresh abort handle under that same lock, so a
+// watcher exit racing DELETE /mount or a remount can't spawn an
+// un-cancellable or duplicate watcher.
+async fn respawn_watcher(
+    state: &DaemonState,
+    mount: &MountState,
+    dirty_signal: &DirtySignal,
+    watcher: &mut WatcherState,
+) {
     let Some(token) = mount.effective_token(&state.config).map(str::to_owned) else {
         tracing::warn!(
             folder_id = %mount.folder_id,
             path = %mount.path,
-            "fs_watch task died and mount has no usable credential; not respawning"
+            "fs_watch task died and mount has no usable credential; retrying on backoff"
         );
+        watcher.backoff = next_watcher_backoff(watcher.backoff, Duration::ZERO);
+        watcher.respawn_at = Some(Instant::now() + watcher.backoff);
         return;
     };
-    handles[FS_WATCH_TASK_INDEX] = spawn_fs_watch_handle(state, mount, dirty_signal.clone(), token);
+
+    let mut tasks = state.tasks.lock().await;
+    let Some(handles) = tasks.get_mut(&mount.path) else {
+        return;
+    };
+    let new_handle = spawn_fs_watch_handle(state, mount, dirty_signal.clone(), token);
+    handles[FS_WATCH_TASK_INDEX] = new_handle.abort_handle();
+    drop(tasks);
+
+    watcher.handle = Some(new_handle);
+    watcher.spawned_at = Instant::now();
+    mount.watcher_alive.store(true, Ordering::Release);
+    // Re-mark once the watcher is back up: the exit-time mark can be consumed
+    // by a reconcile while the watcher is still down (across the backoff
+    // window), so a change made then would otherwise never be picked up.
+    dirty_signal.mark();
 }
 
 async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
@@ -3014,6 +3112,7 @@ mod tests {
             mount.clone(),
             notify_rx,
             dirty_signal.clone(),
+            tokio::spawn(std::future::pending::<()>()),
         ));
 
         dirty_signal.mark();
@@ -3037,6 +3136,7 @@ mod tests {
             mount.clone(),
             notify_rx,
             dirty_signal.clone(),
+            tokio::spawn(std::future::pending::<()>()),
         ));
 
         for _ in 0..5 {
@@ -3052,21 +3152,61 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn sync_loop_respawns_a_finished_watcher_and_marks_the_mount_dirty() {
-        let (state, mount, _requests, _dir) = dirty_reconcile_test_state().await;
-        let dead_handle = tokio::spawn(async {});
-        while !dead_handle.is_finished() {
+    // Spawns a task that has already exited, standing in for an fs_watch
+    // task that died immediately (e.g. a watch_mount registration failure).
+    async fn already_finished_watcher_handle() -> tokio::task::JoinHandle<()> {
+        let handle = tokio::spawn(async {});
+        while !handle.is_finished() {
             tokio::task::yield_now().await;
         }
+        handle
+    }
+
+    // sync_loop's respawn only proceeds while the mount's state.tasks entry
+    // is present (the teardown-race invariant), so tests that drive a
+    // respawn need a placeholder entry with the initial fs_watch abort
+    // handle at FS_WATCH_TASK_INDEX.
+    async fn insert_watcher_task_entry(
+        state: &DaemonState,
+        mount: &MountState,
+        fs_abort_handle: tokio::task::AbortHandle,
+    ) {
         state.tasks.lock().await.insert(
             mount.path.clone(),
             vec![
-                tokio::spawn(std::future::pending::<()>()),
-                tokio::spawn(std::future::pending::<()>()),
-                dead_handle,
+                tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                fs_abort_handle,
             ],
         );
+    }
+
+    async fn wait_for_watcher_alive(mount: &MountState, want: bool, attempts: u32) -> bool {
+        for _ in 0..attempts {
+            if mount.watcher_alive.load(Ordering::Acquire) == want {
+                return true;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        mount.watcher_alive.load(Ordering::Acquire) == want
+    }
+
+    // test_mount() initializes watcher_alive to true, so waiting on `true`
+    // alone would trivially pass before sync_loop even runs its first
+    // iteration; wait for the death to be observed first.
+    async fn wait_for_watcher_respawn(mount: &MountState) -> bool {
+        // Generous windows: a dead-watcher dirty mark drives a reconcile whose
+        // ~1s debounce plus full-sync keeps sync_loop off its select! (so the
+        // next exit is observed only afterward), same as any in-flight wake.
+        wait_for_watcher_alive(mount, false, 160).await
+            && wait_for_watcher_alive(mount, true, 160).await
+    }
+
+    #[tokio::test]
+    async fn sync_loop_detects_a_dead_watcher_and_respawns_it_without_a_ticker_tick() {
+        let (state, mount, _requests, _dir) = dirty_reconcile_test_state().await;
+        let dead_handle = already_finished_watcher_handle().await;
+        insert_watcher_task_entry(&state, &mount, dead_handle.abort_handle()).await;
 
         let (_notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(4);
         let dirty_signal = DirtySignal::new();
@@ -3075,28 +3215,186 @@ mod tests {
             mount.clone(),
             notify_rx,
             dirty_signal.clone(),
+            dead_handle,
         ));
 
-        dirty_signal.mark();
-        let mut respawned_alive = false;
-        for _ in 0..60 {
-            sleep(Duration::from_millis(50)).await;
-            if mount.watcher_alive.load(Ordering::Acquire) {
-                respawned_alive = true;
-                break;
-            }
-        }
+        assert!(
+            wait_for_watcher_alive(&mount, false, 20).await,
+            "a dead watcher must be observed as not alive"
+        );
+        assert!(
+            wait_for_watcher_alive(&mount, true, 80).await,
+            "the watcher must be respawned and observed alive again, well before the 30s ticker"
+        );
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_loop_reports_watcher_not_alive_promptly_not_falsely_alive() {
+        let (state, mount, _requests, _dir) = dirty_reconcile_test_state().await;
+        let dead_handle = already_finished_watcher_handle().await;
+        insert_watcher_task_entry(&state, &mount, dead_handle.abort_handle()).await;
+
+        let (_notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(4);
+        let dirty_signal = DirtySignal::new();
+        let handle = tokio::spawn(sync_loop(
+            state.clone(),
+            mount.clone(),
+            notify_rx,
+            dirty_signal.clone(),
+            dead_handle,
+        ));
 
         assert!(
-            respawned_alive,
+            wait_for_watcher_alive(&mount, false, 20).await,
+            "a watcher that dies at registration must be reported not-alive promptly, \
+             not falsely alive on the strength of the spawn call alone"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_loop_detects_a_second_death_of_a_respawned_watcher() {
+        let (state, mount, _requests, _dir) = dirty_reconcile_test_state().await;
+        let dead_handle = already_finished_watcher_handle().await;
+        insert_watcher_task_entry(&state, &mount, dead_handle.abort_handle()).await;
+
+        let (_notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(4);
+        let dirty_signal = DirtySignal::new();
+        let handle = tokio::spawn(sync_loop(
+            state.clone(),
+            mount.clone(),
+            notify_rx,
+            dirty_signal.clone(),
+            dead_handle,
+        ));
+
+        assert!(
+            wait_for_watcher_respawn(&mount).await,
+            "the first respawn must succeed"
+        );
+
+        // Abort the now-live watcher directly through the same abort handle
+        // DELETE /mount or a remount would use, forcing a second death.
+        {
+            let tasks = state.tasks.lock().await;
+            tasks.get(&mount.path).unwrap()[FS_WATCH_TASK_INDEX].abort();
+        }
+
+        assert!(
+            wait_for_watcher_respawn(&mount).await,
+            "the respawned watcher's later death must also be detected and re-armed on the new handle"
+        );
+        handle.abort();
+    }
+
+    #[test]
+    fn watcher_backoff_grows_then_caps_and_resets_on_stable() {
+        let mut backoff = Duration::ZERO;
+        backoff = next_watcher_backoff(backoff, Duration::ZERO);
+        assert_eq!(backoff, WATCHER_RESPAWN_INITIAL_BACKOFF);
+        backoff = next_watcher_backoff(backoff, Duration::ZERO);
+        assert_eq!(backoff, WATCHER_RESPAWN_INITIAL_BACKOFF * 2);
+        backoff = next_watcher_backoff(backoff, Duration::ZERO);
+        assert_eq!(backoff, WATCHER_RESPAWN_INITIAL_BACKOFF * 4);
+
+        let capped = next_watcher_backoff(WATCHER_RESPAWN_MAX_BACKOFF, Duration::ZERO);
+        assert_eq!(
+            capped, WATCHER_RESPAWN_MAX_BACKOFF,
+            "backoff must not grow past the cap"
+        );
+
+        let reset = next_watcher_backoff(WATCHER_RESPAWN_MAX_BACKOFF, WATCHER_LIVENESS_THRESHOLD);
+        assert_eq!(
+            reset,
+            Duration::ZERO,
+            "a watcher that lived past the liveness threshold resets the backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_loop_respawns_a_finished_watcher_and_marks_the_mount_dirty() {
+        let (state, mount, requests, _dir) = dirty_reconcile_test_state().await;
+        let dead_handle = already_finished_watcher_handle().await;
+        insert_watcher_task_entry(&state, &mount, dead_handle.abort_handle()).await;
+
+        let (_notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(4);
+        let dirty_signal = DirtySignal::new();
+        let handle = tokio::spawn(sync_loop(
+            state.clone(),
+            mount.clone(),
+            notify_rx,
+            dirty_signal.clone(),
+            dead_handle,
+        ));
+
+        assert!(
+            wait_for_watcher_respawn(&mount).await,
             "a healthy respawned watcher must be observed alive again"
         );
+
+        // With the first ticker tick +30s away and no notification, the only
+        // thing that can hit the backend here is the dead-watcher dirty mark
+        // driving a reconcile.
+        let mut saw_reconcile = false;
+        for _ in 0..60 {
+            if !requests.lock().unwrap().is_empty() {
+                saw_reconcile = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        handle.abort();
+        assert!(
+            saw_reconcile,
+            "a dead watcher must mark the mount dirty and drive a reconcile"
+        );
+
         let tasks = state.tasks.lock().await;
         let handles = tasks.get(&mount.path).unwrap();
         assert!(
             !handles[FS_WATCH_TASK_INDEX].is_finished(),
             "the finished handle must have been replaced with a fresh one"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_loop_respawns_a_dead_watcher_while_paused_but_defers_reconcile_until_resume() {
+        let (state, mount, requests, _dir) = dirty_reconcile_test_state().await;
+        state.paused.store(true, Ordering::Release);
+
+        let dead_handle = already_finished_watcher_handle().await;
+        insert_watcher_task_entry(&state, &mount, dead_handle.abort_handle()).await;
+
+        let (_notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(4);
+        let dirty_signal = DirtySignal::new();
+        let handle = tokio::spawn(sync_loop(
+            state.clone(),
+            mount.clone(),
+            notify_rx,
+            dirty_signal.clone(),
+            dead_handle,
+        ));
+
+        assert!(
+            wait_for_watcher_respawn(&mount).await,
+            "a dead watcher must still be detected and respawned while the daemon is paused"
+        );
+        assert_eq!(
+            pull_request_count(&requests),
+            0,
+            "the paused guard must defer the respawn's mirror-mutating reconcile"
+        );
+
+        state.paused.store(false, Ordering::Release);
+        dirty_signal.mark();
+        sleep(Duration::from_millis(1600)).await;
+        handle.abort();
+
+        assert_eq!(
+            pull_request_count(&requests),
+            1,
+            "the deferred reconcile must run once the daemon resumes"
         );
     }
 }
