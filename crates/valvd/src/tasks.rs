@@ -17,6 +17,7 @@ use tokio::{
 use valv_sync::{
     persistence::{
         chunks as chunk_store,
+        mounts as mount_store,
         nodes::LocalNode,
         versions::{self, upsert_version, LocalVersion},
     },
@@ -613,6 +614,21 @@ async fn sync_loop(
                 if notification.folder_id != mount.folder_id {
                     continue;
                 }
+                // A synthetic catch-up notification (server_seq 0: boot, resume,
+                // or WS (re)connect) means we may have missed *local* changes
+                // during downtime or a pause, not only remote ones. Mark the
+                // mount dirty so the ensuing wake runs a push-first reconcile:
+                // an un-pushed local edit is then submitted (and conflict-forked
+                // server-side) before the remote version lands. A pull-only
+                // reconcile would overwrite and lose it. The Dirty wake's own
+                // debounce coalesces a burst, so don't also arm the pull-only
+                // deadline here (that would double the work). A real
+                // remote-change push carries server_seq > 0 and stays on the
+                // lighter pull-only path below.
+                if notification.server_seq == 0 {
+                    dirty_signal.mark();
+                    continue;
+                }
                 notify_deadline.get_or_insert_with(|| Instant::now() + WS_NOTIFY_DEBOUNCE);
                 continue;
             }
@@ -750,21 +766,25 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
     let _sync_guard = mount.sync_lock.lock().await;
     tracing::debug!(folder_id = %mount.folder_id, "diag pull_mount_once begin (pull-only)");
     begin_mount_sync(state, &mount.folder_id).await;
-    let result = {
+    let (cursor_before, result) = {
         let mut conn = state.db.lock().await;
-        pull_delta(
+        let before = mount_store::get_cursor(&conn, &mount.folder_id).unwrap_or(0);
+        let result = pull_delta(
             &state.client,
             &state.config.backend_url,
             &token,
             &mount.folder_id,
             &mut conn,
         )
-        .await
+        .await;
+        (before, result)
     };
+    let mut cursor_after = cursor_before;
     let error = match result {
-        Ok((_, pulled)) => {
+        Ok((up_to_seq, pulled)) => {
             state.backend_health.record_success();
             clear_credential_rejected(state, &token).await;
+            cursor_after = up_to_seq;
             let was_paused = pause_watchers(state);
             let cleanup_error = cleanup_deleted_mount_paths(state, mount)
                 .await
@@ -793,7 +813,10 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
     };
     let succeeded = error.is_none();
     end_mount_sync(state, &mount.folder_id, error).await;
-    if succeeded {
+    // Only wake fp/watch waiters when the pull actually advanced the cursor. A
+    // no-op catch-up/notify pull that advances nothing must not spuriously wake
+    // a blocked watch into returning an unchanged cursor.
+    if succeeded && cursor_after > cursor_before {
         mount.cursor_notify.notify_waiters();
     }
 }
@@ -811,6 +834,10 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
     if mount.update_required {
         mount.update_required_flag.store(true, Ordering::Release);
     }
+    let cursor_before = {
+        let conn = state.db.lock().await;
+        mount_store::get_cursor(&conn, &mount.folder_id).unwrap_or(0)
+    };
 
     let push_result = push_local_with_update_required(
         PathBuf::from(&mount.path).as_path(),
@@ -877,11 +904,13 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
         )
         .await
     };
+    let mut cursor_after = cursor_before;
     let error = match pull_result {
-        Ok((pulled_ops, pulled)) => {
+        Ok((up_to_seq, pulled)) => {
             state.backend_health.record_success();
             clear_credential_rejected(state, &token).await;
-            summary.pulled_ops = pulled_ops;
+            summary.pulled_ops = up_to_seq;
+            cursor_after = up_to_seq;
             let was_paused = pause_watchers(state);
             let mut apply_error = None;
             if let Err(error) =
@@ -931,7 +960,11 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
     set_mount_pending_ops(state, &mount.folder_id, summary.errors).await;
     let pull_succeeded = error.is_none();
     end_mount_sync(state, &mount.folder_id, mount_error).await;
-    if pull_succeeded {
+    // Wake fp/watch waiters only when the cursor actually advanced (a local
+    // push is reflected back through the pull), so a no-op reconcile - e.g. a
+    // dirty-marked catch-up on an unchanged mount - does not spuriously wake a
+    // blocked watch into returning an unchanged cursor.
+    if pull_succeeded && cursor_after > cursor_before {
         mount.cursor_notify.notify_waiters();
     }
     summary
@@ -3265,7 +3298,10 @@ mod tests {
         notify_tx
             .send(WsPushNotification {
                 folder_id: mount.folder_id.clone(),
-                server_seq: 0,
+                // A real remote-change push (server_seq > 0) takes the
+                // pull-only debounce path; a catch-up (server_seq 0) would
+                // instead route through the dirty/push-first reconcile.
+                server_seq: 1,
             })
             .await
             .unwrap();
@@ -3310,7 +3346,8 @@ mod tests {
             notify_tx
                 .send(WsPushNotification {
                     folder_id: mount.folder_id.clone(),
-                    server_seq: 0,
+                    // Real remote-change pushes: exercise the pull-only debounce.
+                    server_seq: 1,
                 })
                 .await
                 .unwrap();
@@ -3328,11 +3365,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_loop_runs_a_push_first_reconcile_for_a_catch_up_notification() {
+        // A catch-up notification (server_seq 0: boot/resume/WS-connect) must
+        // push-first, not pull-only: an un-pushed local edit made during a
+        // pause or downtime has to be submitted (and conflict-forked
+        // server-side) before any remote version is pulled, or it is lost.
+        let (state, mount, requests, dir) = dirty_reconcile_test_state().await;
+        // Give push_local something to submit so a push-first reconcile is
+        // distinguishable from a pull-only reconcile by the request log.
+        fs::write(dir.path().join("a.txt"), b"alpha").unwrap();
+
+        let (notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(4);
+        let dirty_signal = DirtySignal::new();
+        let handle = tokio::spawn(sync_loop(
+            state.clone(),
+            mount.clone(),
+            notify_rx,
+            dirty_signal.clone(),
+            tokio::spawn(std::future::pending::<()>()),
+        ));
+
+        notify_tx
+            .send(WsPushNotification {
+                folder_id: mount.folder_id.clone(),
+                server_seq: 0,
+            })
+            .await
+            .unwrap();
+
+        sleep(Duration::from_millis(1500)).await;
+        handle.abort();
+
+        let log = requests.lock().unwrap().clone();
+        let first_post = log
+            .iter()
+            .position(|line| line == "POST /api/folders/folder-1/ops");
+        let first_get = log
+            .iter()
+            .position(|line| line.starts_with("GET /api/folders/folder-1/ops"));
+        assert!(
+            first_post.is_some(),
+            "a catch-up notification must trigger a push-first reconcile (POST), \
+             not a pull-only pull"
+        );
+        // Push must precede pull: prove the reconcile order, not merely that a
+        // POST happened at some point.
+        assert!(
+            first_get.is_none() || first_post < first_get,
+            "the reconcile must push before it pulls (POST before GET)"
+        );
+        // The catch-up must not also arm the pull-only deadline (that would
+        // double the work into a second, separate pull).
+        assert_eq!(
+            pull_request_count(&requests),
+            1,
+            "a catch-up reconcile pulls exactly once"
+        );
+    }
+
+    #[tokio::test]
     async fn ws_notify_wake_reconciles_when_the_dirty_flag_is_already_set() {
         // Drives this through a real sync_loop rather than inlining the
         // decision, so a real regression in the match arm is actually
-        // caught. sync_loop's Dirty select! arm shares the same
-        // DirtySignal/Notify as the WS-notify debounce, which otherwise
+        // caught. A real remote-change notification (server_seq > 0) takes the
+        // pull-only deadline path, but its Periodic wake still reconciles
+        // (push-first) when the dirty flag is already set. sync_loop's Dirty
+        // select! arm shares the same DirtySignal/Notify, which otherwise
         // races: DirtySignal::mark() wakes any pending dirty_signal.notified()
         // near-instantly, normally winning the select! and consuming the
         // flag via its own debounce before the independently-armed
@@ -3365,7 +3463,9 @@ mod tests {
         notify_tx
             .send(WsPushNotification {
                 folder_id: mount.folder_id.clone(),
-                server_seq: 0,
+                // Real remote change: arms the pull-only deadline whose Periodic
+                // wake must still reconcile because the dirty flag is set.
+                server_seq: 1,
             })
             .await
             .unwrap();
