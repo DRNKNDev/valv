@@ -68,7 +68,8 @@ pub(crate) async fn post_sync(
 
     let mut summary = SyncSummary::default();
     for mount in targets {
-        let mount_summary = run_full_sync_mount(state.clone(), mount).await?;
+        let mount_summary =
+            run_full_sync_mount(state.clone(), mount, MaterializeScope::Full).await?;
         merge_sync_summary(&mut summary, mount_summary);
     }
 
@@ -684,7 +685,13 @@ async fn sync_loop(
 
 async fn reconcile_mount(state: &DaemonState, mount: &MountState) {
     tracing::debug!(folder_id = %mount.folder_id, "diag reconcile_mount (dirty-triggered full_sync)");
-    if let Err(error) = run_full_sync_mount(state.clone(), mount.clone()).await {
+    // Dirty reconciles (catch-up or fs-watcher) push-first but pull with
+    // Background scope so an un-pushed offline delete is not resurrected. An
+    // online edit's path is present, so Background still materializes the
+    // winner; only the offline-delete case diverges from a Full sweep.
+    if let Err(error) =
+        run_full_sync_mount(state.clone(), mount.clone(), MaterializeScope::Background).await
+    {
         tracing::warn!(error = %error, folder_id = %mount.folder_id, "reconcile sync task panicked");
     }
 }
@@ -821,7 +828,11 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
     }
 }
 
-async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary {
+async fn full_sync_mount(
+    state: &DaemonState,
+    mount: &MountState,
+    scope: MaterializeScope,
+) -> SyncSummary {
     let mut summary = SyncSummary::default();
     let Some(token) = mount.effective_token(&state.config).map(str::to_owned) else {
         summary.errors += 1;
@@ -914,7 +925,7 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
             let was_paused = pause_watchers(state);
             let mut apply_error = None;
             if let Err(error) =
-                apply_pulled_fs_changes(state, mount, pulled, MaterializeScope::Full).await
+                apply_pulled_fs_changes(state, mount, pulled, scope).await
             {
                 tracing::error!(
                     folder_id = %mount.folder_id,
@@ -925,7 +936,19 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
                 apply_error = Some(error.to_string());
             }
             let mut materialize_error = None;
-            if let Err(error) = materialize_mount_files(state, mount).await {
+            // A background/catch-up reconcile (Background scope) must not run the
+            // full materialize sweep: it re-downloads every live mirror node
+            // whose path is absent, resurrecting a file the user deleted locally
+            // while offline (the delete can be live-but-superseded in the
+            // mirror). Do only the tombstone cleanup the sweep would have done;
+            // content materialization is left to the scope-gated apply above,
+            // which withholds resurrection under Background. An explicit
+            // `valv sync` (Full) keeps the full sweep.
+            let materialize_result = match scope {
+                MaterializeScope::Full => materialize_mount_files(state, mount).await,
+                MaterializeScope::Background => cleanup_deleted_mount_paths(state, mount).await,
+            };
+            if let Err(error) = materialize_result {
                 tracing::error!(
                     folder_id = %mount.folder_id,
                     error = %error,
@@ -1691,9 +1714,10 @@ async fn fetch_remote_version(
 async fn run_full_sync_mount(
     state: DaemonState,
     mount: MountState,
+    scope: MaterializeScope,
 ) -> Result<SyncSummary, tokio::task::JoinError> {
     tokio::task::spawn_blocking(move || {
-        tokio::runtime::Handle::current().block_on(full_sync_mount(&state, &mount))
+        tokio::runtime::Handle::current().block_on(full_sync_mount(&state, &mount, scope))
     })
     .await
 }
@@ -2764,7 +2788,7 @@ mod tests {
         let (backend_url, server) = push_update_required_server().await;
         state.config.backend_url = backend_url;
 
-        let summary = full_sync_mount(&state, &mount).await;
+        let summary = full_sync_mount(&state, &mount, MaterializeScope::Full).await;
         let requests = server.await.unwrap();
         let status = crate::control::get_status(State(state)).await.unwrap().0;
 
@@ -2807,7 +2831,7 @@ mod tests {
         let (backend_url, server) = push_forbidden_server().await;
         state.config.backend_url = backend_url;
 
-        let summary = full_sync_mount(&state, &mount).await;
+        let summary = full_sync_mount(&state, &mount, MaterializeScope::Full).await;
         let requests = server.await.unwrap();
         let status = crate::control::get_status(State(state)).await.unwrap().0;
 
@@ -2852,7 +2876,7 @@ mod tests {
         ])
         .await;
 
-        let summary = full_sync_mount(&state, &mount).await;
+        let summary = full_sync_mount(&state, &mount, MaterializeScope::Full).await;
         let status = crate::control::get_status(State(state)).await.unwrap().0;
 
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
@@ -2894,7 +2918,7 @@ mod tests {
         let (backend_url, server) = push_update_required_server().await;
         state.config.backend_url = backend_url;
 
-        let summary = full_sync_mount(&state, &mount).await;
+        let summary = full_sync_mount(&state, &mount, MaterializeScope::Full).await;
         let requests = server.await.unwrap();
         let status = crate::control::get_status(State(state)).await.unwrap().0;
 
@@ -3107,7 +3131,7 @@ mod tests {
         let (backend_url, server) = push_transient_failure_server().await;
         state.config.backend_url = backend_url;
 
-        let summary = full_sync_mount(&state, &mount).await;
+        let summary = full_sync_mount(&state, &mount, MaterializeScope::Full).await;
         let _ = server.await.unwrap();
         let status = crate::control::get_status(State(state)).await.unwrap().0;
 
