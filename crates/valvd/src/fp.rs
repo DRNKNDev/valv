@@ -41,7 +41,10 @@ use valv_sync::{
 
 use crate::{
     error::{backend_response_or_error, require_token, DaemonError},
-    tasks::mark_mount_update_required,
+    tasks::{
+        load_nodes_by_id, mark_mount_update_required, node_abs_path, pause_watchers,
+        resume_watchers_after_debounce,
+    },
     DaemonState, MountState,
 };
 
@@ -353,6 +356,15 @@ pub(crate) async fn fp_move(
         )
     };
 
+    let mut nodes_by_id = load_nodes_by_id(&state, &mount.folder_id).await?;
+    let mount_root = PathBuf::from(&mount.path);
+    let old_abs = node_abs_path(
+        &nodes_by_id,
+        &mount_root,
+        mount.scope_node_id.as_deref(),
+        &req.node_id,
+    );
+
     let mut based_on_seq = req.based_on_seq;
     let mut applied_seq = None;
 
@@ -415,6 +427,34 @@ pub(crate) async fn fp_move(
     }
 
     let server_seq = applied_seq.expect("validated request contains at least one change");
+
+    nodes_by_id.insert(updated_node.node_id.clone(), updated_node.clone());
+    let new_abs = node_abs_path(
+        &nodes_by_id,
+        &mount_root,
+        mount.scope_node_id.as_deref(),
+        &req.node_id,
+    );
+    if let (Some(old_abs), Some(new_abs)) = (old_abs, new_abs) {
+        if old_abs != new_abs && old_abs.exists() && !new_abs.exists() {
+            let was_paused = pause_watchers(&state);
+            let rename_result = (|| -> std::io::Result<()> {
+                if let Some(parent) = new_abs.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(&old_abs, &new_abs)
+            })();
+            resume_watchers_after_debounce(&state, was_paused).await;
+            if let Err(error) = rename_result {
+                tracing::warn!(
+                    node_id = %req.node_id,
+                    error = %error,
+                    "fp_move disk rename failed; will be repaired on the next pull-apply"
+                );
+            }
+        }
+    }
+
     Ok(Json(FpMoveResponse {
         node_id: req.node_id,
         server_seq,

@@ -16,6 +16,18 @@ skips=0
 
 for script in "${scripts[@]}"; do
   script_name=$(basename "$script")
+  # Isolate each scenario: fresh per-scenario HOME_A/HOME_B (empty sync.db, so
+  # no mounts accumulate across scenarios and daemon boot has no catch-up
+  # storm), reusing the once-registered account/device tokens. Scenarios
+  # consume $HOME_A/$HOME_B from the environment.
+  # Keep the suffix short (scenario number only): the daemon's Unix socket path
+  # lives under this HOME and must stay within the platform sun_path limit
+  # (104 bytes on macOS).
+  scenario_num="${script_name%%-*}"
+  export HOME_A="${TMPDIR}/home-a-${scenario_num}"
+  export HOME_B="${TMPDIR}/home-b-${scenario_num}"
+  write_device_config "$HOME_A" "$DEVICE_ID_A" "$DEVICE_TOKEN_A" "Smoke Device A"
+  write_device_config "$HOME_B" "$DEVICE_ID_B" "$DEVICE_TOKEN_B" "Smoke Device B"
   printf 'Running %s\n' "$script_name"
   log_file=$(mktemp)
   set +e

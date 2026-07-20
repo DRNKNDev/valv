@@ -68,7 +68,8 @@ pub(crate) async fn post_sync(
 
     let mut summary = SyncSummary::default();
     for mount in targets {
-        let mount_summary = run_full_sync_mount(state.clone(), mount).await?;
+        let mount_summary =
+            run_full_sync_mount(state.clone(), mount, MaterializeScope::Full).await?;
         merge_sync_summary(&mut summary, mount_summary);
     }
 
@@ -674,6 +675,9 @@ async fn sync_loop(
             }
             SyncLoopWake::Dirty => {
                 sleep(DIRTY_RECONCILE_DEBOUNCE).await;
+                if state.paused.load(Ordering::Acquire) {
+                    continue;
+                }
                 if dirty_signal.take() {
                     reconcile_mount(&state, &mount).await;
                 }
@@ -684,7 +688,13 @@ async fn sync_loop(
 
 async fn reconcile_mount(state: &DaemonState, mount: &MountState) {
     tracing::debug!(folder_id = %mount.folder_id, "diag reconcile_mount (dirty-triggered full_sync)");
-    if let Err(error) = run_full_sync_mount(state.clone(), mount.clone()).await {
+    // Dirty reconciles (catch-up or fs-watcher) push-first but pull with
+    // Background scope so an un-pushed offline delete is not resurrected. An
+    // online edit's path is present, so Background still materializes the
+    // winner; only the offline-delete case diverges from a Full sweep.
+    if let Err(error) =
+        run_full_sync_mount(state.clone(), mount.clone(), MaterializeScope::Background).await
+    {
         tracing::warn!(error = %error, folder_id = %mount.folder_id, "reconcile sync task panicked");
     }
 }
@@ -791,7 +801,7 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
                 .err()
                 .map(|err| err.to_string());
             let apply_error =
-                apply_pulled_fs_changes(state, mount, pulled, MaterializeScope::Background)
+                apply_pulled_fs_changes(state, mount, pulled, MaterializeScope::Background, &HashMap::new())
                     .await
                     .err()
                     .map(|err| err.to_string());
@@ -821,7 +831,11 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
     }
 }
 
-async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary {
+async fn full_sync_mount(
+    state: &DaemonState,
+    mount: &MountState,
+    scope: MaterializeScope,
+) -> SyncSummary {
     let mut summary = SyncSummary::default();
     let Some(token) = mount.effective_token(&state.config).map(str::to_owned) else {
         summary.errors += 1;
@@ -852,6 +866,7 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
     )
     .await;
     let mut push_forbidden = false;
+    let mut superseded_moves: HashMap<String, PathBuf> = HashMap::new();
     match push_result {
         Ok(push_summary) => {
             push_forbidden = push_summary.forbidden;
@@ -863,6 +878,7 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
                 push_summary.creates_submitted + push_summary.versions_submitted,
             )
             .await;
+            superseded_moves = push_summary.superseded_moves;
         }
         Err(error) => {
             if is_update_required(&error).is_some() {
@@ -914,7 +930,7 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
             let was_paused = pause_watchers(state);
             let mut apply_error = None;
             if let Err(error) =
-                apply_pulled_fs_changes(state, mount, pulled, MaterializeScope::Full).await
+                apply_pulled_fs_changes(state, mount, pulled, scope, &superseded_moves).await
             {
                 tracing::error!(
                     folder_id = %mount.folder_id,
@@ -925,7 +941,19 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
                 apply_error = Some(error.to_string());
             }
             let mut materialize_error = None;
-            if let Err(error) = materialize_mount_files(state, mount).await {
+            // A background/catch-up reconcile (Background scope) must not run the
+            // full materialize sweep: it re-downloads every live mirror node
+            // whose path is absent, resurrecting a file the user deleted locally
+            // while offline (the delete can be live-but-superseded in the
+            // mirror). Do only the tombstone cleanup the sweep would have done;
+            // content materialization is left to the scope-gated apply above,
+            // which withholds resurrection under Background. An explicit
+            // `valv sync` (Full) keeps the full sweep.
+            let materialize_result = match scope {
+                MaterializeScope::Full => materialize_mount_files(state, mount).await,
+                MaterializeScope::Background => cleanup_deleted_mount_paths(state, mount).await,
+            };
+            if let Err(error) = materialize_result {
                 tracing::error!(
                     folder_id = %mount.folder_id,
                     error = %error,
@@ -970,11 +998,11 @@ async fn full_sync_mount(state: &DaemonState, mount: &MountState) -> SyncSummary
     summary
 }
 
-fn pause_watchers(state: &DaemonState) -> bool {
+pub(crate) fn pause_watchers(state: &DaemonState) -> bool {
     state.fs_events_paused.swap(true, Ordering::AcqRel)
 }
 
-async fn resume_watchers_after_debounce(state: &DaemonState, was_paused: bool) {
+pub(crate) async fn resume_watchers_after_debounce(state: &DaemonState, was_paused: bool) {
     if !was_paused {
         sleep(Duration::from_millis(250)).await;
         state.fs_events_paused.store(false, Ordering::Release);
@@ -1034,6 +1062,7 @@ async fn apply_pulled_fs_changes(
     mount: &MountState,
     pulled: Vec<PulledNode>,
     scope: MaterializeScope,
+    superseded_moves: &HashMap<String, PathBuf>,
 ) -> anyhow::Result<()> {
     if pulled.is_empty() {
         return Ok(());
@@ -1042,9 +1071,16 @@ async fn apply_pulled_fs_changes(
     let nodes_by_id = load_nodes_by_id(state, &mount.folder_id).await?;
     let mount_root = PathBuf::from(&mount.path);
     for pulled_node in pulled {
-        if let Err(error) =
-            apply_pulled_fs_change(state, mount, &nodes_by_id, &mount_root, &pulled_node, scope)
-                .await
+        if let Err(error) = apply_pulled_fs_change(
+            state,
+            mount,
+            &nodes_by_id,
+            &mount_root,
+            &pulled_node,
+            scope,
+            superseded_moves,
+        )
+        .await
         {
             tracing::error!(
                 folder_id = %mount.folder_id,
@@ -1058,7 +1094,7 @@ async fn apply_pulled_fs_changes(
     Ok(())
 }
 
-async fn load_nodes_by_id(
+pub(crate) async fn load_nodes_by_id(
     state: &DaemonState,
     folder_id: &str,
 ) -> anyhow::Result<HashMap<String, LocalNode>> {
@@ -1097,6 +1133,7 @@ async fn apply_pulled_fs_change(
     mount_root: &Path,
     pulled: &PulledNode,
     scope: MaterializeScope,
+    superseded_moves: &HashMap<String, PathBuf>,
 ) -> anyhow::Result<()> {
     match pulled.op_type.as_str() {
         "create" if pulled.node_type == "folder" => {
@@ -1153,6 +1190,21 @@ async fn apply_pulled_fs_change(
                     fs::create_dir_all(parent)?;
                 }
                 fs::rename(old_path, new_path)?;
+            } else if let Some(diverged_path) = superseded_moves
+                .get(&pulled.node_id)
+                .filter(|path| path.exists() && path.as_path() != new_path && !new_path.exists())
+            {
+                // This device locally renamed/moved this same node during the
+                // window and lost the race (push_local's submit was
+                // superseded), leaving the folder on disk under the losing
+                // name. Reuse that folder for the winning name instead of
+                // materializing a fresh copy and orphaning the loser (which a
+                // later scan would push as a duplicate node). This also carries
+                // any children created under it during the pause.
+                if let Some(parent) = new_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(diverged_path, &new_path)?;
             } else {
                 // old_path is already gone locally (e.g. a concurrent local
                 // rename/delete raced this same node). We can't move it into
@@ -1691,9 +1743,10 @@ async fn fetch_remote_version(
 async fn run_full_sync_mount(
     state: DaemonState,
     mount: MountState,
+    scope: MaterializeScope,
 ) -> Result<SyncSummary, tokio::task::JoinError> {
     tokio::task::spawn_blocking(move || {
-        tokio::runtime::Handle::current().block_on(full_sync_mount(&state, &mount))
+        tokio::runtime::Handle::current().block_on(full_sync_mount(&state, &mount, scope))
     })
     .await
 }
@@ -2528,6 +2581,101 @@ mod tests {
         assert!(full_should);
     }
 
+    fn folder_rename_setup(dir: &Path) -> (HashMap<String, LocalNode>, PulledNode) {
+        // Post-pull mirror: node n1 is a folder now at the winning name.
+        let mut nodes = HashMap::from([("root".to_owned(), root_node())]);
+        nodes.insert(
+            "n1".to_owned(),
+            LocalNode {
+                node_id: "n1".to_owned(),
+                folder_id: "folder-1".to_owned(),
+                parent_id: Some("root".to_owned()),
+                name: "winning-name".to_owned(),
+                node_type: "folder".to_owned(),
+                current_version_id: None,
+                server_seq: 2,
+                deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
+            },
+        );
+        let _ = dir;
+        let pulled = PulledNode {
+            node_id: "n1".to_owned(),
+            op_type: "rename".to_owned(),
+            is_conflict_copy: false,
+            actor_device_id: "other".to_owned(),
+            applied_at: "2026-07-20T00:00:00Z".to_owned(),
+            old_name: Some("raced-folder".to_owned()),
+            old_parent_id: Some("root".to_owned()),
+            old_version_id: None,
+            new_name: "winning-name".to_owned(),
+            new_parent_id: Some("root".to_owned()),
+            new_version_id: None,
+            node_type: "folder".to_owned(),
+        };
+        (nodes, pulled)
+    }
+
+    #[tokio::test]
+    async fn apply_pulled_rename_adopts_a_superseded_local_rename_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        let (nodes, pulled) = folder_rename_setup(dir.path());
+
+        // The loser folder this device renamed to locally, before losing the race.
+        let loser = dir.path().join("losing-name");
+        fs::create_dir(&loser).unwrap();
+        let superseded = HashMap::from([("n1".to_owned(), loser.clone())]);
+
+        apply_pulled_fs_change(
+            &state,
+            &mount,
+            &nodes,
+            dir.path(),
+            &pulled,
+            MaterializeScope::Background,
+            &superseded,
+        )
+        .await
+        .unwrap();
+
+        // Adopted onto the winning path; no orphan left behind.
+        assert!(dir.path().join("winning-name").is_dir());
+        assert!(!loser.exists());
+    }
+
+    #[tokio::test]
+    async fn apply_pulled_rename_does_not_adopt_when_winning_path_is_occupied() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        let (nodes, pulled) = folder_rename_setup(dir.path());
+
+        let loser = dir.path().join("losing-name");
+        fs::create_dir(&loser).unwrap();
+        // Winning path already occupied: the adopt guard must decline, leaving
+        // the loser in place rather than clobbering.
+        fs::create_dir(dir.path().join("winning-name")).unwrap();
+        let superseded = HashMap::from([("n1".to_owned(), loser.clone())]);
+
+        apply_pulled_fs_change(
+            &state,
+            &mount,
+            &nodes,
+            dir.path(),
+            &pulled,
+            MaterializeScope::Background,
+            &superseded,
+        )
+        .await
+        .unwrap();
+
+        assert!(loser.exists());
+        assert!(dir.path().join("winning-name").is_dir());
+    }
+
     #[tokio::test]
     async fn account_status_poll_404_clears_cache() {
         let mut state = test_state();
@@ -2764,7 +2912,7 @@ mod tests {
         let (backend_url, server) = push_update_required_server().await;
         state.config.backend_url = backend_url;
 
-        let summary = full_sync_mount(&state, &mount).await;
+        let summary = full_sync_mount(&state, &mount, MaterializeScope::Full).await;
         let requests = server.await.unwrap();
         let status = crate::control::get_status(State(state)).await.unwrap().0;
 
@@ -2807,7 +2955,7 @@ mod tests {
         let (backend_url, server) = push_forbidden_server().await;
         state.config.backend_url = backend_url;
 
-        let summary = full_sync_mount(&state, &mount).await;
+        let summary = full_sync_mount(&state, &mount, MaterializeScope::Full).await;
         let requests = server.await.unwrap();
         let status = crate::control::get_status(State(state)).await.unwrap().0;
 
@@ -2852,7 +3000,7 @@ mod tests {
         ])
         .await;
 
-        let summary = full_sync_mount(&state, &mount).await;
+        let summary = full_sync_mount(&state, &mount, MaterializeScope::Full).await;
         let status = crate::control::get_status(State(state)).await.unwrap().0;
 
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
@@ -2894,7 +3042,7 @@ mod tests {
         let (backend_url, server) = push_update_required_server().await;
         state.config.backend_url = backend_url;
 
-        let summary = full_sync_mount(&state, &mount).await;
+        let summary = full_sync_mount(&state, &mount, MaterializeScope::Full).await;
         let requests = server.await.unwrap();
         let status = crate::control::get_status(State(state)).await.unwrap().0;
 
@@ -3107,7 +3255,7 @@ mod tests {
         let (backend_url, server) = push_transient_failure_server().await;
         state.config.backend_url = backend_url;
 
-        let summary = full_sync_mount(&state, &mount).await;
+        let summary = full_sync_mount(&state, &mount, MaterializeScope::Full).await;
         let _ = server.await.unwrap();
         let status = crate::control::get_status(State(state)).await.unwrap().0;
 
@@ -3756,6 +3904,59 @@ mod tests {
             pull_request_count(&requests),
             1,
             "the deferred reconcile must run once the daemon resumes"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_loop_rechecks_paused_after_the_dirty_debounce_before_reconciling() {
+        let (state, mount, requests, dir) = dirty_reconcile_test_state().await;
+        fs::write(dir.path().join("a.txt"), b"alpha").unwrap();
+
+        let (_notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(4);
+        let dirty_signal = DirtySignal::new();
+        let handle = tokio::spawn(sync_loop(
+            state.clone(),
+            mount.clone(),
+            notify_rx,
+            dirty_signal.clone(),
+            tokio::spawn(std::future::pending::<()>()),
+        ));
+
+        dirty_signal.mark();
+        // Let the Dirty wake fire and enter its 1s debounce sleep (paused is
+        // still false here, so the top-of-loop check passes) before pausing.
+        // The pause then lands mid-debounce, reproducing a POST /pause that
+        // races a reconcile already scheduled.
+        sleep(Duration::from_millis(200)).await;
+        state.paused.store(true, Ordering::Release);
+        sleep(Duration::from_millis(1500)).await;
+
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.starts_with("POST"))
+                .count(),
+            0,
+            "a pause landing during the dirty debounce must prevent the push"
+        );
+
+        state.paused.store(false, Ordering::Release);
+        // Mirrors post_resume's catch-up wake: the Dirty select! arm already
+        // consumed its notify permit while paused, so a fresh mark is needed
+        // to drive the next wake now that the flag itself survived.
+        dirty_signal.mark();
+        sleep(Duration::from_millis(1600)).await;
+        handle.abort();
+
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.starts_with("POST")),
+            "the flag must survive the paused debounce so resume's catch-up reconciles"
         );
     }
 }

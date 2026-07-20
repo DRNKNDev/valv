@@ -40,6 +40,12 @@ pub struct PushSummary {
     pub skipped: u64,
     pub errors: u64,
     pub forbidden: bool,
+    // node_id -> current on-disk path for a rename/move this push tried to
+    // submit but the server superseded (another device won the race). The
+    // same sync cycle's pull-apply consumes this to mv the loser's diverged
+    // folder onto the winning path instead of materializing a fresh copy and
+    // orphaning it.
+    pub superseded_moves: HashMap<String, PathBuf>,
 }
 
 fn record_push_error(summary: &mut PushSummary, error: &anyhow::Error) {
@@ -400,11 +406,17 @@ async fn process_moved_entry(
                     entry.abs_path.display()
                 );
                 record_push_error(summary, &error);
+                summary
+                    .superseded_moves
+                    .insert(node.node_id.clone(), entry.abs_path.clone());
                 deferred_delete_node_ids.insert(node.node_id);
                 return Ok(true);
             }
         };
         let SubmitOpResponse::Applied { server_seq, .. } = response else {
+            summary
+                .superseded_moves
+                .insert(node.node_id.clone(), entry.abs_path.clone());
             summary.skipped += 1;
             return Ok(true);
         };
@@ -438,11 +450,17 @@ async fn process_moved_entry(
                     entry.abs_path.display()
                 );
                 record_push_error(summary, &error);
+                summary
+                    .superseded_moves
+                    .insert(node.node_id.clone(), entry.abs_path.clone());
                 deferred_delete_node_ids.insert(node.node_id);
                 return Ok(true);
             }
         };
         let SubmitOpResponse::Applied { server_seq, .. } = response else {
+            summary
+                .superseded_moves
+                .insert(node.node_id.clone(), entry.abs_path.clone());
             summary.skipped += 1;
             return Ok(true);
         };
