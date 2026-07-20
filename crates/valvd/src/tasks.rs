@@ -798,7 +798,7 @@ async fn pull_mount_once(state: &DaemonState, mount: &MountState) {
                 .err()
                 .map(|err| err.to_string());
             let apply_error =
-                apply_pulled_fs_changes(state, mount, pulled, MaterializeScope::Background)
+                apply_pulled_fs_changes(state, mount, pulled, MaterializeScope::Background, &HashMap::new())
                     .await
                     .err()
                     .map(|err| err.to_string());
@@ -863,6 +863,7 @@ async fn full_sync_mount(
     )
     .await;
     let mut push_forbidden = false;
+    let mut superseded_moves: HashMap<String, PathBuf> = HashMap::new();
     match push_result {
         Ok(push_summary) => {
             push_forbidden = push_summary.forbidden;
@@ -874,6 +875,7 @@ async fn full_sync_mount(
                 push_summary.creates_submitted + push_summary.versions_submitted,
             )
             .await;
+            superseded_moves = push_summary.superseded_moves;
         }
         Err(error) => {
             if is_update_required(&error).is_some() {
@@ -925,7 +927,7 @@ async fn full_sync_mount(
             let was_paused = pause_watchers(state);
             let mut apply_error = None;
             if let Err(error) =
-                apply_pulled_fs_changes(state, mount, pulled, scope).await
+                apply_pulled_fs_changes(state, mount, pulled, scope, &superseded_moves).await
             {
                 tracing::error!(
                     folder_id = %mount.folder_id,
@@ -1057,6 +1059,7 @@ async fn apply_pulled_fs_changes(
     mount: &MountState,
     pulled: Vec<PulledNode>,
     scope: MaterializeScope,
+    superseded_moves: &HashMap<String, PathBuf>,
 ) -> anyhow::Result<()> {
     if pulled.is_empty() {
         return Ok(());
@@ -1065,9 +1068,16 @@ async fn apply_pulled_fs_changes(
     let nodes_by_id = load_nodes_by_id(state, &mount.folder_id).await?;
     let mount_root = PathBuf::from(&mount.path);
     for pulled_node in pulled {
-        if let Err(error) =
-            apply_pulled_fs_change(state, mount, &nodes_by_id, &mount_root, &pulled_node, scope)
-                .await
+        if let Err(error) = apply_pulled_fs_change(
+            state,
+            mount,
+            &nodes_by_id,
+            &mount_root,
+            &pulled_node,
+            scope,
+            superseded_moves,
+        )
+        .await
         {
             tracing::error!(
                 folder_id = %mount.folder_id,
@@ -1120,6 +1130,7 @@ async fn apply_pulled_fs_change(
     mount_root: &Path,
     pulled: &PulledNode,
     scope: MaterializeScope,
+    superseded_moves: &HashMap<String, PathBuf>,
 ) -> anyhow::Result<()> {
     match pulled.op_type.as_str() {
         "create" if pulled.node_type == "folder" => {
@@ -1176,6 +1187,21 @@ async fn apply_pulled_fs_change(
                     fs::create_dir_all(parent)?;
                 }
                 fs::rename(old_path, new_path)?;
+            } else if let Some(diverged_path) = superseded_moves
+                .get(&pulled.node_id)
+                .filter(|path| path.exists() && path.as_path() != new_path && !new_path.exists())
+            {
+                // This device locally renamed/moved this same node during the
+                // window and lost the race (push_local's submit was
+                // superseded), leaving the folder on disk under the losing
+                // name. Reuse that folder for the winning name instead of
+                // materializing a fresh copy and orphaning the loser (which a
+                // later scan would push as a duplicate node). This also carries
+                // any children created under it during the pause.
+                if let Some(parent) = new_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(diverged_path, &new_path)?;
             } else {
                 // old_path is already gone locally (e.g. a concurrent local
                 // rename/delete raced this same node). We can't move it into
