@@ -2578,6 +2578,101 @@ mod tests {
         assert!(full_should);
     }
 
+    fn folder_rename_setup(dir: &Path) -> (HashMap<String, LocalNode>, PulledNode) {
+        // Post-pull mirror: node n1 is a folder now at the winning name.
+        let mut nodes = HashMap::from([("root".to_owned(), root_node())]);
+        nodes.insert(
+            "n1".to_owned(),
+            LocalNode {
+                node_id: "n1".to_owned(),
+                folder_id: "folder-1".to_owned(),
+                parent_id: Some("root".to_owned()),
+                name: "winning-name".to_owned(),
+                node_type: "folder".to_owned(),
+                current_version_id: None,
+                server_seq: 2,
+                deleted_at: None,
+                pushed_size_bytes: None,
+                pushed_mtime_nanos: None,
+            },
+        );
+        let _ = dir;
+        let pulled = PulledNode {
+            node_id: "n1".to_owned(),
+            op_type: "rename".to_owned(),
+            is_conflict_copy: false,
+            actor_device_id: "other".to_owned(),
+            applied_at: "2026-07-20T00:00:00Z".to_owned(),
+            old_name: Some("raced-folder".to_owned()),
+            old_parent_id: Some("root".to_owned()),
+            old_version_id: None,
+            new_name: "winning-name".to_owned(),
+            new_parent_id: Some("root".to_owned()),
+            new_version_id: None,
+            node_type: "folder".to_owned(),
+        };
+        (nodes, pulled)
+    }
+
+    #[tokio::test]
+    async fn apply_pulled_rename_adopts_a_superseded_local_rename_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        let (nodes, pulled) = folder_rename_setup(dir.path());
+
+        // The loser folder this device renamed to locally, before losing the race.
+        let loser = dir.path().join("losing-name");
+        fs::create_dir(&loser).unwrap();
+        let superseded = HashMap::from([("n1".to_owned(), loser.clone())]);
+
+        apply_pulled_fs_change(
+            &state,
+            &mount,
+            &nodes,
+            dir.path(),
+            &pulled,
+            MaterializeScope::Background,
+            &superseded,
+        )
+        .await
+        .unwrap();
+
+        // Adopted onto the winning path; no orphan left behind.
+        assert!(dir.path().join("winning-name").is_dir());
+        assert!(!loser.exists());
+    }
+
+    #[tokio::test]
+    async fn apply_pulled_rename_does_not_adopt_when_winning_path_is_occupied() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state();
+        let mount = test_mount(dir.path().to_string_lossy().as_ref());
+        let (nodes, pulled) = folder_rename_setup(dir.path());
+
+        let loser = dir.path().join("losing-name");
+        fs::create_dir(&loser).unwrap();
+        // Winning path already occupied: the adopt guard must decline, leaving
+        // the loser in place rather than clobbering.
+        fs::create_dir(dir.path().join("winning-name")).unwrap();
+        let superseded = HashMap::from([("n1".to_owned(), loser.clone())]);
+
+        apply_pulled_fs_change(
+            &state,
+            &mount,
+            &nodes,
+            dir.path(),
+            &pulled,
+            MaterializeScope::Background,
+            &superseded,
+        )
+        .await
+        .unwrap();
+
+        assert!(loser.exists());
+        assert!(dir.path().join("winning-name").is_dir());
+    }
+
     #[tokio::test]
     async fn account_status_poll_404_clears_cache() {
         let mut state = test_state();
