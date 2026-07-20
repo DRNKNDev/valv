@@ -224,7 +224,7 @@ wait_for_node_at_path() {
   local path="$2"
   local deadline=$((SECONDS + 30))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if assert_node_at_path "$folder_id" "$path" >/dev/null 2>&1; then
+    if ( assert_node_at_path "$folder_id" "$path" ) >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.5
@@ -247,7 +247,7 @@ wait_for_no_live_node_at_path() {
   local path="$2"
   local deadline=$((SECONDS + 30))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if assert_no_live_node_at_path "$folder_id" "$path" >/dev/null 2>&1; then
+    if ( assert_no_live_node_at_path "$folder_id" "$path" ) >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.5
@@ -358,7 +358,7 @@ wait_for_file_on_device() {
   local timeout_s="${3:-30}"
   local deadline=$((SECONDS + timeout_s))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if assert_path_present "${mount_path}/${filename}" >/dev/null 2>&1; then
+    if [ -e "${mount_path}/${filename}" ]; then
       return 0
     fi
     sleep 0.5
