@@ -675,6 +675,9 @@ async fn sync_loop(
             }
             SyncLoopWake::Dirty => {
                 sleep(DIRTY_RECONCILE_DEBOUNCE).await;
+                if state.paused.load(Ordering::Acquire) {
+                    continue;
+                }
                 if dirty_signal.take() {
                     reconcile_mount(&state, &mount).await;
                 }
@@ -995,11 +998,11 @@ async fn full_sync_mount(
     summary
 }
 
-fn pause_watchers(state: &DaemonState) -> bool {
+pub(crate) fn pause_watchers(state: &DaemonState) -> bool {
     state.fs_events_paused.swap(true, Ordering::AcqRel)
 }
 
-async fn resume_watchers_after_debounce(state: &DaemonState, was_paused: bool) {
+pub(crate) async fn resume_watchers_after_debounce(state: &DaemonState, was_paused: bool) {
     if !was_paused {
         sleep(Duration::from_millis(250)).await;
         state.fs_events_paused.store(false, Ordering::Release);
@@ -1091,7 +1094,7 @@ async fn apply_pulled_fs_changes(
     Ok(())
 }
 
-async fn load_nodes_by_id(
+pub(crate) async fn load_nodes_by_id(
     state: &DaemonState,
     folder_id: &str,
 ) -> anyhow::Result<HashMap<String, LocalNode>> {
@@ -3901,6 +3904,59 @@ mod tests {
             pull_request_count(&requests),
             1,
             "the deferred reconcile must run once the daemon resumes"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_loop_rechecks_paused_after_the_dirty_debounce_before_reconciling() {
+        let (state, mount, requests, dir) = dirty_reconcile_test_state().await;
+        fs::write(dir.path().join("a.txt"), b"alpha").unwrap();
+
+        let (_notify_tx, notify_rx) = mpsc::channel::<WsPushNotification>(4);
+        let dirty_signal = DirtySignal::new();
+        let handle = tokio::spawn(sync_loop(
+            state.clone(),
+            mount.clone(),
+            notify_rx,
+            dirty_signal.clone(),
+            tokio::spawn(std::future::pending::<()>()),
+        ));
+
+        dirty_signal.mark();
+        // Let the Dirty wake fire and enter its 1s debounce sleep (paused is
+        // still false here, so the top-of-loop check passes) before pausing.
+        // The pause then lands mid-debounce, reproducing a POST /pause that
+        // races a reconcile already scheduled.
+        sleep(Duration::from_millis(200)).await;
+        state.paused.store(true, Ordering::Release);
+        sleep(Duration::from_millis(1500)).await;
+
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.starts_with("POST"))
+                .count(),
+            0,
+            "a pause landing during the dirty debounce must prevent the push"
+        );
+
+        state.paused.store(false, Ordering::Release);
+        // Mirrors post_resume's catch-up wake: the Dirty select! arm already
+        // consumed its notify permit while paused, so a fresh mark is needed
+        // to drive the next wake now that the flag itself survived.
+        dirty_signal.mark();
+        sleep(Duration::from_millis(1600)).await;
+        handle.abort();
+
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.starts_with("POST")),
+            "the flag must survive the paused debounce so resume's catch-up reconciles"
         );
     }
 }
